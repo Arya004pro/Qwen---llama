@@ -15,7 +15,7 @@ Your job is ONLY to detect missing:
 Rules:
 - NEVER ask about entity or category
 - Ask ONLY ONE clarification question
-- If both metric and time range are known, reply exactly: CLEAR
+- If time range is missing, ask: 'What time period are you asking about? (e.g. March 2024 or Jan to Jun 2024)'
 
 Known state:
 {known_state}

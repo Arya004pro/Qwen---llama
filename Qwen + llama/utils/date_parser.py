@@ -75,4 +75,8 @@ def parse_date_range(time_range, raw_text):
         d1, y1, d2 = int(nums[0]), int(nums[1]), int(nums[2])
         return date(y1, 1, d1), date(y1, 12, d2)
 
+    # Add before the raise ValueError at the bottom:
+    if year and not found_months:
+        return date(year, 1, 1), date(year, 12, 31)
+
     raise ValueError("Unable to parse date range")

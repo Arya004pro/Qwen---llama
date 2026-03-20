@@ -32,29 +32,30 @@ while True:
     # ---------------------------
     state.update_from_user(user_input)
 
-    known_state = {
-        "entity": state.entity,
-        "metric": state.metric,
-        "time_range": state.time_range,
-        "ranking": state.ranking
-    }
-
-    # Early guard if metric mentioned but entity missing
+    # ---------------------------
+    # Early guard: metric mentioned but no entity
+    # ---------------------------
     if state.entity is None and any(w in user_input.lower() for w in ["revenue", "sales", "quantity"]):
         print("Assistant: Are you asking about products, customers, cities, or categories?")
         continue
 
     # ---------------------------
-    # Ambiguity detection (Qwen)
+    # Only call Qwen if state is NOT complete
     # ---------------------------
-    reply = detect_ambiguity(user_input, known_state)
-
-    if reply.strip() != "CLEAR":
-        print("Assistant:", reply)
-        continue
+    if not state.is_complete():
+        known_state = {
+            "entity": state.entity,
+            "metric": state.metric,
+            "time_range": state.time_range,
+            "ranking": state.ranking
+        }
+        reply = detect_ambiguity(user_input, known_state)
+        if reply.strip() != "CLEAR":
+            print("Assistant:", reply)
+            continue
 
     # ---------------------------
-    # Validate completeness
+    # Final completeness check (fallback)
     # ---------------------------
     if not state.is_complete():
         if state.entity is None:
@@ -62,12 +63,11 @@ while True:
         elif state.metric is None:
             print("Assistant: Should this be measured by revenue or quantity?")
         elif state.time_range is None:
-            print("Assistant: Please specify the time range.")
+            print("Assistant: What time period? (e.g. March 2024 or Jan to Jun 2024)")
         continue
 
     # ---------------------------
     # OPTIONAL schema mapping (LLaMA)
-    # Non-blocking, safe against HF timeouts
     # ---------------------------
     try:
         extract_schema(
@@ -88,7 +88,7 @@ while True:
             state.raw_time_text
         )
     except ValueError:
-        print("Assistant: I couldn’t understand the date range. Can you rephrase it?")
+        print("Assistant: I couldn't understand the date range. Can you rephrase it?")
         continue
 
     # ---------------------------
@@ -106,7 +106,7 @@ while True:
     try:
         sql = SQL_REGISTRY[state.entity][state.metric][state.ranking]
     except KeyError:
-        print("Assistant: I can’t answer this type of question yet.")
+        print("Assistant: I can't answer this type of question yet.")
         state = ConversationState()
         continue
 
