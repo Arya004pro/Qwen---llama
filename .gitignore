@@ -1,0 +1,17 @@
+# Configuration and sensitive files
+Qwen + llama/config.py
+Qwen + llama/test_token.py
+
+# Python caching
+__pycache__/
+*.py[cod]
+*$py.class
+Qwen + llama/__pycache__/
+
+# Environments
+venv/
+.env
+
+# Javascript / Node
+node_modules/
+
