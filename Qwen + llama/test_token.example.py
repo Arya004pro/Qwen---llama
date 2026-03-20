@@ -1,15 +1,22 @@
 import requests
 import json
+from dotenv import load_dotenv
+import os
 
-url = "https://router.huggingface.co/v1/chat/completions"
+load_dotenv()
+
+GROQ_API_TOKEN = os.getenv("GROQ_API_TOKEN")
+QWEN_MODEL     = os.getenv("QWEN_MODEL", "qwen/qwen3-32b")
+
+url = "https://api.groq.com/openai/v1/chat/completions"
 
 headers = {
-    "Authorization": "Bearer your_huggingface_api_token_here",
+    "Authorization": f"Bearer {GROQ_API_TOKEN}",
     "Content-Type": "application/json"
 }
 
 payload = {
-    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "model": QWEN_MODEL,
     "messages": [
         {"role": "user", "content": "Reply with exactly the word OK"}
     ],

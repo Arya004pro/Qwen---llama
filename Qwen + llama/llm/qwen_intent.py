@@ -1,5 +1,5 @@
-from llm.hf_client import call_hf_chat
-from config import HF_API_TOKEN, QWEN_MODEL
+from llm.client import call_llm
+from config import GROQ_API_TOKEN, QWEN_MODEL
 
 
 def detect_ambiguity(user_message, known_state):
@@ -16,6 +16,7 @@ Rules:
 - NEVER ask about entity or category
 - Ask ONLY ONE clarification question
 - If time range is missing, ask: 'What time period are you asking about? (e.g. March 2024 or Jan to Jun 2024)'
+- If both metric and time range are known, reply exactly: CLEAR
 
 Known state:
 {known_state}
@@ -26,11 +27,11 @@ Known state:
         {"role": "user", "content": user_message}
     ]
 
-    result = call_hf_chat(
+    result = call_llm(
         model_name=QWEN_MODEL,
         messages=messages,
-        token=HF_API_TOKEN,
-        max_tokens=100
+        token=GROQ_API_TOKEN,
+        max_tokens=500
     )
 
     return result["choices"][0]["message"]["content"].strip()

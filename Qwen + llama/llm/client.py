@@ -1,9 +1,9 @@
 import requests
-from config import HF_API_TOKEN
+from config import GROQ_API_TOKEN
 
-HF_ROUTER_URL = "https://router.huggingface.co/v1/chat/completions"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-def call_hf_chat(model_name, messages, token, max_tokens=256):
+def call_llm(model_name, messages, token, max_tokens=500):
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
@@ -15,12 +15,17 @@ def call_hf_chat(model_name, messages, token, max_tokens=256):
         "max_tokens": max_tokens
     }
 
-    response = requests.post(HF_ROUTER_URL, headers=headers, json=payload)
+    response = requests.post(GROQ_URL, headers=headers, json=payload)
     response.raise_for_status()
     result = response.json()
 
     usage = result.get("usage", {})
-    print(f"[Tokens] prompt={usage.get('prompt_tokens')} | completion={usage.get('completion_tokens')} | total={usage.get('total_tokens')} | model={model_name.split('/')[-1]}")
+    print(
+        f"[Tokens] prompt={usage.get('prompt_tokens')} | "
+        f"completion={usage.get('completion_tokens')} | "
+        f"total={usage.get('total_tokens')} | "
+        f"model={model_name.split('/')[-1]}"
+    )
 
     return result
 
@@ -28,12 +33,12 @@ def call_hf_chat(model_name, messages, token, max_tokens=256):
 # ✅ TEMPORARY TEST BLOCK (MANDATORY)
 if __name__ == "__main__":
 
-    result = call_hf_chat(
-        model_name="Qwen/Qwen2.5-7B-Instruct",
+    result = call_llm(
+        model_name="qwen/qwen3-32b",
         messages=[
             {"role": "user", "content": "Reply with exactly OK"}
         ],
-        token=HF_API_TOKEN,
+        token=GROQ_API_TOKEN,
         max_tokens=5
     )
 

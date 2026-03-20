@@ -1,5 +1,5 @@
-from llm.hf_client import call_hf_chat
-from config import HF_API_TOKEN, LLAMA_MODEL
+from llm.client import call_llm
+from config import GROQ_API_TOKEN, LLAMA_MODEL
 import json
 
 def extract_schema(entity, metric, time_range, ranking=None):
@@ -28,11 +28,11 @@ Return ONLY valid JSON in this format:
 
     messages = [{"role": "user", "content": prompt}]
 
-    result = call_hf_chat(
+    result = call_llm(
         model_name=LLAMA_MODEL,
         messages=messages,
-        token=HF_API_TOKEN,
-        max_tokens=120
+        token=GROQ_API_TOKEN,
+        max_tokens=500
     )
 
     return result["choices"][0]["message"]["content"]
