@@ -7,6 +7,9 @@ services:
       - .env
     environment:
       - MOTIA_API_URL=http://host.docker.internal:3121
+      - CHART_OUTPUT_DIR=/charts
+    volumes:
+      - ./charts:/charts
     stdin_open: true
     tty: true
     extra_hosts:
