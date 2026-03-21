@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 config = {
     "name": "ReceiveQuery",
-    "description": "Accepts analytics queries via HTTP and starts the workflow pipeline",
+    "description": "Entry point: accepts a natural-language analytics question and creates a tracked query run",
     "flows": ["sales-analytics-flow"],
     "triggers": [
         http("POST", "/query"),

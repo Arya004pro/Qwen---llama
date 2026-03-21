@@ -1,32 +1,30 @@
-"""Step 5: Execute Query — Runs SQL against PostgreSQL.
+"""Step 5: Execute Query — Runs SQL against PostgreSQL."""
 
-Parses the date range from natural language, looks up the SQL template
-from the registry, executes it against PostgreSQL, and passes the
-raw results to the formatting step.
+import os
+import sys
 
-Trigger: Queue (query::execute)
-Emits:   query::format.result
-Flow:    sales-analytics-flow
-"""
+# ── Fix imports FIRST before anything else ──────────────────────────────────
+# steps/ -> motia/ -> project_root (where db/, utils/, state/ live)
+_STEPS_DIR   = os.path.dirname(os.path.abspath(__file__))
+_MOTIA_DIR   = os.path.dirname(_STEPS_DIR)
+_PROJECT_ROOT = os.path.dirname(_MOTIA_DIR)
 
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+for _p in [_STEPS_DIR, _MOTIA_DIR, _PROJECT_ROOT]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+# ────────────────────────────────────────────────────────────────────────────
 
 import psycopg2
 from typing import Any
 from motia import FlowContext, queue
 
-from shared_config import POSTGRES, PROJECT_ROOT
-import sys
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
+from shared_config import POSTGRES
 from db.sql_registry import SQL_REGISTRY
 from utils.date_parser import parse_date_range
 
 config = {
     "name": "ExecuteQuery",
-    "description": "Parses dates, looks up SQL from registry, executes against PostgreSQL",
+    "description": "Builds SQL inputs from intent, runs the query on PostgreSQL, and captures raw analytics results",
     "flows": ["sales-analytics-flow"],
     "triggers": [
         queue("query::execute"),
@@ -68,7 +66,6 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             "error": str(e),
             "raw_time_text": raw_time_text,
         })
-
         query_state = await ctx.state.get("queries", query_id)
         if query_state:
             await ctx.state.set("queries", query_id, {
@@ -94,7 +91,6 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             "metric": metric,
             "ranking": ranking,
         })
-
         query_state = await ctx.state.get("queries", query_id)
         if query_state:
             await ctx.state.set("queries", query_id, {
@@ -118,7 +114,6 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         cur.close()
         conn.close()
 
-        # Convert rows to serializable format
         results = []
         for row in rows:
             if ranking == "aggregate":
@@ -139,7 +134,6 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             "queryId": query_id,
             "error": str(e),
         })
-
         query_state = await ctx.state.get("queries", query_id)
         if query_state:
             await ctx.state.set("queries", query_id, {

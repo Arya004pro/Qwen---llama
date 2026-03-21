@@ -4,7 +4,6 @@ This is a utility step that allows users to check the status and
 results of a previously submitted query using its query ID.
 
 Trigger: HTTP GET /query/:queryId
-Flow:    sales-analytics-flow
 """
 
 from typing import Any
@@ -12,8 +11,8 @@ from motia import ApiRequest, ApiResponse, FlowContext, http
 
 config = {
     "name": "GetQueryResult",
-    "description": "Retrieves the status and results of a processed analytics query",
-    "flows": ["sales-analytics-flow"],
+    "description": "Utility endpoint: returns status and results for a previously submitted query id",
+    "flows": ["sales-analytics-utilities"],
     "triggers": [
         http("GET", "/query/:queryId"),
     ],
@@ -22,7 +21,7 @@ config = {
 
 
 async def handler(request: ApiRequest[Any], ctx: FlowContext[Any]) -> ApiResponse[Any]:
-    query_id = request.params.get("queryId", "")
+    query_id = request.path_params.get("queryId", "")
 
     if not query_id:
         return ApiResponse(status=400, body={"error": "Missing queryId parameter"})

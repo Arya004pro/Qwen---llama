@@ -1,0 +1,12 @@
+{
+  "name": "qwen-llama-workflow-runner",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Run chatbot and Motia workflow UI with npm scripts",
+  "scripts": {
+    "start": "docker compose -f Qwen_llama/docker-compose.chatbot.yml run --rm chatbot",
+    "dev": "docker compose -f Qwen_llama/motia/docker-compose.yml up -d --build --remove-orphans",
+    "dev:down": "docker compose -f Qwen_llama/motia/docker-compose.yml down --remove-orphans",
+    "dev:logs": "docker compose -f Qwen_llama/motia/docker-compose.yml logs -f --tail=200"
+  }
+}

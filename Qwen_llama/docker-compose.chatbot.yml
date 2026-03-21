@@ -1,0 +1,13 @@
+services:
+  chatbot:
+    build:
+      context: ..
+      dockerfile: Qwen_llama/Dockerfile.chatbot
+    env_file:
+      - .env
+    environment:
+      - MOTIA_API_URL=http://host.docker.internal:3121
+    stdin_open: true
+    tty: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

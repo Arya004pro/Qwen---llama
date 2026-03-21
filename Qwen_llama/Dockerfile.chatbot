@@ -1,0 +1,10 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY Qwen_llama/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY Qwen_llama/ .
+
+CMD ["python", "motia_chat_cli.py"]

@@ -14,7 +14,7 @@ from motia import FlowContext, queue
 
 config = {
     "name": "FormatResult",
-    "description": "Formats raw SQL results into human-readable text with proper formatting",
+    "description": "Transforms raw query output into the final user-facing answer and marks the run complete",
     "flows": ["sales-analytics-flow"],
     "triggers": [
         queue("query::format.result"),

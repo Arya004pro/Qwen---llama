@@ -21,7 +21,7 @@ from shared_config import GROQ_API_TOKEN, QWEN_MODEL, GROQ_URL
 
 config = {
     "name": "AmbiguityCheck",
-    "description": "Uses Qwen 3-32B via Groq to check if the query needs clarification",
+    "description": "Validates whether required details are present; requests clarification when the question is incomplete",
     "flows": ["sales-analytics-flow"],
     "triggers": [
         queue("query::ambiguity.check"),

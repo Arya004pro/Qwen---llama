@@ -4,7 +4,6 @@ A utility step to list all queries that have been processed through
 the workflow, showing their status and results.
 
 Trigger: HTTP GET /queries
-Flow:    sales-analytics-flow
 """
 
 from typing import Any
@@ -12,8 +11,8 @@ from motia import ApiRequest, ApiResponse, FlowContext, http
 
 config = {
     "name": "ListQueries",
-    "description": "Returns all queries that have been processed through the workflow",
-    "flows": ["sales-analytics-flow"],
+    "description": "Utility endpoint: lists tracked queries and their current processing status",
+    "flows": ["sales-analytics-utilities"],
     "triggers": [
         http("GET", "/queries"),
     ],

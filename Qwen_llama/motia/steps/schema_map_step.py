@@ -22,7 +22,7 @@ from shared_config import GROQ_API_TOKEN, LLAMA_MODEL, GROQ_URL
 
 config = {
     "name": "SchemaMap",
-    "description": "Uses LLaMA 3.1-8B via Groq to map parsed intent to structured JSON schema",
+    "description": "Converts parsed intent into a strict query schema used by SQL execution",
     "flows": ["sales-analytics-flow"],
     "triggers": [
         queue("query::schema.map"),

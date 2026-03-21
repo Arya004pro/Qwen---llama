@@ -1,31 +1,26 @@
-"""Step 2: Parse Intent — Extracts entity, metric, time_range, and ranking from the query.
+"""Step 2: Parse Intent — Extracts entity, metric, time_range, and ranking from the query."""
 
-Uses the existing ConversationState class to parse the user's natural
-language query into structured fields (entity, metric, time_range, ranking).
+import os
+import sys
 
-Trigger: Queue (query::intent.parse)
-Emits:   query::ambiguity.check
-Flow:    sales-analytics-flow
-"""
+# ── Fix imports FIRST before anything else ──────────────────────────────────
+_STEPS_DIR    = os.path.dirname(os.path.abspath(__file__))
+_MOTIA_DIR    = os.path.dirname(_STEPS_DIR)
+_PROJECT_ROOT = os.path.dirname(_MOTIA_DIR)
 
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+for _p in [_STEPS_DIR, _MOTIA_DIR, _PROJECT_ROOT]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+# ────────────────────────────────────────────────────────────────────────────
 
-import re
 from typing import Any
 from motia import FlowContext, queue
-
-# ── Import existing project modules ──
-from shared_config import PROJECT_ROOT
-import sys
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
 
 from state.conversation_state import ConversationState
 
 config = {
     "name": "ParseIntent",
-    "description": "Extracts entity, metric, time_range, and ranking from the user query",
+    "description": "Interprets the user question into structured intent fields (entity, metric, time range, ranking)",
     "flows": ["sales-analytics-flow"],
     "triggers": [
         queue("query::intent.parse"),
@@ -40,7 +35,6 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
 
     ctx.logger.info("🔍 Parsing intent", {"queryId": query_id, "query": user_query})
 
-    # Use the existing ConversationState to parse
     state = ConversationState()
     state.update_from_user(user_query)
 
@@ -62,7 +56,6 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         "top_n": parsed["top_n"],
     })
 
-    # Update query state
     query_state = await ctx.state.get("queries", query_id)
     if query_state:
         await ctx.state.set("queries", query_id, {
@@ -71,7 +64,6 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             "parsed": parsed,
         })
 
-    # Emit to ambiguity check
     await ctx.enqueue({
         "topic": "query::ambiguity.check",
         "data": {
