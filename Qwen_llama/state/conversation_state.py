@@ -1,31 +1,41 @@
 import re
 
-# Month keyword set for quick lookup
 _MONTH_WORDS = {
     "jan", "january", "feb", "february", "mar", "march",
     "apr", "april", "may", "jun", "june", "jul", "july",
     "aug", "august", "sep", "september", "oct", "october",
-    "nov", "november", "dec", "december"
+    "nov", "november", "dec", "december",
 }
+
+_QUARTER_WORDS = {"q1", "q2", "q3", "q4"}
+
+_YEAR_RE = re.compile(r"\b(20\d{2})\b")
+
+
+def _has_month(text):   return any(m in text for m in _MONTH_WORDS)
+def _has_quarter(text): return any(q in text for q in _QUARTER_WORDS)
+def _has_year(text):    return bool(_YEAR_RE.search(text))
+def _count_years(text): return len(_YEAR_RE.findall(text))
+
 
 class ConversationState:
     def __init__(self):
-        self.entity = None
-        self.metric = None
-        self.time_range = None
+        self.entity        = None
+        self.metric        = None
+        self.time_range    = None
         self.raw_time_text = None
-        self.ranking = None
-        self.top_n = 5
+        self.ranking       = None
+        self.top_n         = 5
         self.is_comparison = False
 
     def normalize(self, text):
         text = text.lower().strip()
         replacements = {
-            "revnue": "revenue",
+            "revnue":  "revenue",
             "prodcts": "products",
-            "qty": "quantity",
-            "hw mch": "how much",
-            "versus": "vs",
+            "qty":     "quantity",
+            "hw mch":  "how much",
+            "versus":  "vs",
         }
         for k, v in replacements.items():
             text = text.replace(k, v)
@@ -33,39 +43,51 @@ class ConversationState:
 
     def _detect_comparison(self, t):
         """
-        Return True when text looks like a cross-period comparison.
-        Handles:
-          * "compare revenue in January and March 2024"
-          * "compare revenue in march vs april 2024"
-          * "revenue in jan vs march 2024"
+        Detect cross-period comparisons for:
+          • month vs month    "march vs april 2024"
+          • quarter vs quarter "q1 vs q2 2024"
+          • year vs year       "2023 vs 2024"
+          • month-range vs month-range  "jan to mar vs apr to jun 2024"
+          • compare … and …   "compare revenue in january and march 2024"
         """
-        # "compare ... and ..." where both sides have a month
+        def _both_sides_have_period(sep):
+            parts = t.split(sep, 1)
+            if len(parts) < 2:
+                return False
+            left, right = parts
+            left_ok  = _has_month(left)  or _has_quarter(left)  or _has_year(left)
+            right_ok = _has_month(right) or _has_quarter(right) or _has_year(right)
+            return left_ok and right_ok
+
+        # "X vs Y"
+        if " vs " in t and _both_sides_have_period(" vs "):
+            return True
+
+        # "compare ... and ..." with a period on each side of "and"
         if "compare" in t and " and " in t:
             parts = t.split(" and ", 1)
-            left_has_month  = any(m in parts[0] for m in _MONTH_WORDS)
-            right_has_month = any(m in parts[1] for m in _MONTH_WORDS)
-            if left_has_month and right_has_month:
+            left, right = parts
+            left_ok  = _has_month(left)  or _has_quarter(left)
+            right_ok = _has_month(right) or _has_quarter(right)
+            # also catch "compare 2023 and 2024" (year-only on each side)
+            if not left_ok and not right_ok:
+                left_ok  = _has_year(left)
+                right_ok = _has_year(right)
+            if left_ok and right_ok:
                 return True
 
-        # "vs" (already normalised from "versus")
-        if " vs " in t:
-            parts = t.split(" vs ", 1)
-            left_has_month  = any(m in parts[0] for m in _MONTH_WORDS)
-            right_has_month = any(m in parts[1] for m in _MONTH_WORDS)
-            if left_has_month and right_has_month:
-                return True
-
-        # generic "compare" keyword with at least two distinct months anywhere
+        # "compare/comparison" keyword + two distinct time indicators anywhere
         if "compare" in t or "comparison" in t:
-            months_found = [m for m in _MONTH_WORDS if m in t]
-            if len(months_found) >= 2:
+            months   = [m for m in _MONTH_WORDS  if m in t]
+            quarters = [q for q in _QUARTER_WORDS if q in t]
+            yr_count = _count_years(t)
+            if len(months) >= 2 or len(quarters) >= 2 or yr_count >= 2:
                 return True
 
         return False
 
     def update_from_user(self, text):
-        # Hard reset every turn
-        self.top_n = 5
+        self.top_n         = 5
         self.is_comparison = False
 
         t = self.normalize(text)
@@ -86,23 +108,22 @@ class ConversationState:
         elif "quantity" in t or "units" in t:
             self.metric = "quantity"
 
-        # COMPARISON INTENT — detect before ranking so defaults are set correctly
+        # COMPARISON INTENT
         if self._detect_comparison(t):
             self.is_comparison = True
             self.raw_time_text = text
-            # When no entity was stated, default to "product"
             if self.entity is None:
                 self.entity = "product"
-            # Aggregate is a clean default for comparisons (can still be overridden by "top N")
             if self.ranking is None:
                 self.ranking = "aggregate"
 
-        # AGGREGATE INTENT
+        # AGGREGATE
         if any(x in t for x in ["how much", "total", "overall", "sum"]):
             self.ranking = "aggregate"
 
         # BOTTOM N
-        if any(x in t for x in ["bottom", "worst", "lowest", "least", "low performing", "underperform"]):
+        if any(x in t for x in ["bottom", "worst", "lowest", "least",
+                                  "low performing", "underperform"]):
             self.ranking = "bottom"
             m = re.search(r"bottom\s+(\d+)", t)
             if m:
@@ -116,7 +137,7 @@ class ConversationState:
                 self.top_n = int(m.group(1))
 
         # TIME
-        if any(m in t for m in _MONTH_WORDS):
+        if _has_month(t) or _has_quarter(t) or _has_year(t):
             self.time_range = "custom_range"
             if not self.raw_time_text:
                 self.raw_time_text = text
