@@ -20,3 +20,8 @@ Thumbs.db
 *.swo
 .idea/
 .vscode/
+
+# ── Motia Specific ────────────────────────────────────────
+motia/bin/
+motia/data/
+motia/uv.lock # optional: you can keep this out of gitignore if you want strict dep locking
