@@ -1,4 +1,5 @@
-"""Step 2: Parse Intent — Extracts entity, metric, time_range, and ranking from the query."""
+"""Step 2: Parse Intent — Extracts entity, metric, time_range, ranking, and
+comparison intent from the user query."""
 
 import os
 import sys
@@ -20,7 +21,7 @@ from state.conversation_state import ConversationState
 
 config = {
     "name": "ParseIntent",
-    "description": "Interprets the user question into structured intent fields (entity, metric, time range, ranking)",
+    "description": "Interprets the user question into structured intent fields (entity, metric, time range, ranking, comparison flag)",
     "flows": ["sales-analytics-flow"],
     "triggers": [
         queue("query::intent.parse"),
@@ -45,6 +46,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         "raw_time_text": state.raw_time_text or user_query,
         "ranking": state.ranking,
         "top_n": state.top_n,
+        "is_comparison": state.is_comparison,   # ← NEW
     }
 
     ctx.logger.info("✅ Intent parsed", {
@@ -54,6 +56,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         "time_range": parsed["time_range"],
         "ranking": parsed["ranking"],
         "top_n": parsed["top_n"],
+        "is_comparison": parsed["is_comparison"],
     })
 
     query_state = await ctx.state.get("queries", query_id)

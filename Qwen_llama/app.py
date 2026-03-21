@@ -4,7 +4,8 @@ from llm.llama_schema import extract_schema
 
 from db.sql_registry import SQL_REGISTRY
 from db.executor import run_query
-from utils.date_parser import parse_date_range
+from utils.date_parser import parse_date_range, parse_comparison_date_ranges
+from utils.token_logger import reset_session_totals, get_session_totals
 
 print("AI Analytics Assistant (type 'exit' to quit)")
 
@@ -14,49 +15,61 @@ ENTITY_LABELS = {
     "product": "products",
     "customer": "customers",
     "city": "cities",
-    "category": "categories"
+    "category": "categories",
 }
+
+
+def fmt_value(value, prefix):
+    return f"{prefix}{value:,.2f}"
+
+
+def delta_str(v1, v2, prefix):
+    if v1 is None or v2 is None:
+        return "N/A"
+    delta = v2 - v1
+    sign  = "+" if delta >= 0 else ""
+    pct   = (delta / v1 * 100) if v1 != 0 else float("inf")
+    return f"{sign}{prefix}{abs(delta):,.2f}  ({sign}{pct:.1f}%)"
+
+
+def print_token_summary():
+    totals = get_session_totals()
+    if totals["total_tokens"] > 0:
+        print(
+            f"\n  [token summary] "
+            f"prompt={totals['prompt_tokens']}  "
+            f"completion={totals['completion_tokens']}  "
+            f"total={totals['total_tokens']}"
+        )
+
 
 while True:
     user_input = input("\nUser: ").strip()
 
-    # ---------------------------
-    # Exit handling
-    # ---------------------------
     if user_input.lower() in ["exit", "quit", "q"]:
         print("Assistant: Goodbye 👋")
         break
 
-    # ---------------------------
-    # Update conversation state
-    # ---------------------------
+    reset_session_totals()
     state.update_from_user(user_input)
 
-    # ---------------------------
-    # Early guard: metric mentioned but no entity
-    # ---------------------------
     if state.entity is None and any(w in user_input.lower() for w in ["revenue", "sales", "quantity"]):
         print("Assistant: Are you asking about products, customers, cities, or categories?")
         continue
 
-    # ---------------------------
-    # Only call Qwen if state is NOT complete
-    # ---------------------------
     if not state.is_complete():
         known_state = {
-            "entity": state.entity,
-            "metric": state.metric,
+            "entity":     state.entity,
+            "metric":     state.metric,
             "time_range": state.time_range,
-            "ranking": state.ranking
+            "ranking":    state.ranking,
         }
         reply = detect_ambiguity(user_input, known_state)
         if reply.strip() != "CLEAR":
             print("Assistant:", reply)
+            print_token_summary()
             continue
 
-    # ---------------------------
-    # Final completeness check (fallback)
-    # ---------------------------
     if not state.is_complete():
         if state.entity is None:
             print("Assistant: Are you asking about products, customers, cities, or categories?")
@@ -66,43 +79,21 @@ while True:
             print("Assistant: What time period? (e.g. March 2024 or Jan to Jun 2024)")
         continue
 
-    # ---------------------------
-    # OPTIONAL schema mapping (LLaMA)
-    # ---------------------------
     try:
         extract_schema(
             entity=state.entity,
             metric=state.metric,
             time_range=state.time_range,
-            ranking=state.ranking
+            ranking=state.ranking,
         )
     except Exception:
         pass
 
-    # ---------------------------
-    # Parse date range
-    # ---------------------------
-    try:
-        start_date, end_date = parse_date_range(
-            state.time_range,
-            state.raw_time_text
-        )
-    except ValueError:
-        print("Assistant: I couldn't understand the date range. Can you rephrase it?")
-        continue
-
-    # ---------------------------
-    # Ensure ranking defaults
-    # ---------------------------
     if state.ranking is None:
-        state.ranking = "top"
-
-    if state.ranking == "top" and state.top_n <= 0:
+        state.ranking = "aggregate" if state.is_comparison else "top"
+    if state.ranking in ("top", "bottom") and state.top_n <= 0:
         state.top_n = 5
 
-    # ---------------------------
-    # Fetch SQL from registry
-    # ---------------------------
     try:
         sql = SQL_REGISTRY[state.entity][state.metric][state.ranking]
     except KeyError:
@@ -110,39 +101,100 @@ while True:
         state = ConversationState()
         continue
 
-    # ---------------------------
-    # Execute SQL
-    # ---------------------------
-    if state.ranking == "aggregate":
-        rows = run_query(sql, (start_date, end_date))
-    else:
-        rows = run_query(sql, (start_date, end_date, state.top_n))
+    # ──────────────────────────────────────────────────────────────────────
+    # COMPARISON MODE
+    # ──────────────────────────────────────────────────────────────────────
+    if state.is_comparison:
+        try:
+            (start1, end1), (start2, end2) = parse_comparison_date_ranges(
+                state.raw_time_text or user_input
+            )
+        except ValueError:
+            print("Assistant: I couldn't parse the two time periods. "
+                  "Try: 'Compare revenue in March vs April 2024'")
+            state = ConversationState()
+            continue
 
-    # ---------------------------
-    # Output
-    # ---------------------------
-    if not rows or rows[0][0] is None:
-        print("Assistant: No data available for the selected period.")
-    else:
+        import calendar as _cal
+        p1     = f"{_cal.month_name[start1.month]} {start1.year}"
+        p2     = f"{_cal.month_name[start2.month]} {start2.year}"
         prefix = "₹" if state.metric == "revenue" else ""
         entity_label = ENTITY_LABELS[state.entity]
 
-        if state.ranking == "aggregate":
-            value = rows[0][0]
-            print(
-                f"Assistant: Total {state.metric} between "
-                f"{start_date:%d %B %Y} and {end_date:%d %B %Y} "
-                f"is {prefix}{value:,.2f}"
-            )
-        else:
-            print(
-                f"Assistant: Top {state.top_n} {entity_label} by {state.metric} "
-                f"between {start_date:%d %B %Y} and {end_date:%d %B %Y}:"
-            )
-            for i, (name, value) in enumerate(rows, start=1):
-                print(f"{i}. {name} — {prefix}{value:,.2f}")
+        try:
+            if state.ranking == "aggregate":
+                rows1 = run_query(sql, (start1, end1))
+                rows2 = run_query(sql, (start2, end2))
+                v1 = float(rows1[0][0]) if rows1 and rows1[0][0] is not None else None
+                v2 = float(rows2[0][0]) if rows2 and rows2[0][0] is not None else None
+                print(f"\nAssistant: 📊 {state.metric.title()} Comparison: {p1} vs {p2}")
+                print("  " + "─" * 46)
+                print(f"  {p1:<22} {fmt_value(v1, prefix) if v1 is not None else 'N/A'}")
+                print(f"  {p2:<22} {fmt_value(v2, prefix) if v2 is not None else 'N/A'}")
+                print(f"  {'Δ Change':<22} {delta_str(v1, v2, prefix)}")
+            else:
+                rows1 = run_query(sql, (start1, end1, state.top_n))
+                rows2 = run_query(sql, (start2, end2, state.top_n))
+                dict1 = {str(r[0]): float(r[1]) for r in rows1 if r[1] is not None}
+                dict2 = {str(r[0]): float(r[1]) for r in rows2 if r[1] is not None}
+                all_names = list(dict.fromkeys(
+                    [str(r[0]) for r in rows1] + [str(r[0]) for r in rows2]
+                ))
+                rank_label = "Top" if state.ranking == "top" else "Bottom"
+                print(f"\nAssistant: 📊 {rank_label} {state.top_n} {entity_label} "
+                      f"by {state.metric}: {p1} vs {p2}")
+                print(f"  {'#':>3}  {'Name':<28}  {p1:>16}  {p2:>16}  {'Δ Change':>14}")
+                print("  " + "─" * 84)
+                for i, name in enumerate(all_names, start=1):
+                    v1 = dict1.get(name)
+                    v2 = dict2.get(name)
+                    col1 = fmt_value(v1, prefix) if v1 is not None else "—"
+                    col2 = fmt_value(v2, prefix) if v2 is not None else "—"
+                    d    = delta_str(v1, v2, prefix)
+                    print(f"  {i:>3}. {name:<28}  {col1:>16}  {col2:>16}  {d:>14}")
+        except Exception as e:
+            print(f"Assistant: Database error — {e}")
 
-    # ---------------------------
-    # Reset state
-    # ---------------------------
+        print_token_summary()
+        state = ConversationState()
+        continue
+
+    # ──────────────────────────────────────────────────────────────────────
+    # NORMAL (single period) MODE
+    # ──────────────────────────────────────────────────────────────────────
+    try:
+        start_date, end_date = parse_date_range(state.time_range, state.raw_time_text)
+    except ValueError:
+        print("Assistant: I couldn't understand the date range. Can you rephrase it?")
+        state = ConversationState()
+        continue
+
+    prefix       = "₹" if state.metric == "revenue" else ""
+    entity_label = ENTITY_LABELS[state.entity]
+
+    rows = (
+        run_query(sql, (start_date, end_date))
+        if state.ranking == "aggregate"
+        else run_query(sql, (start_date, end_date, state.top_n))
+    )
+
+    if not rows or rows[0][0] is None:
+        print("Assistant: No data available for the selected period.")
+    elif state.ranking == "aggregate":
+        value = rows[0][0]
+        print(
+            f"Assistant: Total {state.metric} between "
+            f"{start_date:%d %B %Y} and {end_date:%d %B %Y} "
+            f"is {prefix}{value:,.2f}"
+        )
+    else:
+        rank_label = "Top" if state.ranking == "top" else "Bottom"
+        print(
+            f"Assistant: {rank_label} {state.top_n} {entity_label} by {state.metric} "
+            f"between {start_date:%d %B %Y} and {end_date:%d %B %Y}:"
+        )
+        for i, (name, value) in enumerate(rows, start=1):
+            print(f"  {i}. {name} — {prefix}{value:,.2f}")
+
+    print_token_summary()
     state = ConversationState()
