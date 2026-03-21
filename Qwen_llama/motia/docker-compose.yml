@@ -1,0 +1,16 @@
+services:
+  motia-engine:
+    build:
+      context: ..
+      dockerfile: motia/Dockerfile
+    ports:
+      - "3121:3121"
+      - "3124:3124"
+      - "49134:49134"
+      - "3112:3112"
+    env_file:
+      - ../.env
+    volumes:
+      - ./steps:/app/motia/steps
+      - ./data:/app/motia/data
+    restart: unless-stopped
