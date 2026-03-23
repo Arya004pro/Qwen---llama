@@ -1,6 +1,7 @@
 # Configuration and sensitive files
 Qwen + llama/config.py
 Qwen + llama/test_token.py
+Qwen_llama/charts/
 
 # Python caching
 __pycache__/
