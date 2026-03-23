@@ -1,4 +1,7 @@
-"""Step 3: Ambiguity Check — Qwen 3-32B ambiguity detection + token logging."""
+"""Step 3: Ambiguity Check — Qwen 3-32B ambiguity detection + token logging.
+
+Unchanged except: enqueues query::text.to.sql instead of query::schema.map.
+"""
 
 import os, sys, re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -12,10 +15,13 @@ from utils.token_logger import log_tokens, add_tokens_to_state
 
 config = {
     "name": "AmbiguityCheck",
-    "description": "Validates whether required details are present; requests clarification when the question is incomplete",
+    "description": (
+        "Validates whether required details are present; requests clarification "
+        "when the question is incomplete. Routes to TextToSQL on success."
+    ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::ambiguity.check")],
-    "enqueues": ["query::schema.map"],
+    "enqueues": ["query::text.to.sql"],   # ← updated (was query::schema.map)
 }
 
 
@@ -88,7 +94,6 @@ Known state: {known_state}
             result = response.json()
 
             usage = result.get("usage", {})
-            # ── Token logging ──────────────────────────────────────────────
             log_tokens(ctx, query_id, "AmbiguityCheck", QWEN_MODEL, usage)
             await add_tokens_to_state(ctx, query_id, "AmbiguityCheck", QWEN_MODEL, usage)
 
@@ -116,8 +121,9 @@ Known state: {known_state}
         })
 
     if ambiguity_result == "CLEAR":
+        # ← now routes to TextToSQL instead of SchemaMap
         await ctx.enqueue({
-            "topic": "query::schema.map",
+            "topic": "query::text.to.sql",
             "data":  {"queryId": query_id, "query": user_query, "parsed": parsed},
         })
     else:

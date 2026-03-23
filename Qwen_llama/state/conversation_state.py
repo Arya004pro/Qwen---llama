@@ -43,12 +43,14 @@ class ConversationState:
 
     def _detect_comparison(self, t):
         """
-        Detect cross-period comparisons for:
-          • month vs month    "march vs april 2024"
-          • quarter vs quarter "q1 vs q2 2024"
-          • year vs year       "2023 vs 2024"
-          • month-range vs month-range  "jan to mar vs apr to jun 2024"
-          • compare … and …   "compare revenue in january and march 2024"
+        Detect cross-period comparisons including growth/change queries.
+
+        Patterns caught:
+          • X vs Y                 "march vs april 2024"
+          • compare … and …       "compare revenue in jan and march 2024"
+          • growth / change / diff "revenue growth from Q1 to Q2 2024"
+          • from … to … (two periods) "from january to march vs april to june 2024"
+          • 2+ distinct periods anywhere in the text
         """
         def _both_sides_have_period(sep):
             parts = t.split(sep, 1)
@@ -69,11 +71,40 @@ class ConversationState:
             left, right = parts
             left_ok  = _has_month(left)  or _has_quarter(left)
             right_ok = _has_month(right) or _has_quarter(right)
-            # also catch "compare 2023 and 2024" (year-only on each side)
             if not left_ok and not right_ok:
                 left_ok  = _has_year(left)
                 right_ok = _has_year(right)
             if left_ok and right_ok:
+                return True
+
+        # NEW: growth / change / increase / decrease keywords + two time indicators
+        # Catches: "growth from Q1 to Q2", "change between jan and march",
+        #          "which city had the highest revenue growth from Q1 to Q2 2024"
+        _growth_kw = {"growth", "grew", "increase", "increased", "decrease",
+                      "decreased", "change", "changed", "differ", "difference",
+                      "compare", "comparison", "trend"}
+        if any(kw in t for kw in _growth_kw):
+            months   = [m for m in _MONTH_WORDS  if m in t]
+            quarters = [q for q in _QUARTER_WORDS if q in t]
+            yr_count = _count_years(t)
+            if len(months) >= 2 or len(quarters) >= 2 or yr_count >= 2:
+                return True
+            # "from Q1 to Q2" — two distinct quarter tokens (already caught above)
+            # but also "from january to march" within a single year
+            if len(months) >= 2 or len(quarters) >= 2:
+                return True
+
+        # NEW: "from <period> to <period>" structure (no explicit comparison keyword)
+        # Catches: "from Q1 to Q2 2024", "from January to June 2024"
+        from_to_re = re.compile(
+            r"\bfrom\b.{1,30}?\bto\b",
+            re.IGNORECASE,
+        )
+        if from_to_re.search(t):
+            months   = [m for m in _MONTH_WORDS  if m in t]
+            quarters = [q for q in _QUARTER_WORDS if q in t]
+            yr_count = _count_years(t)
+            if len(months) >= 2 or len(quarters) >= 2 or yr_count >= 2:
                 return True
 
         # "compare/comparison" keyword + two distinct time indicators anywhere
@@ -95,17 +126,17 @@ class ConversationState:
         # ENTITY
         if "product" in t:
             self.entity = "product"
-        elif "category" in t:
+        elif "category" in t or "categor" in t:
             self.entity = "category"
         elif "customer" in t:
             self.entity = "customer"
-        elif "city" in t:
+        elif "city" in t or "cities" in t:
             self.entity = "city"
 
-        # METRIC
-        if "revenue" in t or "sales" in t:
+        # METRIC — revenue signals
+        if "revenue" in t or "sales" in t or "growth" in t or "earning" in t:
             self.metric = "revenue"
-        elif "quantity" in t or "units" in t:
+        elif "quantity" in t or "units" in t or "sold" in t:
             self.metric = "quantity"
 
         # COMPARISON INTENT
@@ -117,8 +148,21 @@ class ConversationState:
             if self.ranking is None:
                 self.ranking = "aggregate"
 
-        # AGGREGATE
-        if any(x in t for x in ["how much", "total", "overall", "sum"]):
+        # THRESHOLD — filtered queries like "categories with more than 10% of revenue"
+        # These need a HAVING clause, not a plain SUM.  Detected BEFORE aggregate
+        # so they don't get collapsed into a featureless total.
+        _threshold_kw = {"more than", "less than", "exceed", "exceeds",
+                         "above", "below", "at least", "at most",
+                         "greater than", "fewer than"}
+        _has_threshold_kw = any(kw in t for kw in _threshold_kw)
+        _has_pct = any(x in t for x in ["percent", "percentage", "%", "proportion"])
+        _has_filter_num = bool(re.search(r"\d+\s*(%|percent|units|orders|times)", t))
+
+        if _has_threshold_kw and (_has_pct or _has_filter_num):
+            self.ranking = "threshold"
+
+        # AGGREGATE — plain totals with no per-entity breakdown
+        elif any(x in t for x in ["how much", "total", "overall", "sum"]):
             self.ranking = "aggregate"
 
         # BOTTOM N
@@ -136,6 +180,12 @@ class ConversationState:
             if m:
                 self.top_n = int(m.group(1))
 
+        # Highest / lowest single result
+        if any(x in t for x in ["highest", "most", "best", "largest", "biggest"]):
+            if self.ranking is None:
+                self.ranking = "top"
+                self.top_n   = 1
+
         # TIME
         if _has_month(t) or _has_quarter(t) or _has_year(t):
             self.time_range = "custom_range"
@@ -144,3 +194,32 @@ class ConversationState:
 
     def is_complete(self):
         return bool(self.entity and self.metric and self.time_range)
+
+    def merge_clarification(self, clarification_text: str):
+        """
+        Apply a follow-up clarification answer on top of the existing state
+        without resetting fields that are already known.
+        Used by the Motia pipeline when routing clarification replies.
+        """
+        t = self.normalize(clarification_text)
+
+        if self.entity is None:
+            if "product" in t:
+                self.entity = "product"
+            elif "category" in t or "categor" in t:
+                self.entity = "category"
+            elif "customer" in t:
+                self.entity = "customer"
+            elif "city" in t or "cities" in t:
+                self.entity = "city"
+
+        if self.metric is None:
+            if "revenue" in t or "sales" in t:
+                self.metric = "revenue"
+            elif "quantity" in t or "units" in t:
+                self.metric = "quantity"
+
+        if self.time_range is None:
+            if _has_month(t) or _has_quarter(t) or _has_year(t):
+                self.time_range    = "custom_range"
+                self.raw_time_text = clarification_text

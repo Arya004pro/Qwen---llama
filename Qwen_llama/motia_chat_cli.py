@@ -1,8 +1,10 @@
 """motia_chat_cli.py — Terminal chat client with chart file generation.
 
-Charts are written to CHART_OUTPUT_DIR (default: ./charts relative to CWD,
-or /charts when running in Docker with the volume mount).
-Open the .html file in your Windows browser directly from that folder.
+Changes vs original:
+  - Passes sessionId back to /query when the previous response was needs_clarification
+    so the pipeline can merge the clarification text into the existing parsed state
+    rather than starting fresh.
+  - Chart output and everything else is unchanged.
 """
 
 import os
@@ -14,8 +16,6 @@ import requests
 API_BASE   = os.getenv("MOTIA_API_URL", "http://host.docker.internal:3121").rstrip("/")
 SUBMIT_URL = f"{API_BASE}/query"
 
-# In Docker: /charts (mounted to Qwen_llama/charts/ on Windows)
-# Locally:   ./charts
 CHART_DIR = os.getenv("CHART_OUTPUT_DIR", os.path.join(os.getcwd(), "charts"))
 
 _PALETTE = [
@@ -60,8 +60,6 @@ new Chart(document.getElementById('c'),{cfg});
 </body>
 </html>"""
 
-
-# ─── helpers ──────────────────────────────────────────────────────────────────
 
 def _border(c):
     return c.replace("0.85", "1")
@@ -112,13 +110,7 @@ def _base(prefix, tip_fn=None, legend=False, index_axis=None):
     return opts
 
 
-# ─── chart config: primary path reads chart_config stored in state ────────────
-
 def _cfg_from_state(result: dict):
-    """
-    Primary: use chart_config already built and stored by format_result_step.
-    Returns the Chart.js config dict, or None if not present.
-    """
     chart_config = result.get("chart_config")
     if not chart_config:
         return None, None, None
@@ -128,13 +120,7 @@ def _cfg_from_state(result: dict):
     return cfg, chart_config.get("title"), chart_config.get("subtitle")
 
 
-# ─── chart config: fallback builds from formattedItems ───────────────────────
-
 def _cfg_from_items(result: dict):
-    """
-    Fallback: rebuild chart config from formattedItems.
-    Used for queries completed before chart_config was stored in state.
-    """
     parsed        = result.get("parsed", {})
     metric        = parsed.get("metric", "revenue")
     ranking       = parsed.get("ranking") or "top"
@@ -236,13 +222,9 @@ def _cfg_from_items(result: dict):
     }
 
 
-# ─── write HTML ───────────────────────────────────────────────────────────────
-
 def _write_chart(result: dict, query_id: str) -> str | None:
-    # 1. Try chart_config stored in state (preferred)
     cfg, title, subtitle = _cfg_from_state(result)
 
-    # 2. Fall back to rebuilding from formattedItems
     if cfg is None:
         cfg = _cfg_from_items(result)
         text     = result.get("formattedText", "")
@@ -280,8 +262,6 @@ def _write_chart(result: dict, query_id: str) -> str | None:
         return None
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
-
 def fetch_result(query_id: str) -> dict:
     r = requests.get(f"{API_BASE}/query/{query_id}", timeout=15)
     r.raise_for_status()
@@ -294,7 +274,6 @@ def print_final(result: dict, query_id: str) -> None:
     if status == "completed":
         text = result.get("formattedText")
         print(f"Assistant: {text}" if text else "Assistant: Query completed.")
-
         path = _write_chart(result, query_id)
         if path:
             win_path = path.replace("/charts/", "Qwen_llama\\charts\\")
@@ -306,14 +285,65 @@ def print_final(result: dict, query_id: str) -> None:
         print(f"Assistant: {result.get('clarification', 'Please clarify your query.')}")
     elif status == "error":
         print(f"Assistant: ⚠  {result.get('error', 'Unknown error.')}")
+        if result.get("sql_source"):
+            print(f"  [sql_source] {result.get('sql_source')}")
+        print(f"  [check Motia logs at http://localhost:3113/logs for the full SQL]")
     else:
         print(f"Assistant: Query finished with status '{status}'.")
+
+
+def submit_query(user_input: str, session_id: str | None = None) -> dict | None:
+    """POST /query, optionally attaching a sessionId for clarification replies."""
+    body = {"query": user_input}
+    if session_id:
+        body["sessionId"] = session_id
+    try:
+        resp = requests.post(SUBMIT_URL, json=body, timeout=20)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        print(f"Assistant: Failed to submit query ({exc}).")
+        return None
+
+
+def poll_until_done(query_id: str) -> dict | None:
+    """Poll /query/{id} until terminal status. Returns final state dict."""
+    deadline    = time.time() + 180
+    last_status = None
+    while time.time() < deadline:
+        try:
+            result = fetch_result(query_id)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                time.sleep(0.7)
+                continue
+            print(f"Assistant: Failed to fetch result ({exc}).")
+            return None
+        except Exception as exc:
+            print(f"Assistant: Failed to fetch result ({exc}).")
+            return None
+
+        status = result.get("status")
+        if status != last_status:
+            print(f"[status] {status}")
+            last_status = status
+
+        if status in {"completed", "error", "needs_clarification"}:
+            return result
+
+        time.sleep(0.7)
+
+    print("Assistant: Timed out. Check Motia Logs/Traces UI.")
+    return None
 
 
 def main() -> None:
     print("Motia Live Chat (type 'exit' to quit)")
     print(f"API    : {API_BASE}")
     print(f"Charts : {CHART_DIR}\n")
+
+    # Track whether the last response was needs_clarification
+    pending_session_id: str | None = None
 
     while True:
         user_input = input("User: ").strip()
@@ -323,12 +353,11 @@ def main() -> None:
         if not user_input:
             continue
 
-        try:
-            resp = requests.post(SUBMIT_URL, json={"query": user_input}, timeout=20)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:
-            print(f"Assistant: Failed to submit query ({exc}).")
+        # If we're answering a clarification, pass the session ID back
+        data = submit_query(user_input, session_id=pending_session_id)
+        pending_session_id = None   # reset; will be re-set if response is needs_clarification
+
+        if not data:
             continue
 
         query_id = data.get("queryId")
@@ -338,33 +367,15 @@ def main() -> None:
 
         print(f"Assistant: Accepted (queryId: {query_id}). Processing...")
 
-        deadline    = time.time() + 180
-        last_status = None
-        while time.time() < deadline:
-            try:
-                result = fetch_result(query_id)
-            except requests.HTTPError as exc:
-                if exc.response is not None and exc.response.status_code == 404:
-                    time.sleep(0.7)
-                    continue
-                print(f"Assistant: Failed to fetch result ({exc}).")
-                break
-            except Exception as exc:
-                print(f"Assistant: Failed to fetch result ({exc}).")
-                break
+        result = poll_until_done(query_id)
+        if result is None:
+            continue
 
-            status = result.get("status")
-            if status != last_status:
-                print(f"[status] {status}")
-                last_status = status
+        print_final(result, query_id)
 
-            if status in {"completed", "error", "needs_clarification"}:
-                print_final(result, query_id)
-                break
-
-            time.sleep(0.7)
-        else:
-            print("Assistant: Timed out. Check Motia Logs/Traces UI.")
+        # If the pipeline is waiting for clarification, remember the session
+        if result.get("status") == "needs_clarification":
+            pending_session_id = query_id
 
         print()
 
