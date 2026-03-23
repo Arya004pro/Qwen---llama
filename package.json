@@ -7,6 +7,7 @@
     "start": "docker compose -f Qwen_llama/docker-compose.chatbot.yml run --rm --build chatbot",
     "dev": "docker compose -f Qwen_llama/motia/docker-compose.yml up -d --build --remove-orphans",
     "dev:down": "docker compose -f Qwen_llama/motia/docker-compose.yml down --remove-orphans",
-    "dev:logs": "docker compose -f Qwen_llama/motia/docker-compose.yml logs -f --tail=200"
+    "dev:logs": "docker compose -f Qwen_llama/motia/docker-compose.yml logs -f --tail=200",
+    "dashboard": "streamlit run streamlit_app.py --server.port 8501"
   }
 }
