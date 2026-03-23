@@ -78,14 +78,24 @@ def _is_safe(sql: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _explain(sql: str) -> tuple[bool, str]:
+def _explain(sql: str, parsed: dict | None = None) -> tuple[bool, str]:
     n = sql.count("%s")
     if n == 0:
         params: tuple = ()
     else:
-        dummy_date = date.today().replace(day=1)
-        dummy_int  = 5
-        params = tuple(dummy_date if i < n - 1 else dummy_int for i in range(n))
+        d   = date.today().replace(day=1)
+        num = 5
+        qt  = (parsed or {}).get("query_type","")
+        thr = (parsed or {}).get("threshold") or {}
+        typ = thr.get("type","")
+        if qt == "threshold" and typ == "percentage" and n == 5:
+            params = (d, d, num, d, d)      # start,end,pct_val,start,end
+        elif qt == "threshold" and typ == "absolute" and n == 3:
+            params = (d, d, num)             # start,end,threshold_val
+        elif qt in ("comparison","growth_ranking") and n == 5:
+            params = (d, d, d, d, num)       # start1,end1,start2,end2,limit
+        else:
+            params = tuple(d if i < n - 1 else num for i in range(n))
     try:
         conn = psycopg2.connect(**POSTGRES)
         cur  = conn.cursor()
@@ -139,7 +149,11 @@ def _call_llm(model: str, prompt: str) -> tuple[str, dict]:
 
 
 def _registry_fallback(parsed: dict) -> str | None:
-    qt     = parsed.get("query_type", "top_n")
+    """Emergency fallback for SIMPLE queries only (top/bottom/aggregate).
+    Never returns SQL for complex types — those must use the builder."""
+    qt = parsed.get("query_type", "top_n")
+    if qt not in ("top_n", "bottom_n", "aggregate"):
+        return None   # complex queries must not fall back to wrong SQL
     entity = parsed.get("entity")
     metric = parsed.get("metric")
     key    = "top" if qt == "top_n" else "bottom" if qt == "bottom_n" else "aggregate"
@@ -174,7 +188,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         if built:
             ok, reason = _is_safe(built)
             if ok:
-                ok2, err = _explain(built)
+                ok2, err = _explain(built, parsed)
                 if ok2:
                     generated_sql = built
                     ctx.logger.info("✅ Builder SQL validated", {"queryId": query_id})
@@ -200,7 +214,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             sql = _extract_sql(raw)
             ok, reason = _is_safe(sql)
             if ok:
-                ok2, err = _explain(sql)
+                ok2, err = _explain(sql, parsed)
                 if ok2:
                     generated_sql = sql
                     ctx.logger.info("✅ LLM SQL validated", {"queryId": query_id})

@@ -121,6 +121,9 @@ def _build_params(sql: str, parsed: dict) -> tuple:
     if n == 4 and qt == "threshold":
         # percentage template: (start, end, start, end)
         return (s, e, s, e)
+    if n == 5 and qt == "threshold" and thr and thr.get("type") == "percentage":
+        # builder percentage SQL: (start, end, pct_value, start, end)
+        return (s, e, thr["value"], s, e)
 
     # Generic: fill date pairs, last slot = limit or threshold
     slots: list = []
@@ -177,6 +180,19 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         qs = await ctx.state.get("queries", query_id)
         await _error(ctx, qs, query_id, f"SQL execution failed: {exc}")
         return
+
+    # Guard: growth_ranking with all-zero period2 = no data (e.g. Q4 beyond dataset)
+    if qt == "growth_ranking" and results:
+        all_zero_p2 = all(r.get("value2", 0) == 0 for r in results)
+        all_zero_p1 = all(r.get("value1", 0) == 0 for r in results)
+        trs = parsed.get("time_ranges", [])
+        if all_zero_p2 and not all_zero_p1 and len(trs) >= 2:
+            qs = await ctx.state.get("queries", query_id)
+            end_p2 = trs[1]["end"] if len(trs) > 1 else "unknown"
+            await _error(ctx, qs, query_id,
+                f"No data found for the second period (ending {end_p2}). "
+                "The dataset may not cover this time range.")
+            return
 
     # Shape validation: detect LLM returning wrong query structure
     _RANKED_TYPES = {"top_n","bottom_n","threshold","intersection","zero_filter","growth_ranking","comparison"}
