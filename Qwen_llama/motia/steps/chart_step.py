@@ -132,10 +132,17 @@ def _build_html(query_state: dict) -> str:
     body = f'<div class="chart-wrap"><canvas id="myChart"></canvas></div>{token_html}'
 
     import json
+    import re
     cfg = chart_config.get("config", {})
+    json_str = json.dumps(cfg, indent=2)
+    # Strip function markers and surrounding quotes so ChartJS sees actual JS functions
+    json_str = json_str.replace('"@@FUNCTION@@', '').replace('@@ENDFUNCTION@@"', '')
+    # Fallback for old cached queries: match string literals starting with function(
+    json_str = re.sub(r'"(function\([cv]\)\{[^"]+\})"', r'\1', json_str)
+    
     script = f"""
 const ctx = document.getElementById('myChart');
-new Chart(ctx, {json.dumps(cfg, indent=2)});
+new Chart(ctx, {json_str});
 """
     return _HTML_TEMPLATE.format(
         title=title, subtitle=subtitle, body=body, script=script

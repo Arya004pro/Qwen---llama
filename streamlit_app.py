@@ -130,7 +130,15 @@ def fetch_chart_html(query_id):
     try:
         r = requests.get(f"{API}/query/{query_id}/chart", timeout=10)
         r.raise_for_status()
-        return r.text
+        text = r.text
+        # Motia runtime might serialize the HTML string as JSON, regardless of headers
+        if text.startswith('"') and text.endswith('"'):
+            import json
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return text
+        return text
     except Exception as e:
         return f"<p style='color:#ef4444'>Could not load chart: {e}</p>"
 
@@ -172,7 +180,7 @@ def render_tokens(usage, totals):
              "Prompt": e.get("prompt_tokens",0),
              "Completion": e.get("completion_tokens",0),
              "Total": e.get("total_tokens",0)} for e in usage]
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, width='stretch', hide_index=True)
     if totals and totals.get("total_tokens"):
         c1, c2, c3 = st.columns(3)
         c1.metric("Prompt tokens",     totals.get("prompt_tokens", 0))
@@ -208,7 +216,7 @@ with left:
     )
     send_col, status_col = st.columns([1, 3])
     send_btn            = send_col.button("Send", disabled=st.session_state.polling,
-                                          use_container_width=True, type="primary")
+                                          width="stretch", type="primary")
     status_placeholder  = status_col.empty()
     clarify_placeholder = st.empty()
     result_placeholder  = st.empty()
@@ -253,86 +261,115 @@ if send_btn and query_input.strip():
         st.session_state.polling = False
         st.error(f"Failed to submit: {e}")
 
-# ── Polling loop ──────────────────────────────────────────────────────────────
+# ── Polling OR Final State ──────────────────────────────────────────────────
+state = None
 if st.session_state.polling and st.session_state.query_id:
     try:
-        state         = fetch_state(st.session_state.query_id)
-        status        = state.get("status", "")
-        completed_idx = STATUS_MAP.get(status, -1)
-        is_error      = status == "error"
-        elapsed       = time.time() - (st.session_state.poll_start or time.time())
-
-        # Record step completion times
-        if completed_idx > st.session_state.last_completed:
-            for idx in range(st.session_state.last_completed + 1, completed_idx + 1):
-                if idx not in st.session_state.step_times:
-                    st.session_state.step_times[idx] = round(elapsed, 1)
-            st.session_state.last_completed = completed_idx
-
-        with steps_placeholder.container():
-            render_steps(completed_idx, is_error, st.session_state.step_times)
-
-        status_placeholder.caption(f"Status: `{status}`")
-
-        if state.get("generated_sql"):
-            with sql_placeholder.container():
-                st.markdown(f'<div class="sql-box">{state["generated_sql"].strip()}</div>',
-                            unsafe_allow_html=True)
-
-        if state.get("token_usage"):
-            with token_placeholder.container():
-                render_tokens(state.get("token_usage"), state.get("token_totals"))
-
-        # ── Terminal states ──────────────────────────────────────────────────
-        if status == "needs_clarification":
-            st.session_state.polling         = False
-            st.session_state.pending_session = st.session_state.query_id
-            q = state.get("clarification", "Please clarify your query.")
-            with clarify_placeholder.container():
-                st.markdown(f'<div class="clarify-box">💬 {q}</div>', unsafe_allow_html=True)
-                answer = st.text_input("Your answer",
-                                       key=f"clarify_{st.session_state.query_id}",
-                                       placeholder="Type your answer and press Enter")
-                if st.button("Reply", key=f"reply_{st.session_state.query_id}", type="primary"):
-                    if answer.strip():
-                        st.session_state.polling        = True
-                        st.session_state.step_times     = {}
-                        st.session_state.last_completed = -1
-                        st.session_state.poll_start     = time.time()
-                        resp = submit_query(answer.strip(),
-                                            session_id=st.session_state.pending_session)
-                        st.session_state.query_id        = resp["queryId"]
-                        st.session_state.pending_session = None
-                        st.rerun()
-
-        elif status == "completed":
-            st.session_state.polling     = False
-            st.session_state.final_state = state
-            text = state.get("formattedText", "Query complete.")
-            with result_placeholder.container():
-                st.markdown('<div class="section-lbl">Result</div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="result-box">{text}</div>', unsafe_allow_html=True)
-                if state.get("chart_config"):
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    with st.expander("📈 View interactive chart", expanded=True):
-                        chart_html = fetch_chart_html(st.session_state.query_id)
-                        components.html(chart_html, height=520, scrolling=False)
-            st.session_state.history.append({"query": query_input or "(reply)", "result": text})
-            status_placeholder.caption("Done ✓ — ask another question")
-
-        elif status == "error":
-            st.session_state.polling = False
-            err = state.get("error", "Unknown error.")
-            with result_placeholder.container():
-                st.markdown('<div class="section-lbl">Result</div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="result-box result-error">⚠ {err}</div>',
-                            unsafe_allow_html=True)
-            status_placeholder.caption("Pipeline error — check Motia logs")
-
-        else:
-            time.sleep(POLL_INTERVAL)
-            st.rerun()
-
+        state = fetch_state(st.session_state.query_id)
     except Exception as e:
         st.session_state.polling = False
         st.error(f"Polling error: {e}")
+elif not st.session_state.polling and st.session_state.final_state:
+    state = st.session_state.final_state
+
+if state:
+    status        = state.get("status", "")
+    target_idx    = STATUS_MAP.get(status, -1)
+    is_error      = status == "error"
+    elapsed       = time.time() - (st.session_state.poll_start or time.time())
+
+    # Record step completion times and visually animate catching up
+    if st.session_state.polling and target_idx > st.session_state.last_completed:
+        for idx in range(st.session_state.last_completed + 1, target_idx + 1):
+            if idx not in st.session_state.step_times:
+                st.session_state.step_times[idx] = round(float(elapsed), 1)
+            
+            # Visually animate the step transitioning
+            st.session_state.last_completed = idx
+            with steps_placeholder.container():
+                render_steps(idx, is_error if idx == target_idx else False, st.session_state.step_times)
+            time.sleep(0.4) # Lively delay between steps
+    else:
+        with steps_placeholder.container():
+            render_steps(st.session_state.last_completed if st.session_state.polling else target_idx, is_error, st.session_state.step_times)
+
+    if st.session_state.polling:
+        status_placeholder.caption(f"Status: `{status}`")
+    elif is_error:
+        status_placeholder.caption("Pipeline error — check Motia logs")
+    else:
+        status_placeholder.caption("Done ✓ — ask another question")
+
+    if state.get("generated_sql"):
+        with sql_placeholder.container():
+            st.markdown(f'<div class="sql-box">{state["generated_sql"].strip()}</div>',
+                        unsafe_allow_html=True)
+
+    if state.get("token_usage"):
+        with token_placeholder.container():
+            render_tokens(state.get("token_usage"), state.get("token_totals"))
+
+    # ── Terminal states ──────────────────────────────────────────────────
+    if status == "needs_clarification":
+        if st.session_state.polling:
+            st.session_state.polling         = False
+            st.session_state.pending_session = st.session_state.query_id
+            st.session_state.final_state     = state
+            st.rerun()
+
+        q = state.get("clarification", "Please clarify your query.")
+        with clarify_placeholder.container():
+            st.markdown(f'<div class="clarify-box">💬 {q}</div>', unsafe_allow_html=True)
+            answer = st.text_input("Your answer",
+                                   key=f"clarify_{st.session_state.query_id}",
+                                   placeholder="Type your answer and press Enter")
+            if st.button("Reply", key=f"reply_{st.session_state.query_id}", type="primary"):
+                if answer.strip():
+                    st.session_state.polling        = True
+                    st.session_state.step_times     = {}
+                    st.session_state.last_completed = -1
+                    st.session_state.poll_start     = time.time()
+                    resp = submit_query(answer.strip(),
+                                        session_id=st.session_state.pending_session)
+                    st.session_state.query_id        = resp["queryId"]
+                    st.session_state.pending_session = None
+                    st.rerun()
+
+    elif status == "completed":
+        if st.session_state.polling:
+            st.session_state.polling     = False
+            st.session_state.final_state = state
+            text = state.get("formattedText", "Query complete.")
+            
+            # Store history item
+            hist_query = query_input if query_input else "(reply)"
+            # Handle empty query text issue implicitly by retrieving previous text if possible
+            st.session_state.history.append({"query": hist_query, "result": text})
+            st.rerun()
+
+        text = state.get("formattedText", "Query complete.")
+        with result_placeholder.container():
+            st.markdown('<div class="section-lbl">Result</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="result-box">{text}</div>', unsafe_allow_html=True)
+            if state.get("chart_config"):
+                st.markdown("<br>", unsafe_allow_html=True)
+                with st.expander("📈 View interactive chart", expanded=True):
+                    chart_html = fetch_chart_html(st.session_state.query_id)
+                    components.html(chart_html, height=520, scrolling=False)
+
+    elif status == "error":
+        if st.session_state.polling:
+            st.session_state.polling = False
+            st.session_state.final_state = state
+            st.rerun()
+
+        err = state.get("error", "Unknown error.")
+        with result_placeholder.container():
+            st.markdown('<div class="section-lbl">Result</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="result-box result-error">⚠ {err}</div>',
+                        unsafe_allow_html=True)
+
+    else:
+        if st.session_state.polling:
+            time.sleep(POLL_INTERVAL)
+            st.rerun()
