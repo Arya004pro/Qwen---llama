@@ -56,11 +56,17 @@ def _extract_all_years(text: str) -> list[int]:
 
 
 def _extract_months_ordered(text: str) -> list[int]:
+    """Extract month numbers in order, with fuzzy matching for common typos."""
+    import difflib as _dl
     found = []
     for w in text.split():
         k = w.strip(",.?:()")
         if k in MONTHS:
             found.append(MONTHS[k])
+        elif len(k) >= 3:   # Only attempt fuzzy on words long enough to be a month
+            matches = _dl.get_close_matches(k, MONTHS.keys(), n=1, cutoff=0.80)
+            if matches:
+                found.append(MONTHS[matches[0]])
     return found
 
 
@@ -143,6 +149,13 @@ def parse_date_range(time_range: str, raw_text: str) -> tuple[date, date]:
     q = _extract_quarter(text)
     if q:
         return _quarter_range(q[0], q[1], year)
+
+    # Named half/period patterns — checked before falling back to full year
+    # "first half", "H1", "jan to jun" style (no explicit month tokens)
+    if any(p in text for p in ["first half", "h1", "jan-jun", "jan to jun"]):
+        return date(year, 1, 1), date(year, 6, 30)
+    if any(p in text for p in ["second half", "h2", "jul-dec", "jul to dec"]):
+        return date(year, 7, 1), date(year, 12, 31)
 
     tokens = text.replace(",", "").split()
     nums   = [t for t in tokens if t.isdigit()]

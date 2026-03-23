@@ -1,14 +1,11 @@
 """Step 4: Text-to-SQL
 
-Routes queries to the right SQL source:
-  - Absolute threshold  → SQL_REGISTRY (no LLM call needed)
-  - Percentage threshold → Qwen (complex HAVING subquery)
-  - Top / bottom / aggregate → LLaMA (standard registry fallback available)
-  - Zero filter, top_growth, intersection → handled by execute_query_step directly
-    (no SQL generation needed; execute_query uses registry SQL)
-  - Other threshold      → Qwen
+Primary path: db/sql_builder.py generates deterministic parameterized SQL
+              from Qwen's structured intent for all standard query types.
+LLM path:     Only when intent has custom filters (gender, age, state name
+              in WHERE, region_id) that require SQL the builder can't produce.
 
-All values (threshold, limit, dates) come from parsed intent — nothing hardcoded.
+This eliminates LLM SQL hallucination for standard analytics queries.
 """
 
 import os, sys, re, logging
@@ -20,50 +17,33 @@ for _p in [_STEPS_DIR, _MOTIA_DIR, _PROJECT_ROOT]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import requests
-import psycopg2
+import requests, psycopg2
 from datetime import date
 from typing import Any
 from motia import FlowContext, queue
 
 from shared_config import GROQ_API_TOKEN, LLAMA_MODEL, QWEN_MODEL, GROQ_URL, POSTGRES
 from utils.token_logger import log_tokens, add_tokens_to_state
-from db.sql_registry import SQL_REGISTRY
+from db.schema_context import get_schema_prompt
+from db.sql_builder import build_sql
+
+try:
+    from db.sql_registry import SQL_REGISTRY
+except ImportError:
+    SQL_REGISTRY = {}
 
 logger = logging.getLogger(__name__)
 
 config = {
     "name": "TextToSQL",
     "description": (
-        "Generates or resolves SQL for the query. "
-        "Absolute thresholds use registry SQL directly (no LLM). "
-        "Percentage thresholds use Qwen. Standard queries use LLaMA with registry fallback."
+        "Builds SQL deterministically from Qwen intent for all standard queries. "
+        "Uses LLM only for custom-filter queries (gender, age, state conditions)."
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::text.to.sql")],
     "enqueues": ["query::execute"],
 }
-
-_SCHEMA = """
-Database schema
----------------
-orders        : order_id, customer_id, order_date DATE, total_amount NUMERIC
-order_items   : order_item_id, order_id, product_id, quantity INT, item_price NUMERIC
-products      : product_id, product_name, category_id
-categories    : category_id, category_name
-customers     : customer_id, customer_name, city_id
-cities        : city_id, city_name
-
-Revenue rules
--------------
-Product/category revenue = SUM(oi.quantity * oi.item_price)
-Customer/city revenue    = SUM(o.total_amount)
-Quantity                 = SUM(oi.quantity)
-Always filter: o.order_date BETWEEN %s AND %s
-
-Param order: ranked=(start, end, limit::int)  aggregate/threshold_abs=(start, end, value)
-Use %s for ALL placeholders — never hard-code dates or numbers.
-"""
 
 _THINK_RE    = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _SQL_LINE_RE = re.compile(r"(?im)^(WITH|SELECT)\b")
@@ -89,7 +69,7 @@ def _extract_sql(raw: str) -> str:
 
 def _is_safe(sql: str) -> tuple[bool, str]:
     if not _SQL_LINE_RE.match(sql):
-        return False, f"no WITH/SELECT at line start — got: {sql[:80]!r}"
+        return False, f"does not start WITH/SELECT: {sql[:80]!r}"
     m = _FORBIDDEN.search(sql)
     if m:
         return False, f"forbidden keyword: {m.group()!r}"
@@ -98,25 +78,14 @@ def _is_safe(sql: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _explain(sql: str, ranking: str, threshold_value=None) -> tuple[bool, str]:
-    d0, d1, lim = date(2024, 1, 1), date(2024, 1, 31), 5
+def _explain(sql: str) -> tuple[bool, str]:
     n = sql.count("%s")
     if n == 0:
         params: tuple = ()
-    elif n == 3 and ranking in ("top", "bottom"):
-        params = (d0, d1, lim)
-    elif n == 3 and ranking == "threshold":
-        params = (d0, d1, threshold_value or 100)
-    elif n == 2:
-        params = (d0, d1)
     else:
-        slots = []
-        for i in range(n):
-            if i == n - 1 and ranking in ("top", "bottom") and n % 2 == 1:
-                slots.append(lim)
-            else:
-                slots.append(d0 if i % 2 == 0 else d1)
-        params = tuple(slots)
+        dummy_date = date.today().replace(day=1)
+        dummy_int  = 5
+        params = tuple(dummy_date if i < n - 1 else dummy_int for i in range(n))
     try:
         conn = psycopg2.connect(**POSTGRES)
         cur  = conn.cursor()
@@ -128,63 +97,40 @@ def _explain(sql: str, ranking: str, threshold_value=None) -> tuple[bool, str]:
         return False, str(exc).split("\n")[0]
 
 
-def _build_prompt(entity, metric, ranking, top_n, raw_query,
-                  threshold_value=None, threshold_type=None) -> str:
-    """
-    Build LLM prompt. threshold_value / threshold_type are passed through
-    directly from the parser — never hardcoded here.
-    """
-    if ranking == "threshold" and threshold_type == "percentage":
-        pct = threshold_value or "N"
-        rank_instr = (
-            f"The user wants entities where the {metric} exceeds {pct}% of the "
-            f"total {metric} in the period.\n"
-            "Use a HAVING clause with a correlated subquery:\n"
-            f"  HAVING SUM(...) > ({pct} / 100.0) * (\n"
-            "    SELECT SUM(...) FROM ... WHERE order_date BETWEEN %s AND %s\n"
-            "  )\n"
-            "Alias group-by col as 'name', metric as 'value'. End ORDER BY value DESC. NO LIMIT."
-        )
-    elif ranking in ("top", "top_growth"):
-        rank_instr = (
-            f"Return top {top_n} rows.\n"
-            "End with: ORDER BY value DESC\nLIMIT %s"
-        )
-    elif ranking == "bottom":
-        rank_instr = (
-            f"Return bottom {top_n} rows.\n"
-            "End with: ORDER BY value ASC\nLIMIT %s"
-        )
-    elif ranking == "aggregate":
-        rank_instr = (
-            "Return ONE scalar row, one column aliased 'value'. "
-            "No GROUP BY, ORDER BY, or LIMIT."
-        )
-    else:
-        rank_instr = f"Return top {top_n} rows ORDER BY value DESC LIMIT %s"
+def _build_llm_prompt(user_query: str, parsed: dict) -> str:
+    """Only used for custom-filter queries."""
+    filters = parsed.get("filters", {})
+    filter_desc = ", ".join(f"{k}={v}" for k, v in filters.items()) if filters else "none"
+    return f"""You are a PostgreSQL expert. Output ONLY raw SQL — no prose, no markdown.
 
-    user_line = f'User question: "{raw_query}"\n' if raw_query else ""
+User question: "{user_query}"
 
-    return (
-        "You are a PostgreSQL expert. Output ONLY raw SQL — no prose, no markdown.\n"
-        f"{user_line}\n"
-        f"{_SCHEMA}\n"
-        f"Task: entity={entity}  metric={metric}  ranking={ranking}\n\n"
-        "Rules:\n"
-        "- Alias group-by column as  name  and aggregation as  value\n"
-        "- Use %s for ALL date/limit/value placeholders\n"
-        f"- {rank_instr}\n\n"
-        "SQL:"
-    )
+{get_schema_prompt()}
+
+Intent: {parsed}
+
+Custom filters to apply: {filter_desc}
+
+Build a SELECT query that:
+- Aliases the primary group-by column as "name"
+- Aliases the metric aggregation as "value"
+- Applies the custom filters in the WHERE clause
+- Uses %s for ALL date/number placeholders
+- No semicolons, no comments
+
+SQL:"""
 
 
-def _call_llm(model: str, prompt_text: str) -> tuple[str, dict]:
+def _call_llm(model: str, prompt: str) -> tuple[str, dict]:
     resp = requests.post(
         GROQ_URL,
         headers={"Authorization": f"Bearer {GROQ_API_TOKEN}",
                  "Content-Type": "application/json"},
-        json={"model": model, "messages": [{"role": "user", "content": prompt_text}],
-              "max_tokens": 1024, "temperature": 0.0},
+        json={
+            "model":    model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1024, "temperature": 0.0,
+        },
         timeout=45,
     )
     resp.raise_for_status()
@@ -192,100 +138,110 @@ def _call_llm(model: str, prompt_text: str) -> tuple[str, dict]:
     return data["choices"][0]["message"]["content"].strip(), data.get("usage", {})
 
 
+def _registry_fallback(parsed: dict) -> str | None:
+    qt     = parsed.get("query_type", "top_n")
+    entity = parsed.get("entity")
+    metric = parsed.get("metric")
+    key    = "top" if qt == "top_n" else "bottom" if qt == "bottom_n" else "aggregate"
+    try:
+        return SQL_REGISTRY[entity][metric][key]
+    except (KeyError, TypeError):
+        return None
+
+
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
-    query_id        = input_data.get("queryId")
-    user_query      = input_data.get("query", "")
-    parsed          = input_data.get("parsed", {})
+    query_id   = input_data.get("queryId")
+    user_query = input_data.get("query", "")
+    parsed     = input_data.get("parsed", {})
 
-    entity          = parsed.get("entity")
-    metric          = parsed.get("metric")
-    ranking         = parsed.get("ranking") or "top"
-    top_n           = parsed.get("top_n", 5) or 5
-    is_growth_ranking = parsed.get("is_growth_ranking", False)
-    is_intersection = parsed.get("is_intersection", False)
-    threshold_value = parsed.get("threshold_value")
-    threshold_type  = parsed.get("threshold_type")
+    # Stash user query in parsed so builder can check sort direction
+    parsed["_user_query"] = user_query
 
-    # ── Modes that need no LLM — pass straight to execute ─────────────────────
-    skip_llm_modes = {"zero_filter", "top_growth"}
-    if (ranking in skip_llm_modes or is_growth_ranking or is_intersection
-            or (ranking == "threshold" and threshold_type == "absolute")):
-        ctx.logger.info("⚡ Skipping LLM — using registry SQL directly", {
-            "queryId": query_id, "ranking": ranking,
-            "threshold_type": threshold_type,
-        })
-        await ctx.enqueue({
-            "topic": "query::execute",
-            "data":  {
-                "queryId":        query_id,
-                "query":          user_query,
-                "parsed":         parsed,
-                "generated_sql":  None,   # execute_query will use registry
-            },
-        })
-        return
+    qt      = parsed.get("query_type", "top_n")
+    filters = parsed.get("filters", {})
 
-    # ── LLM routing ──────────────────────────────────────────────────────────
-    # Percentage threshold → Qwen (needs complex subquery)
-    # Everything else → LLaMA (with registry fallback in execute_query)
-    model = (QWEN_MODEL
-             if (ranking == "threshold" and threshold_type == "percentage")
-             else LLAMA_MODEL)
+    ctx.logger.info("🧬 TextToSQL", {"queryId": query_id, "query_type": qt,
+                                      "has_filters": bool(filters)})
 
-    ctx.logger.info("🧬 TextToSQL via LLM", {
-        "queryId": query_id, "model": model,
-        "entity": entity, "metric": metric, "ranking": ranking,
-    })
-
-    prompt_text   = _build_prompt(entity, metric, ranking, top_n, user_query,
-                                   threshold_value, threshold_type)
     generated_sql = None
     usage         = {}
+    fallback_used = False
+    sql_source    = "builder"
 
-    try:
-        raw, usage = _call_llm(model, prompt_text)
-        ctx.logger.info("🔬 LLM raw", {"queryId": query_id, "preview": raw[:400]})
-        sql = _extract_sql(raw)
-        ctx.logger.info("🔬 Extracted SQL", {"queryId": query_id, "sql": sql})
-        ok, reason = _is_safe(sql)
-        if not ok:
-            ctx.logger.warn("⚠️ Safety FAILED", {"queryId": query_id, "reason": reason})
-        else:
-            ok2, err = _explain(sql, ranking, threshold_value)
-            if not ok2:
-                ctx.logger.warn("⚠️ EXPLAIN FAILED",
-                                {"queryId": query_id, "error": err, "sql": sql})
+    # ── Primary path: deterministic builder ───────────────────────────────────
+    if not filters:
+        built = build_sql(parsed)
+        if built:
+            ok, reason = _is_safe(built)
+            if ok:
+                ok2, err = _explain(built)
+                if ok2:
+                    generated_sql = built
+                    ctx.logger.info("✅ Builder SQL validated", {"queryId": query_id})
+                else:
+                    ctx.logger.warn("⚠️ Builder EXPLAIN failed", {"queryId": query_id, "error": err})
             else:
-                generated_sql = sql
-                ctx.logger.info("✅ SQL validated", {"queryId": query_id})
-    except Exception as exc:
-        ctx.logger.error("❌ LLM call error", {"queryId": query_id, "error": str(exc)})
+                ctx.logger.warn("⚠️ Builder safety failed", {"queryId": query_id, "reason": reason})
 
-    if usage:
-        log_tokens(ctx, query_id, "TextToSQL", model, usage)
-        await add_tokens_to_state(ctx, query_id, "TextToSQL", model, usage)
+    # ── LLM path: custom filters OR builder failed ─────────────────────────────
+    if generated_sql is None:
+        # Complex queries → Qwen; simple → LLaMA
+        COMPLEX = {"growth_ranking", "comparison", "threshold", "intersection", "zero_filter"}
+        model   = QWEN_MODEL if qt in COMPLEX else LLAMA_MODEL
+        sql_source = f"llm_{model.split('/')[0]}"
 
-    # If LLM failed for percentage threshold, error out (no safe registry fallback)
-    if generated_sql is None and ranking == "threshold" and threshold_type == "percentage":
-        msg = (
-            f"Percentage threshold SQL generation failed "
-            f"(entity={entity}, metric={metric}). "
-            "Check http://localhost:3113/logs for details."
-        )
-        qs = await ctx.state.get("queries", query_id)
-        if qs:
-            await ctx.state.set("queries", query_id, {
-                **qs, "status": "error", "error": msg,
-            })
-        return
+        ctx.logger.info("🤖 LLM SQL generation", {"queryId": query_id, "model": model})
+
+        try:
+            prompt      = _build_llm_prompt(user_query, parsed)
+            raw, usage  = _call_llm(model, prompt)
+            ctx.logger.info("🔬 LLM raw", {"queryId": query_id, "preview": raw[:400]})
+
+            sql = _extract_sql(raw)
+            ok, reason = _is_safe(sql)
+            if ok:
+                ok2, err = _explain(sql)
+                if ok2:
+                    generated_sql = sql
+                    ctx.logger.info("✅ LLM SQL validated", {"queryId": query_id})
+                else:
+                    ctx.logger.warn("⚠️ LLM EXPLAIN failed", {"queryId": query_id, "error": err})
+            else:
+                ctx.logger.warn("⚠️ LLM safety failed", {"queryId": query_id, "reason": reason})
+        except Exception as exc:
+            ctx.logger.error("❌ LLM error", {"queryId": query_id, "error": str(exc)})
+
+        if usage:
+            log_tokens(ctx, query_id, "TextToSQL", model, usage)
+            await add_tokens_to_state(ctx, query_id, "TextToSQL", model, usage)
+
+    # ── Emergency registry fallback (simple queries only) ─────────────────────
+    if generated_sql is None:
+        fb = _registry_fallback(parsed)
+        if fb:
+            generated_sql = fb
+            fallback_used = True
+            sql_source    = "registry_fallback"
+            ctx.logger.warn("⚠️ Registry fallback used", {"queryId": query_id})
+        else:
+            msg = (
+                f"Could not generate SQL for query_type={qt} "
+                f"entity={parsed.get('entity')} metric={parsed.get('metric')}."
+            )
+            qs = await ctx.state.get("queries", query_id)
+            if qs:
+                await ctx.state.set("queries", query_id, {
+                    **qs, "status": "error", "error": msg,
+                })
+            return
 
     qs = await ctx.state.get("queries", query_id)
     if qs:
         await ctx.state.set("queries", query_id, {
-            **qs,
-            "status":        "sql_generated",
+            **qs, "status": "sql_generated",
             "generated_sql": generated_sql,
-            "sql_fallback":  generated_sql is None,
+            "sql_source":    sql_source,
+            "sql_fallback":  fallback_used,
         })
 
     await ctx.enqueue({

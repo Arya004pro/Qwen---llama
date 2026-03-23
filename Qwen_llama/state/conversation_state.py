@@ -258,13 +258,18 @@ class ConversationState:
                 self.entity = "product"
 
             if self._detect_growth_ranking(t):
-                # Rank entities by their growth delta
                 self.is_growth_ranking = True
                 self.ranking           = "top_growth"
-                # top_n overridden below if user said "top N"
             else:
                 if self.ranking is None:
-                    self.ranking = "aggregate"
+                    # "by category/product/city/customer" in the query means
+                    # the user wants a per-entity breakdown, not a single total
+                    _by_entity = any(p in t for p in [
+                        "by category", "by product", "by city",
+                        "by customer", "per category", "per product",
+                        "per city", "per customer",
+                    ])
+                    self.ranking = "top" if _by_entity else "aggregate"
 
         # ── intersection ──────────────────────────────────────────────────────
         elif self._detect_intersection(t):

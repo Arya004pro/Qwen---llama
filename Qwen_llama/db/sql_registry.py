@@ -57,6 +57,22 @@ SQL_REGISTRY = {
                 HAVING SUM(oi.quantity * oi.item_price) > %s
                 ORDER BY value DESC;
             """,
+            "threshold_percentage_tmpl": """
+                SELECT p.product_name AS name,
+                       SUM(oi.quantity * oi.item_price) AS value
+                FROM order_items oi
+                JOIN orders o ON oi.order_id = o.order_id
+                JOIN products p ON oi.product_id = p.product_id
+                WHERE o.order_date BETWEEN %s AND %s
+                GROUP BY p.product_name
+                HAVING SUM(oi.quantity * oi.item_price) > {pct} * (
+                    SELECT SUM(oi2.quantity * oi2.item_price)
+                    FROM order_items oi2
+                    JOIN orders o2 ON oi2.order_id = o2.order_id
+                    WHERE o2.order_date BETWEEN %s AND %s
+                )
+                ORDER BY value DESC;
+            """,
             # Zero filter: products with NO revenue in the period
             "zero_filter": """
                 SELECT p.product_name AS name, 0 AS value
@@ -114,6 +130,22 @@ SQL_REGISTRY = {
                 HAVING SUM(oi.quantity) > %s
                 ORDER BY value DESC;
             """,
+            "threshold_percentage_tmpl": """
+                SELECT p.product_name AS name,
+                       SUM(oi.quantity) AS value
+                FROM order_items oi
+                JOIN orders o ON oi.order_id = o.order_id
+                JOIN products p ON oi.product_id = p.product_id
+                WHERE o.order_date BETWEEN %s AND %s
+                GROUP BY p.product_name
+                HAVING SUM(oi.quantity) > {pct} * (
+                    SELECT SUM(oi2.quantity)
+                    FROM order_items oi2
+                    JOIN orders o2 ON oi2.order_id = o2.order_id
+                    WHERE o2.order_date BETWEEN %s AND %s
+                )
+                ORDER BY value DESC;
+            """,
             # Zero filter: products with NO units sold in the period
             "zero_filter": """
                 SELECT p.product_name AS name, 0 AS value
@@ -166,6 +198,20 @@ SQL_REGISTRY = {
                 WHERE o.order_date BETWEEN %s AND %s
                 GROUP BY c.customer_name
                 HAVING SUM(o.total_amount) > %s
+                ORDER BY value DESC;
+            """,
+            "threshold_percentage_tmpl": """
+                SELECT c.customer_name AS name,
+                       SUM(o.total_amount) AS value
+                FROM orders o
+                JOIN customers c ON o.customer_id = c.customer_id
+                WHERE o.order_date BETWEEN %s AND %s
+                GROUP BY c.customer_name
+                HAVING SUM(o.total_amount) > {pct} * (
+                    SELECT SUM(o2.total_amount)
+                    FROM orders o2
+                    WHERE o2.order_date BETWEEN %s AND %s
+                )
                 ORDER BY value DESC;
             """,
             "zero_filter": """
@@ -223,6 +269,21 @@ SQL_REGISTRY = {
                 WHERE o.order_date BETWEEN %s AND %s
                 GROUP BY ci.city_name
                 HAVING SUM(o.total_amount) > %s
+                ORDER BY value DESC;
+            """,
+            "threshold_percentage_tmpl": """
+                SELECT ci.city_name AS name,
+                       SUM(o.total_amount) AS value
+                FROM orders o
+                JOIN customers cu ON o.customer_id = cu.customer_id
+                JOIN cities ci ON cu.city_id = ci.city_id
+                WHERE o.order_date BETWEEN %s AND %s
+                GROUP BY ci.city_name
+                HAVING SUM(o.total_amount) > {pct} * (
+                    SELECT SUM(o2.total_amount)
+                    FROM orders o2
+                    WHERE o2.order_date BETWEEN %s AND %s
+                )
                 ORDER BY value DESC;
             """,
             "zero_filter": """
@@ -287,6 +348,23 @@ SQL_REGISTRY = {
                 HAVING SUM(oi.quantity * oi.item_price) > %s
                 ORDER BY value DESC;
             """,
+            "threshold_percentage_tmpl": """
+                SELECT cat.category_name AS name,
+                       SUM(oi.quantity * oi.item_price) AS value
+                FROM order_items oi
+                JOIN products p ON oi.product_id = p.product_id
+                JOIN categories cat ON p.category_id = cat.category_id
+                JOIN orders o ON oi.order_id = o.order_id
+                WHERE o.order_date BETWEEN %s AND %s
+                GROUP BY cat.category_name
+                HAVING SUM(oi.quantity * oi.item_price) > {pct} * (
+                    SELECT SUM(oi2.quantity * oi2.item_price)
+                    FROM order_items oi2
+                    JOIN orders o2 ON oi2.order_id = o2.order_id
+                    WHERE o2.order_date BETWEEN %s AND %s
+                )
+                ORDER BY value DESC;
+            """,
             "zero_filter": """
                 SELECT cat.category_name AS name, 0 AS value
                 FROM categories cat
@@ -345,6 +423,23 @@ SQL_REGISTRY = {
                 WHERE o.order_date BETWEEN %s AND %s
                 GROUP BY cat.category_name
                 HAVING SUM(oi.quantity) > %s
+                ORDER BY value DESC;
+            """,
+            "threshold_percentage_tmpl": """
+                SELECT cat.category_name AS name,
+                       SUM(oi.quantity) AS value
+                FROM order_items oi
+                JOIN products p ON oi.product_id = p.product_id
+                JOIN categories cat ON p.category_id = cat.category_id
+                JOIN orders o ON oi.order_id = o.order_id
+                WHERE o.order_date BETWEEN %s AND %s
+                GROUP BY cat.category_name
+                HAVING SUM(oi.quantity) > {pct} * (
+                    SELECT SUM(oi2.quantity)
+                    FROM order_items oi2
+                    JOIN orders o2 ON oi2.order_id = o2.order_id
+                    WHERE o2.order_date BETWEEN %s AND %s
+                )
                 ORDER BY value DESC;
             """,
             "zero_filter": """
