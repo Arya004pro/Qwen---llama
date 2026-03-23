@@ -20,6 +20,7 @@ Thumbs.db
 *.swo
 .idea/
 .vscode/
+Qwen_llama/charts/
 
 # ── Motia Specific ────────────────────────────────────────
 motia/bin/

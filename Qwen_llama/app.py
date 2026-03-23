@@ -4,7 +4,11 @@ from llm.llama_schema import extract_schema
 
 from db.sql_registry import SQL_REGISTRY
 from db.executor import run_query
-from utils.date_parser import parse_date_range, parse_comparison_date_ranges
+from utils.date_parser import (
+    parse_date_range,
+    parse_comparison_date_ranges,
+    parse_both_date_ranges,           # NEW
+)
 from utils.token_logger import reset_session_totals, get_session_totals
 
 print("AI Analytics Assistant (type 'exit' to quit)")
@@ -12,9 +16,9 @@ print("AI Analytics Assistant (type 'exit' to quit)")
 state = ConversationState()
 
 ENTITY_LABELS = {
-    "product": "products",
+    "product":  "products",
     "customer": "customers",
-    "city": "cities",
+    "city":     "cities",
     "category": "categories",
 }
 
@@ -94,24 +98,91 @@ while True:
     if state.ranking in ("top", "bottom") and state.top_n <= 0:
         state.top_n = 5
 
-    try:
-        sql = SQL_REGISTRY[state.entity][state.metric][state.ranking]
-    except KeyError:
-        print("Assistant: I can't answer this type of question yet.")
+    # ──────────────────────────────────────────────────────────────────────
+    # INTERSECTION MODE — "both X and Y"
+    # ──────────────────────────────────────────────────────────────────────
+    if state.is_intersection:
+        try:
+            (start1, end1), (start2, end2) = parse_both_date_ranges(
+                state.raw_time_text or user_input
+            )
+        except ValueError:
+            print("Assistant: I couldn't parse the two time periods. "
+                  "Try: 'Top 3 customers by revenue in both January and March 2024'")
+            state = ConversationState()
+            continue
+
+        import calendar as _cal
+        p1     = f"{_cal.month_name[start1.month]} {start1.year}"
+        p2     = f"{_cal.month_name[start2.month]} {start2.year}"
+        prefix = "₹" if state.metric == "revenue" else ""
+        entity_label = ENTITY_LABELS[state.entity]
+
+        # Fetch both periods using top-N SQL with a large limit so we capture
+        # all entities that might appear in both sets.
+        try:
+            top_sql = SQL_REGISTRY[state.entity][state.metric]["top"]
+        except KeyError:
+            print("Assistant: I can't answer this type of question yet.")
+            state = ConversationState()
+            continue
+
+        BIG_LIMIT = 500
+        try:
+            rows1 = run_query(top_sql, (start1, end1, BIG_LIMIT))
+            rows2 = run_query(top_sql, (start2, end2, BIG_LIMIT))
+        except Exception as e:
+            print(f"Assistant: Database error — {e}")
+            state = ConversationState()
+            continue
+
+        dict1 = {str(r[0]): float(r[1]) for r in rows1 if r[1] is not None}
+        dict2 = {str(r[0]): float(r[1]) for r in rows2 if r[1] is not None}
+
+        common_names = set(dict1) & set(dict2)
+
+        if not common_names:
+            print(f"Assistant: No {entity_label} placed orders in "
+                  f"BOTH {p1} AND {p2}.")
+            print_token_summary()
+            state = ConversationState()
+            continue
+
+        # Rank by combined value, take top_n
+        combined = sorted(
+            [(n, dict1[n] + dict2[n]) for n in common_names],
+            key=lambda x: x[1],
+            reverse=True,
+        )[: state.top_n]
+
+        print(f"\nAssistant: 🔀 Top {len(combined)} {entity_label} present in "
+              f"BOTH {p1} AND {p2} (combined {state.metric}):")
+        for i, (name, value) in enumerate(combined, start=1):
+            print(f"  {i}. {name} — {prefix}{value:,.2f}")
+
+        print_token_summary()
         state = ConversationState()
         continue
 
     # ──────────────────────────────────────────────────────────────────────
-    # COMPARISON MODE
+    # COMPARISON MODE — "X vs Y" / "from Q1 to Q2" / "growth…"
     # ──────────────────────────────────────────────────────────────────────
     if state.is_comparison:
+        try:
+            sql = SQL_REGISTRY[state.entity][state.metric][state.ranking]
+        except KeyError:
+            print("Assistant: I can't answer this type of question yet.")
+            state = ConversationState()
+            continue
+
         try:
             (start1, end1), (start2, end2) = parse_comparison_date_ranges(
                 state.raw_time_text or user_input
             )
         except ValueError:
             print("Assistant: I couldn't parse the two time periods. "
-                  "Try: 'Compare revenue in March vs April 2024'")
+                  "Try: 'Compare revenue in March vs April 2024' or "
+                  "'Revenue growth from Q1 to Q2 2024'")
             state = ConversationState()
             continue
 
@@ -162,6 +233,13 @@ while True:
     # ──────────────────────────────────────────────────────────────────────
     # NORMAL (single period) MODE
     # ──────────────────────────────────────────────────────────────────────
+    try:
+        sql = SQL_REGISTRY[state.entity][state.metric][state.ranking]
+    except KeyError:
+        print("Assistant: I can't answer this type of question yet.")
+        state = ConversationState()
+        continue
+
     try:
         start_date, end_date = parse_date_range(state.time_range, state.raw_time_text)
     except ValueError:
