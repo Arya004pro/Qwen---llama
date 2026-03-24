@@ -23,6 +23,7 @@ Intent JSON schema
 """
 
 import os, sys, re, json
+from datetime import datetime, timezone
 
 _STEPS_DIR    = os.path.dirname(os.path.abspath(__file__))
 _MOTIA_DIR    = os.path.dirname(_STEPS_DIR)
@@ -147,7 +148,13 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
 
     qs = await ctx.state.get("queries", query_id)
     if qs:
-        await ctx.state.set("queries", query_id, {**qs, "status": "intent_parsed", "parsed": parsed})
+        now_iso = datetime.now(timezone.utc).isoformat()
+        prev_ts = qs.get("status_timestamps", {})
+        await ctx.state.set("queries", query_id, {
+            **qs, "status": "intent_parsed", "parsed": parsed,
+            "updatedAt": now_iso,
+            "status_timestamps": {**prev_ts, "intent_parsed": now_iso},
+        })
 
     await ctx.enqueue({
         "topic": "query::ambiguity.check",

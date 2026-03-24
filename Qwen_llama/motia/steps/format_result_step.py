@@ -34,9 +34,10 @@ _BORDERS = [c.replace("0.85","1") for c in _PALETTE]
 
 _BASE = {
     "responsive": True, "maintainAspectRatio": True,
+    "interaction": {"mode": "nearest", "intersect": True},
     "plugins": {
         "legend": {"display": False},
-        "tooltip": {"backgroundColor":"#1e2130","titleColor":"#e2e8f0",
+        "tooltip": {"enabled": True, "backgroundColor":"#1e2130","titleColor":"#e2e8f0",
                     "bodyColor":"#94a3b8","borderColor":"#2d3148","borderWidth":1},
     },
     "scales": {
@@ -257,11 +258,15 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
 
     ctx.logger.info("✅ Formatted", {"queryId": query_id})
     if qs:
+        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        prev_ts = qs.get("status_timestamps", {})
         await ctx.state.set("queries", query_id, {
             **qs, "status": "completed",
             "formattedText": formatted_text, "formattedItems": items,
             "chart_config":  chart_config,
             "token_usage":   token_usage, "token_totals": token_totals,
-            "completedAt":   _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "completedAt":   now_iso,
+            "updatedAt": now_iso,
+            "status_timestamps": {**prev_ts, "completed": now_iso},
         })
     ctx.logger.info("🏁 Pipeline complete!", {"queryId": query_id})

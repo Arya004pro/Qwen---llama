@@ -4,6 +4,7 @@ import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import requests, json
+from datetime import datetime, timezone
 from typing import Any
 from motia import FlowContext, queue
 
@@ -89,10 +90,14 @@ Return ONLY valid JSON in this format:
 
     query_state = await ctx.state.get("queries", query_id)
     if query_state:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        prev_ts = query_state.get("status_timestamps", {})
         await ctx.state.set("queries", query_id, {
             **query_state,
             "status": "schema_mapped",
             "schema": schema_result or parsed,
+            "updatedAt": now_iso,
+            "status_timestamps": {**prev_ts, "schema_mapped": now_iso},
         })
 
     await ctx.enqueue({

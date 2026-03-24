@@ -132,17 +132,64 @@ def _build_html(query_state: dict) -> str:
     body = f'<div class="chart-wrap"><canvas id="myChart"></canvas></div>{token_html}'
 
     import json
-    import re
     cfg = chart_config.get("config", {})
     json_str = json.dumps(cfg, indent=2)
-    # Strip function markers and surrounding quotes so ChartJS sees actual JS functions
-    json_str = json_str.replace('"@@FUNCTION@@', '').replace('@@ENDFUNCTION@@"', '')
-    # Fallback for old cached queries: match string literals starting with function(
-    json_str = re.sub(r'"(function\([cv]\)\{[^"]+\})"', r'\1', json_str)
-    
+
     script = f"""
 const ctx = document.getElementById('myChart');
-new Chart(ctx, {json_str});
+const rawConfig = {json_str};
+
+function reviveFunctions(node) {{
+  if (Array.isArray(node)) {{
+    return node.map(reviveFunctions);
+  }}
+  if (node && typeof node === 'object') {{
+    const out = {{}};
+    for (const [k, v] of Object.entries(node)) {{
+      out[k] = reviveFunctions(v);
+    }}
+    return out;
+  }}
+  if (typeof node === 'string') {{
+    let fnText = null;
+    if (node.startsWith('@@FUNCTION@@') && node.endsWith('@@ENDFUNCTION@@')) {{
+      fnText = node.slice('@@FUNCTION@@'.length, -'@@ENDFUNCTION@@'.length);
+    }} else if (node.startsWith('function(')) {{
+      fnText = node;
+    }}
+    if (fnText) {{
+      try {{
+        return (0, eval)('(' + fnText + ')');
+      }} catch (e) {{
+        console.warn('Failed to revive chart callback function:', e);
+      }}
+    }}
+  }}
+  return node;
+}}
+
+const chartConfig = reviveFunctions(rawConfig);
+chartConfig.options = chartConfig.options || {{}};
+chartConfig.options.plugins = chartConfig.options.plugins || {{}};
+chartConfig.options.plugins.tooltip = chartConfig.options.plugins.tooltip || {{}};
+chartConfig.options.plugins.tooltip.enabled = true;
+chartConfig.options.interaction = chartConfig.options.interaction || {{ mode: 'nearest', intersect: false }};
+
+const prefix = {("'₹'" if metric == "revenue" else "''")};
+const tooltip = chartConfig.options.plugins.tooltip;
+tooltip.callbacks = tooltip.callbacks || {{}};
+if (typeof tooltip.callbacks.label !== 'function') {{
+  tooltip.callbacks.label = function(c) {{
+    const v = c.raw;
+    const n = (typeof v === 'number')
+      ? v.toLocaleString('en-IN', {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})
+      : String(v ?? '');
+    const ds = c.dataset && c.dataset.label ? `${{c.dataset.label}}: ` : '';
+    return ` ${{ds}}${{prefix}}${{n}}`;
+  }};
+}}
+
+new Chart(ctx, chartConfig);
 """
     return _HTML_TEMPLATE.format(
         title=title, subtitle=subtitle, body=body, script=script

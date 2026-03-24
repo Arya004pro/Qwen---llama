@@ -35,6 +35,7 @@ async def handler(request: ApiRequest[dict[str, Any]], ctx: FlowContext[Any]) ->
         return ApiResponse(status=400, body={"error": "Missing 'query' field"})
 
     now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
 
     # ── Clarification reply ────────────────────────────────────────────────────
     if session_id:
@@ -51,11 +52,13 @@ async def handler(request: ApiRequest[dict[str, Any]], ctx: FlowContext[Any]) ->
             )
 
             query_id = session_id
+            prev_ts = (previous or {}).get("status_timestamps", {})
             await ctx.state.set("queries", query_id, {
                 **previous,
                 "status":    "received",
                 "lastQuery": user_query,
-                "updatedAt": now.isoformat(),
+                "updatedAt": now_iso,
+                "status_timestamps": {**prev_ts, "received": now_iso},
             })
 
             await ctx.enqueue({
@@ -74,7 +77,8 @@ async def handler(request: ApiRequest[dict[str, Any]], ctx: FlowContext[Any]) ->
 
     await ctx.state.set("queries", query_id, {
         "id": query_id, "query": user_query,
-        "status": "received", "createdAt": now.isoformat(),
+        "status": "received", "createdAt": now_iso, "updatedAt": now_iso,
+        "status_timestamps": {"received": now_iso},
     })
 
     await ctx.enqueue({

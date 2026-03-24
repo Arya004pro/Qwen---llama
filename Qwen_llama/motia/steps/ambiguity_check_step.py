@@ -6,6 +6,7 @@ No second LLM call needed unless Qwen failed to parse.
 """
 
 import os, sys
+from datetime import datetime, timezone
 _STEPS_DIR    = os.path.dirname(os.path.abspath(__file__))
 _MOTIA_DIR    = os.path.dirname(_STEPS_DIR)
 _PROJECT_ROOT = os.path.dirname(_MOTIA_DIR)
@@ -44,18 +45,26 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     if not is_complete and clarification:
         ctx.logger.warn("⚠️ Needs clarification", {"queryId": query_id, "question": clarification})
         if qs:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            prev_ts = qs.get("status_timestamps", {})
             await ctx.state.set("queries", query_id, {
                 **qs,
                 "status":        "needs_clarification",
                 "clarification": clarification,
                 "parsed":        parsed,
+                "updatedAt":     now_iso,
+                "status_timestamps": {**prev_ts, "needs_clarification": now_iso},
             })
         return
 
     # Complete — forward to SQL generation
     if qs:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        prev_ts = qs.get("status_timestamps", {})
         await ctx.state.set("queries", query_id, {
             **qs, "status": "ambiguity_checked",
+            "updatedAt": now_iso,
+            "status_timestamps": {**prev_ts, "ambiguity_checked": now_iso},
         })
 
     await ctx.enqueue({

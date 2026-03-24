@@ -17,7 +17,7 @@ for _p in [_STEPS_DIR, _MOTIA_DIR, _PROJECT_ROOT]:
         sys.path.insert(0, _p)
 
 import psycopg2
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 from motia import FlowContext, queue
 from shared_config import POSTGRES
@@ -152,7 +152,13 @@ def _period_label(start_str: str, end_str: str) -> str:
 
 async def _error(ctx, qs, query_id, msg):
     if qs:
-        await ctx.state.set("queries", query_id, {**qs, "status": "error", "error": msg})
+        now_iso = datetime.now(timezone.utc).isoformat()
+        prev_ts = qs.get("status_timestamps", {})
+        await ctx.state.set("queries", query_id, {
+            **qs, "status": "error", "error": msg,
+            "updatedAt": now_iso,
+            "status_timestamps": {**prev_ts, "error": now_iso},
+        })
 
 
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
@@ -208,7 +214,13 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
 
     qs = await ctx.state.get("queries", query_id)
     if qs:
-        await ctx.state.set("queries", query_id, {**qs, "status": "executed", "results": results})
+        now_iso = datetime.now(timezone.utc).isoformat()
+        prev_ts = qs.get("status_timestamps", {})
+        await ctx.state.set("queries", query_id, {
+            **qs, "status": "executed", "results": results,
+            "updatedAt": now_iso,
+            "status_timestamps": {**prev_ts, "executed": now_iso},
+        })
 
     # Build period labels for formatting
     period_labels = [_period_label(t["start"], t["end"]) for t in trs]

@@ -18,7 +18,7 @@ for _p in [_STEPS_DIR, _MOTIA_DIR, _PROJECT_ROOT]:
         sys.path.insert(0, _p)
 
 import requests, psycopg2
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 from motia import FlowContext, queue
 
@@ -244,18 +244,26 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             )
             qs = await ctx.state.get("queries", query_id)
             if qs:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                prev_ts = qs.get("status_timestamps", {})
                 await ctx.state.set("queries", query_id, {
                     **qs, "status": "error", "error": msg,
+                    "updatedAt": now_iso,
+                    "status_timestamps": {**prev_ts, "error": now_iso},
                 })
             return
 
     qs = await ctx.state.get("queries", query_id)
     if qs:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        prev_ts = qs.get("status_timestamps", {})
         await ctx.state.set("queries", query_id, {
             **qs, "status": "sql_generated",
             "generated_sql": generated_sql,
             "sql_source":    sql_source,
             "sql_fallback":  fallback_used,
+            "updatedAt": now_iso,
+            "status_timestamps": {**prev_ts, "sql_generated": now_iso},
         })
 
     await ctx.enqueue({

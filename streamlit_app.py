@@ -2,6 +2,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import requests
 import time
+from datetime import datetime
 
 API          = "http://localhost:3121"
 POLL_INTERVAL = 0.7
@@ -25,6 +26,15 @@ STATUS_MAP = {
     "executed":            4,
     "completed":           5,
     "error":               5,
+}
+
+STEP_STATUS_OPTIONS = {
+    0: ["received"],
+    1: ["intent_parsed"],
+    2: ["ambiguity_checked", "needs_clarification"],
+    3: ["sql_generated", "schema_mapped"],
+    4: ["executed"],
+    5: ["completed", "error"],
 }
 
 for key, default in {
@@ -142,6 +152,43 @@ def fetch_chart_html(query_id):
     except Exception as e:
         return f"<p style='color:#ef4444'>Could not load chart: {e}</p>"
 
+def _parse_iso(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def _compute_backend_step_times(state):
+    ts_map = state.get("status_timestamps", {}) or {}
+    created_at = _parse_iso(state.get("createdAt"))
+    step_at = {}
+
+    for idx in range(len(STEPS)):
+        for status_name in STEP_STATUS_OPTIONS.get(idx, []):
+            dt = _parse_iso(ts_map.get(status_name))
+            if dt:
+                step_at[idx] = dt
+                break
+
+    if 0 not in step_at and created_at:
+        step_at[0] = created_at
+
+    times = {}
+    prev = created_at or step_at.get(0)
+    for idx in range(len(STEPS)):
+        dt = step_at.get(idx)
+        if not dt:
+            continue
+        if prev:
+            times[idx] = max((dt - prev).total_seconds(), 0.0)
+        else:
+            times[idx] = 0.0
+        prev = dt
+
+    return times
+
 def render_steps(completed_idx, is_error, step_times):
     parts = []
     for i, s in enumerate(STEPS):
@@ -155,8 +202,12 @@ def render_steps(completed_idx, is_error, step_times):
             cls, icon = "idle", s["icon"]
 
         t = step_times.get(i)
-        if t:
-            time_html = f'<div class="step-time">{t:.1f}s</div>'
+        if t is not None:
+            if t < 1:
+                t_label = f"{t:.2f}s"
+            else:
+                t_label = f"{t:.1f}s"
+            time_html = f'<div class="step-time">{t_label}</div>'
         elif cls == "active":
             time_html = '<div class="step-time">…</div>'
         else:
@@ -276,22 +327,16 @@ if state:
     status        = state.get("status", "")
     target_idx    = STATUS_MAP.get(status, -1)
     is_error      = status == "error"
-    elapsed       = time.time() - (st.session_state.poll_start or time.time())
+    backend_times = _compute_backend_step_times(state)
+    if backend_times:
+        st.session_state.step_times.update(backend_times)
 
-    # Record step completion times and visually animate catching up
-    if st.session_state.polling and target_idx > st.session_state.last_completed:
-        for idx in range(st.session_state.last_completed + 1, target_idx + 1):
-            if idx not in st.session_state.step_times:
-                st.session_state.step_times[idx] = round(float(elapsed), 1)
-            
-            # Visually animate the step transitioning
-            st.session_state.last_completed = idx
-            with steps_placeholder.container():
-                render_steps(idx, is_error if idx == target_idx else False, st.session_state.step_times)
-            time.sleep(0.4) # Lively delay between steps
-    else:
-        with steps_placeholder.container():
-            render_steps(st.session_state.last_completed if st.session_state.polling else target_idx, is_error, st.session_state.step_times)
+    if target_idx > st.session_state.last_completed:
+        st.session_state.last_completed = target_idx
+
+    render_idx = st.session_state.last_completed if st.session_state.polling else target_idx
+    with steps_placeholder.container():
+        render_steps(render_idx, is_error, st.session_state.step_times)
 
     if st.session_state.polling:
         status_placeholder.caption(f"Status: `{status}`")
