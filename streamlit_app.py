@@ -1,19 +1,26 @@
+"""streamlit_app.py — Sales Analytics Pipeline Dashboard
+
+Changes from original:
+- Added a single direct "Download" PDF button.
+- PDF is generated server-side with selectable text, plus chart + table.
+"""
+
 import streamlit as st
 import streamlit.components.v1 as components
 import requests
 import time
 from datetime import datetime
 
-API          = "http://localhost:3121"
+API           = "http://localhost:3121"
 POLL_INTERVAL = 0.7
 
 STEPS = [
     {"label": "Receive",      "sub": "REST entry point",    "icon": "⤵"},
     {"label": "Parse intent", "sub": "Qwen 3-32B",          "icon": "◈"},
     {"label": "Ambiguity",    "sub": "Clarification check", "icon": "?"},
-    {"label": "Text → SQL",   "sub": "LLaMA 3.1-8B",        "icon": "{}"},
+    {"label": "Text → SQL",   "sub": "Builder / LLaMA",     "icon": "{}"},
     {"label": "Execute SQL",  "sub": "PostgreSQL",           "icon": "▶"},
-    {"label": "Format",       "sub": "Chart.js result",     "icon": "✦"},
+    {"label": "Format",       "sub": "Result + chart",      "icon": "✦"},
 ]
 
 STATUS_MAP = {
@@ -116,6 +123,260 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
+# ── Export report builder (direct downloadable PDF) ──────────────────────────
+
+def _safe_text(v) -> str:
+    s = "" if v is None else str(v)
+    return s.replace("₹", "Rs ").replace("—", "-")
+
+
+def _pretty_col(k: str) -> str:
+    return k.replace("_", " ").replace("period1", "Period 1").replace("period2", "Period 2").title()
+
+
+def _to_num(v):
+    try:
+        return float(v)
+    except Exception:
+        return 0.0
+
+
+def _to_rl_color(s, fallback):
+    from reportlab.lib import colors
+    if not isinstance(s, str):
+        return fallback
+    s = s.strip()
+    try:
+        if s.startswith("#"):
+            return colors.HexColor(s)
+        if s.startswith("rgba("):
+            vals = s[5:-1].split(",")
+            r, g, b = [max(0, min(255, int(float(x.strip())))) for x in vals[:3]]
+            return colors.Color(r / 255.0, g / 255.0, b / 255.0)
+        if s.startswith("rgb("):
+            vals = s[4:-1].split(",")
+            r, g, b = [max(0, min(255, int(float(x.strip())))) for x in vals[:3]]
+            return colors.Color(r / 255.0, g / 255.0, b / 255.0)
+    except Exception:
+        return fallback
+    return fallback
+
+
+def _build_pdf_chart(chart_config):
+    if not chart_config:
+        return None
+    cfg = chart_config.get("config", {}) or {}
+    data = cfg.get("data", {}) or {}
+    labels = list(data.get("labels", []) or [])
+    datasets = list(data.get("datasets", []) or [])
+    if not labels or not datasets:
+        return None
+
+    series = []
+    for ds in datasets:
+        vals = ds.get("data", []) or []
+        if len(vals) < len(labels):
+            vals = vals + [0] * (len(labels) - len(vals))
+        series.append([_to_num(v) for v in vals[: len(labels)]])
+    if not series:
+        return None
+
+    from reportlab.lib import colors
+    from reportlab.graphics.shapes import Drawing
+    from reportlab.graphics.charts.barcharts import HorizontalBarChart
+
+    max_label = max((len(str(x)) for x in labels), default=10)
+    left_pad = 120 if max_label <= 14 else min(210, 120 + (max_label - 14) * 4)
+    chart_h = max(180, min(380, 15 * len(labels) + 45))
+    drawing = Drawing(500, chart_h + 35)
+    chart = HorizontalBarChart()
+    chart.x = left_pad
+    chart.y = 18
+    chart.width = 480 - left_pad
+    chart.height = chart_h
+    chart.data = tuple(tuple(row) for row in series)
+    chart.categoryAxis.categoryNames = [str(x) if len(str(x)) <= 28 else f"{str(x)[:25]}..." for x in labels]
+    chart.categoryAxis.labels.boxAnchor = "e"
+    chart.categoryAxis.labels.fontSize = 7 if len(labels) > 12 else 8
+    chart.categoryAxis.labels.dx = -6
+    chart.categoryAxis.labels.fillColor = colors.HexColor("#cbd5e1")
+    chart.valueAxis.labels.fontSize = 8
+    chart.valueAxis.labels.fillColor = colors.HexColor("#94a3b8")
+    chart.valueAxis.strokeColor = colors.HexColor("#334155")
+    chart.categoryAxis.strokeColor = colors.HexColor("#334155")
+    chart.groupSpacing = 5
+    chart.barSpacing = 2
+    chart.valueAxis.visibleGrid = True
+    chart.valueAxis.gridStrokeColor = colors.HexColor("#1f2937")
+
+    for i, ds in enumerate(datasets):
+        c = ds.get("backgroundColor")
+        if isinstance(c, list) and c:
+            c = c[0]
+        fill = _to_rl_color(c, colors.HexColor("#60a5fa"))
+        chart.bars[i].fillColor = fill
+        chart.bars[i].strokeColor = fill
+
+    drawing.add(chart)
+    return drawing
+
+
+def _is_number_like(value) -> bool:
+    if value is None:
+        return False
+    s = str(value).strip().replace(",", "")
+    if not s:
+        return False
+    if s.startswith("Rs "):
+        s = s[3:].strip()
+    if s.startswith("-"):
+        s = s[1:]
+    try:
+        float(s)
+        return True
+    except Exception:
+        return False
+
+
+def _build_export_pdf(state: dict, user_query: str) -> bytes:
+    from io import BytesIO
+    from xml.sax.saxutils import escape
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether,
+        HRFlowable, CondPageBreak
+    )
+
+    chart_config = state.get("chart_config")
+    items = state.get("formattedItems", []) or []
+    text_answer = state.get("formattedText", "") or ""
+    token_totals = state.get("token_totals", {}) or {}
+    generated_at = datetime.now().strftime("%d %B %Y, %H:%M")
+
+    summary = _safe_text(text_answer.split("─── Token Usage")[0].strip())
+    query = _safe_text(user_query)
+
+    styles = getSampleStyleSheet()
+    title_s = ParagraphStyle("title_s", parent=styles["Heading1"], fontSize=18, leading=22, spaceAfter=4, textColor=colors.HexColor("#f8fafc"))
+    meta_s = ParagraphStyle("meta_s", parent=styles["Normal"], fontSize=9, textColor=colors.HexColor("#94a3b8"))
+    h2_s = ParagraphStyle("h2_s", parent=styles["Heading2"], fontSize=12, textColor=colors.HexColor("#e2e8f0"), spaceBefore=8, spaceAfter=6)
+    body_s = ParagraphStyle("body_s", parent=styles["Normal"], fontSize=10.5, leading=14, textColor=colors.HexColor("#cbd5e1"))
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=letter,
+        leftMargin=0.55 * inch,
+        rightMargin=0.55 * inch,
+        topMargin=0.55 * inch,
+        bottomMargin=0.55 * inch,
+        title=f"Analytics Report - {query[:80]}",
+    )
+    story = []
+
+    story.append(Paragraph(escape(query), title_s))
+    story.append(Paragraph(f"Generated {generated_at}", meta_s))
+    story.append(Spacer(1, 6))
+    story.append(HRFlowable(width="100%", thickness=0.6, color=colors.HexColor("#1e293b")))
+    story.append(Spacer(1, 10))
+
+    summary_html = "<br/>".join(escape(x) for x in summary.splitlines()) if summary else "-"
+    answer_card = Table([[Paragraph(summary_html, body_s)]], colWidths=[doc.width])
+    answer_card.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#0b1220")),
+        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#374151")),
+        ("LINEBEFORE", (0, 0), (0, -1), 2.0, colors.HexColor("#60a5fa")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(KeepTogether([Paragraph("Answer", h2_s), answer_card]))
+    story.append(Spacer(1, 8))
+
+    chart = _build_pdf_chart(chart_config)
+    if chart is not None:
+        chart_title = (chart_config or {}).get("title")
+        chart_nodes = [Paragraph("Chart", h2_s)]
+        if chart_title:
+            chart_nodes.append(Paragraph(escape(_safe_text(chart_title)), meta_s))
+            chart_nodes.append(Spacer(1, 4))
+        chart_nodes.append(chart)
+        story.append(KeepTogether(chart_nodes))
+        story.append(Spacer(1, 10))
+
+    if items:
+        skip_keys = {"raw_value", "raw_delta"}
+        cols = [k for k in items[0].keys() if k not in skip_keys]
+        table_data = [[_pretty_col(c) for c in cols]]
+        for row in items:
+            table_data.append([_safe_text(row.get(c, "")) for c in cols])
+
+        avail_w = doc.width
+        if len(cols) <= 1:
+            col_widths = [avail_w]
+        else:
+            first_w = min(max(190, avail_w * 0.36), avail_w * 0.5)
+            rest_w = (avail_w - first_w) / (len(cols) - 1)
+            col_widths = [first_w] + [rest_w] * (len(cols) - 1)
+
+        tbl = Table(table_data, repeatRows=1, hAlign="LEFT", colWidths=col_widths)
+        align_cmds = [("ALIGN", (0, 0), (-1, 0), "LEFT"), ("ALIGN", (0, 1), (0, -1), "LEFT")]
+        for ci, col_name in enumerate(cols[1:], start=1):
+            numeric_col = ("rank" in col_name.lower()) or all(_is_number_like(r.get(col_name)) for r in items[: min(20, len(items))])
+            align_cmds.append(("ALIGN", (ci, 1), (ci, -1), "RIGHT" if numeric_col else "LEFT"))
+
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#e2e8f0")),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 9.2),
+            ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 1), (-1, -1), 9),
+            ("TEXTCOLOR", (0, 1), (-1, -1), colors.HexColor("#cbd5e1")),
+            ("LINEABOVE", (0, 0), (-1, 0), 0.8, colors.HexColor("#334155")),
+            ("LINEBELOW", (0, 0), (-1, 0), 0.8, colors.HexColor("#334155")),
+            ("GRID", (0, 1), (-1, -1), 0.35, colors.HexColor("#1f2937")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#020617"), colors.HexColor("#0b1220")]),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ] + align_cmds))
+        story.append(CondPageBreak(1.6 * inch))
+        story.append(Paragraph("Data Table", h2_s))
+        story.append(tbl)
+        story.append(Spacer(1, 8))
+
+    if token_totals.get("total_tokens"):
+        token_txt = (
+            f"Token usage - prompt: {token_totals.get('prompt_tokens', 0)} | "
+            f"completion: {token_totals.get('completion_tokens', 0)} | "
+            f"total: {token_totals.get('total_tokens', 0)}"
+        )
+        story.append(Paragraph(escape(token_txt), meta_s))
+
+    def _on_page(canv, _doc):
+        canv.saveState()
+        canv.setFillColor(colors.HexColor("#020817"))
+        canv.rect(0, 0, letter[0], letter[1], stroke=0, fill=1)
+        canv.setFont("Helvetica", 8)
+        canv.setFillColor(colors.HexColor("#64748b"))
+        canv.drawString(_doc.leftMargin, 0.30 * inch, "Sales Analytics Report")
+        canv.drawRightString(letter[0] - _doc.rightMargin, 0.30 * inch, f"Page {_doc.page}")
+        canv.restoreState()
+
+    doc.build(story, onFirstPage=_on_page, onLaterPages=_on_page)
+    return buf.getvalue()
+
+
+# ── API helpers ───────────────────────────────────────────────────────────────
+
 def api_ok():
     try:
         requests.get(f"{API}/queries", timeout=2)
@@ -141,12 +402,11 @@ def fetch_chart_html(query_id):
         r = requests.get(f"{API}/query/{query_id}/chart", timeout=10)
         r.raise_for_status()
         text = r.text
-        # Motia runtime might serialize the HTML string as JSON, regardless of headers
         if text.startswith('"') and text.endswith('"'):
-            import json
             try:
-                return json.loads(text)
-            except json.JSONDecodeError:
+                import json as _j
+                return _j.loads(text)
+            except Exception:
                 return text
         return text
     except Exception as e:
@@ -161,9 +421,9 @@ def _parse_iso(ts):
         return None
 
 def _compute_backend_step_times(state):
-    ts_map = state.get("status_timestamps", {}) or {}
+    ts_map     = state.get("status_timestamps", {}) or {}
     created_at = _parse_iso(state.get("createdAt"))
-    step_at = {}
+    step_at    = {}
 
     for idx in range(len(STEPS)):
         for status_name in STEP_STATUS_OPTIONS.get(idx, []):
@@ -176,7 +436,7 @@ def _compute_backend_step_times(state):
         step_at[0] = created_at
 
     times = {}
-    prev = created_at or step_at.get(0)
+    prev  = created_at or step_at.get(0)
     for idx in range(len(STEPS)):
         dt = step_at.get(idx)
         if not dt:
@@ -203,10 +463,7 @@ def render_steps(completed_idx, is_error, step_times):
 
         t = step_times.get(i)
         if t is not None:
-            if t < 1:
-                t_label = f"{t:.2f}s"
-            else:
-                t_label = f"{t:.1f}s"
+            t_label = f"{t:.2f}s" if t < 1 else f"{t:.1f}s"
             time_html = f'<div class="step-time">{t_label}</div>'
         elif cls == "active":
             time_html = '<div class="step-time">…</div>'
@@ -231,12 +488,13 @@ def render_tokens(usage, totals):
              "Prompt": e.get("prompt_tokens",0),
              "Completion": e.get("completion_tokens",0),
              "Total": e.get("total_tokens",0)} for e in usage]
-    st.dataframe(rows, width='stretch', hide_index=True)
+    st.dataframe(rows, width="stretch", hide_index=True)
     if totals and totals.get("total_tokens"):
         c1, c2, c3 = st.columns(3)
-        c1.metric("Prompt tokens",     totals.get("prompt_tokens", 0))
-        c2.metric("Completion tokens", totals.get("completion_tokens", 0))
-        c3.metric("Total tokens",      totals.get("total_tokens", 0))
+        c1.metric("Prompt tokens",     totals.get("prompt_tokens",0))
+        c2.metric("Completion tokens", totals.get("completion_tokens",0))
+        c3.metric("Total tokens",      totals.get("total_tokens",0))
+
 
 # ── Layout ────────────────────────────────────────────────────────────────────
 st.markdown("## 📊 Sales Analytics — Live Pipeline")
@@ -266,11 +524,11 @@ with left:
         disabled=st.session_state.polling,
     )
     send_col, status_col = st.columns([1, 3])
-    send_btn            = send_col.button("Send", disabled=st.session_state.polling,
-                                          width="stretch", type="primary")
-    status_placeholder  = status_col.empty()
-    clarify_placeholder = st.empty()
-    result_placeholder  = st.empty()
+    send_btn             = send_col.button("Send", disabled=st.session_state.polling,
+                                           width="stretch", type="primary")
+    status_placeholder   = status_col.empty()
+    clarify_placeholder  = st.empty()
+    result_placeholder   = st.empty()
 
 with right:
     st.markdown('<div class="section-lbl">Token usage</div>', unsafe_allow_html=True)
@@ -294,6 +552,7 @@ if st.session_state.history:
                 <div class="hist-a">{item['result'][:300]}{'…' if len(item['result'])>300 else ''}</div>
             </div>""", unsafe_allow_html=True)
 
+
 # ── Send handler ──────────────────────────────────────────────────────────────
 if send_btn and query_input.strip():
     st.session_state.polling        = True
@@ -312,7 +571,8 @@ if send_btn and query_input.strip():
         st.session_state.polling = False
         st.error(f"Failed to submit: {e}")
 
-# ── Polling OR Final State ──────────────────────────────────────────────────
+
+# ── Polling OR Final State ────────────────────────────────────────────────────
 state = None
 if st.session_state.polling and st.session_state.query_id:
     try:
@@ -354,7 +614,7 @@ if state:
         with token_placeholder.container():
             render_tokens(state.get("token_usage"), state.get("token_totals"))
 
-    # ── Terminal states ──────────────────────────────────────────────────
+    # ── Terminal states ───────────────────────────────────────────────────────
     if status == "needs_clarification":
         if st.session_state.polling:
             st.session_state.polling         = False
@@ -384,23 +644,43 @@ if state:
         if st.session_state.polling:
             st.session_state.polling     = False
             st.session_state.final_state = state
-            text = state.get("formattedText", "Query complete.")
-            
-            # Store history item
-            hist_query = query_input if query_input else "(reply)"
-            # Handle empty query text issue implicitly by retrieving previous text if possible
-            st.session_state.history.append({"query": hist_query, "result": text})
+            hist_query = query_input if query_input else "(clarification reply)"
+            st.session_state.history.append({
+                "query":  hist_query,
+                "result": state.get("formattedText", ""),
+            })
             st.rerun()
 
         text = state.get("formattedText", "Query complete.")
         with result_placeholder.container():
             st.markdown('<div class="section-lbl">Result</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="result-box">{text}</div>', unsafe_allow_html=True)
+
+            # ── Chart preview ─────────────────────────────────────────────────
             if state.get("chart_config"):
                 st.markdown("<br>", unsafe_allow_html=True)
-                with st.expander("📈 View interactive chart", expanded=True):
+                with st.expander("📈 Interactive chart", expanded=True):
                     chart_html = fetch_chart_html(st.session_state.query_id)
                     components.html(chart_html, height=520, scrolling=False)
+
+            # ── Single direct PDF download button ─────────────────────────────
+            st.markdown("<br>", unsafe_allow_html=True)
+            last_query = (st.session_state.history[-1]["query"]
+                          if st.session_state.history else "query")
+            safe_name = "".join(ch for ch in last_query[:48] if ch.isalnum() or ch in (" ", "_", "-")).strip().replace(" ", "_")
+            if not safe_name:
+                safe_name = "report"
+            try:
+                pdf_bytes = _build_export_pdf(state, last_query)
+                st.download_button(
+                    label="Download",
+                    data=pdf_bytes,
+                    file_name=f"{safe_name}_{datetime.now().strftime('%Y-%m-%d')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=False,
+                )
+            except ImportError:
+                st.error("PDF export requires `reportlab`. Install it with: pip install reportlab")
 
     elif status == "error":
         if st.session_state.polling:
