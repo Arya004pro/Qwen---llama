@@ -1,6 +1,6 @@
 """llm/sql_generator.py
 
-Generates a parameterized PostgreSQL SELECT statement from parsed query intent
+Generates a parameterized DuckDB SELECT statement from parsed query intent
 using an LLM, then validates it:
 
   1. Strip Qwen3 <think> blocks  — must happen BEFORE any SQL extraction
@@ -10,7 +10,7 @@ using an LLM, then validates it:
 
 Public API
 ----------
-  generate_sql(intent, groq_url, api_token, model, schema_prompt, postgres_config)
+  generate_sql(intent, groq_url, api_token, model, schema_prompt)
       -> (sql | None, usage_dict)
 """
 
@@ -21,8 +21,8 @@ import logging
 from datetime import date
 from typing import Any
 
-import psycopg2
 import requests
+from db.duckdb_connection import explain_query
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +89,7 @@ def _is_safe(sql: str) -> tuple[bool, str]:
 
 # ─── EXPLAIN syntax check ─────────────────────────────────────────────────────
 
-def _validate_syntax(sql: str, ranking: str, postgres_config: dict) -> tuple[bool, str]:
+def _validate_syntax(sql: str, ranking: str) -> tuple[bool, str]:
     """
     Run EXPLAIN to verify syntax against the live schema.
     Skipped for 'threshold' — subquery param count varies and is checked at runtime.
@@ -101,11 +101,11 @@ def _validate_syntax(sql: str, ranking: str, postgres_config: dict) -> tuple[boo
     dummy_end   = date(2024, 1, 31)
     dummy_limit = 5
 
-    count = sql.count("%s")
+    count = sql.count("%s") + sql.count("?")
     if count == 0:
-        params: tuple = ()
+        params: list = []
     elif count == 3 and ranking in ("top", "bottom"):
-        params = (dummy_start, dummy_end, dummy_limit)
+        params = [dummy_start, dummy_end, dummy_limit]
     else:
         slots = []
         for i in range(count):
@@ -115,19 +115,8 @@ def _validate_syntax(sql: str, ranking: str, postgres_config: dict) -> tuple[boo
                 slots.append(dummy_start)
             else:
                 slots.append(dummy_end)
-        params = tuple(slots)
-
-    try:
-        conn = psycopg2.connect(**postgres_config)
-        cur  = conn.cursor()
-        cur.execute(f"EXPLAIN {sql}", params)
-        cur.close()
-        conn.close()
-        return True, ""
-    except psycopg2.Error as exc:
-        return False, str(exc).split("\n")[0]
-    except Exception as exc:
-        return False, str(exc)
+        params = slots
+    return explain_query(sql, params)
 
 
 # ─── Prompt ───────────────────────────────────────────────────────────────────
@@ -142,11 +131,11 @@ def _build_prompt(intent: dict[str, Any], schema_prompt: str) -> str:
     rank_instruction = {
         "top": (
             f"Return the top {top_n} rows.\n"
-            "End the query with: ORDER BY value DESC\nLIMIT %s"
+            "End the query with: ORDER BY value DESC\nLIMIT ?"
         ),
         "bottom": (
             f"Return the bottom {top_n} rows.\n"
-            "End the query with: ORDER BY value ASC\nLIMIT %s"
+            "End the query with: ORDER BY value ASC\nLIMIT ?"
         ),
         "aggregate": (
             "Return a single scalar total — one row, one column aliased 'value'.\n"
@@ -155,15 +144,15 @@ def _build_prompt(intent: dict[str, Any], schema_prompt: str) -> str:
         "threshold": (
             "Use a HAVING clause derived from the user's question.\n"
             "For 'more than 10% of total revenue', write:\n"
-            "  HAVING SUM(...) > 0.10 * (SELECT SUM(...) FROM ... WHERE order_date BETWEEN %s AND %s)\n"
+            "  HAVING SUM(...) > 0.10 * (SELECT SUM(...) FROM ... WHERE order_date BETWEEN ? AND ?)\n"
             "Alias the group-by column as 'name' and the metric as 'value'.\n"
             "End with ORDER BY value DESC. No LIMIT clause."
         ),
-    }.get(ranking, f"Return top {top_n} rows ORDER BY value DESC LIMIT %s")
+    }.get(ranking, f"Return top {top_n} rows ORDER BY value DESC LIMIT ?")
 
     user_line = f'\nUser question: "{raw_query}"\n' if raw_query else ""
 
-    return f"""You are a PostgreSQL expert. Output ONLY a raw SQL query — no prose, no explanation, no markdown.
+    return f"""You are a DuckDB SQL expert. Output ONLY a raw SQL query — no prose, no explanation, no markdown.
 {user_line}
 {schema_prompt}
 
@@ -176,7 +165,7 @@ Ranking : {ranking}
 Requirements
 ------------
 - Alias the group-by column as  name  and the aggregation as  value
-- Use %s placeholders for every date and numeric limit (never hard-code values)
+- Use ? placeholders for every date and numeric limit (never hard-code values)
 - {rank_instruction}
 
 SQL:"""
@@ -190,7 +179,6 @@ def generate_sql(
     api_token:       str,
     model:           str,
     schema_prompt:   str,
-    postgres_config: dict,
 ) -> tuple[str | None, dict]:
     """
     Generate and validate a parameterized SQL query.
@@ -230,7 +218,7 @@ def generate_sql(
         return None, usage
 
     # EXPLAIN (skipped for threshold)
-    ok, err = _validate_syntax(sql, ranking, postgres_config)
+    ok, err = _validate_syntax(sql, ranking)
     if not ok:
         logger.warning("EXPLAIN FAILED: %s\nSQL was:\n%s", err, sql)
         return None, usage

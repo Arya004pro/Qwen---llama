@@ -21,7 +21,7 @@ modules:
     config:
       port: 3121
       host: 0.0.0.0
-      default_timeout: 30000
+      default_timeout: 300000
       concurrency_request_limit: 1024
       cors:
         allowed_origins:
@@ -72,7 +72,5 @@ modules:
 
   - class: modules::shell::ExecModule
     config:
-      watch:
-        - steps/**/*.py
       exec:
         - uv run python patch_motia_runtime.py && uv run motia run --dir steps

@@ -1,51 +1,70 @@
-"""db/schema_context.py — Exact DB schema matching the actual dataset."""
+"""Schema prompt builder for SQL generation."""
 
-SCHEMA = """
+from db.duckdb_connection import get_read_connection
+
+_STATIC_FALLBACK = """
 Tables
 ------
 states         : state_id (PK), state_name
-cities         : city_id (PK), city_name, state_id (FK→states)
-customers      : customer_id (PK), customer_name, gender, age, region_id, city_id (FK→cities)
+cities         : city_id (PK), city_name, state_id (FK->states)
+customers      : customer_id (PK), customer_name, gender, age, region_id, city_id (FK->cities)
 categories     : category_id (PK), category_name
-products       : product_id (PK), product_name, category_id (FK→categories), price NUMERIC
-orders         : order_id (PK), customer_id (FK→customers), order_date DATE, total_amount NUMERIC
-order_items    : order_item_id (PK), order_id (FK→orders), product_id (FK→products),
-                 quantity INT, item_price NUMERIC
-
-Key notes
----------
-- customers.gender  : text (e.g. Male / Female)
-- customers.age     : integer (customer age in years)
-- customers.region_id : integer (not a FK to a separate table in this dataset)
-- products.price    : list price per unit (item_price in order_items is actual sale price)
+products       : product_id (PK), product_name, category_id (FK->categories), price DOUBLE
+orders         : order_id (PK), customer_id (FK->customers), order_date DATE, total_amount DOUBLE
+order_items    : order_item_id (PK), order_id (FK->orders), product_id (FK->products),
+                 quantity INT, item_price DOUBLE
 
 Aggregation rules
 -----------------
-product/category revenue  = SUM(oi.quantity * oi.item_price)
+product/category revenue    = SUM(oi.quantity * oi.item_price)
 customer/city/state revenue = SUM(o.total_amount)
-quantity sold              = SUM(oi.quantity)
-order count                = COUNT(DISTINCT o.order_id)
+quantity sold               = SUM(oi.quantity)
+order count                 = COUNT(DISTINCT o.order_id)
 
-Date filter: always use  o.order_date BETWEEN %s AND %s
-
-SQL rules
----------
-- SELECT only — no INSERT/UPDATE/DELETE/DROP/CREATE
-- Use %s for ALL placeholders — never hardcode values
-- No semicolons, no SQL comments
-- Alias primary group-by column as "name", metric as "value"
-- For ranked queries:    ORDER BY value DESC/ASC   LIMIT %s
-- For aggregate:         ONE row, ONE column aliased "value"
-- For threshold abs:     HAVING SUM(...) > %s
-- For threshold pct:     HAVING SUM(...) > fraction * (SELECT SUM(...) WHERE dates BETWEEN %s AND %s)
-- For zero-filter:       NOT EXISTS subquery
-- For intersection:      entities present in BOTH period subqueries
-- For growth/delta:      CTE or subquery per period → return name, value1, value2, delta
-- State-level queries:   JOIN cities ci ON cu.city_id = ci.city_id
-                         JOIN states s  ON ci.state_id = s.state_id
-- Gender/age filters:    use customers.gender or customers.age directly in WHERE
+Date filter: always use o.order_date BETWEEN ? AND ?
+Use ? placeholders for all params.
 """
 
 
+def _live_schema_prompt() -> str:
+    conn = get_read_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema='main'
+              AND table_name NOT LIKE '_raw_%'
+            ORDER BY table_name
+            """
+        ).fetchall()
+        tables = [r[0] for r in rows]
+        if not tables:
+            return ""
+
+        lines = ["Tables", "------"]
+        for t in tables:
+            cols = conn.execute(f'DESCRIBE "{t}"').fetchall()
+            col_s = ", ".join(f"{c[0]} {c[1]}" for c in cols)
+            lines.append(f"{t:<14}: {col_s}")
+
+        lines.append("")
+        lines.append("SQL rules")
+        lines.append("---------")
+        lines.append("- SELECT only")
+        lines.append("- Alias group key as name and metric as value")
+        lines.append("- Use ? placeholders for all params")
+        lines.append("- For ranked queries use ORDER BY value DESC/ASC LIMIT ?")
+        return "\n".join(lines)
+    finally:
+        conn.close()
+
+
 def get_schema_prompt() -> str:
-    return SCHEMA.strip()
+    try:
+        live = _live_schema_prompt().strip()
+        if live:
+            return live
+    except Exception:
+        pass
+    return _STATIC_FALLBACK.strip()

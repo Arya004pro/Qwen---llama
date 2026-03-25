@@ -17,15 +17,16 @@ for _p in [_STEPS_DIR, _MOTIA_DIR, _PROJECT_ROOT]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import requests, psycopg2
+import requests
 from datetime import date, datetime, timezone
 from typing import Any
 from motia import FlowContext, queue
 
-from shared_config import GROQ_API_TOKEN, LLAMA_MODEL, QWEN_MODEL, GROQ_URL, POSTGRES
+from shared_config import GROQ_API_TOKEN, LLAMA_MODEL, QWEN_MODEL, GROQ_URL
 from utils.token_logger import log_tokens, add_tokens_to_state
 from db.schema_context import get_schema_prompt
 from db.sql_builder import build_sql
+from db.duckdb_connection import explain_query
 
 try:
     from db.sql_registry import SQL_REGISTRY
@@ -33,6 +34,9 @@ except ImportError:
     SQL_REGISTRY = {}
 
 logger = logging.getLogger(__name__)
+
+_BUILDER_ENTITIES = {"product", "customer", "city", "category", "state"}
+_BUILDER_METRICS = {"revenue", "quantity", "order_count"}
 
 config = {
     "name": "TextToSQL",
@@ -79,9 +83,9 @@ def _is_safe(sql: str) -> tuple[bool, str]:
 
 
 def _explain(sql: str, parsed: dict | None = None) -> tuple[bool, str]:
-    n = sql.count("%s")
+    n = sql.count("%s") + sql.count("?")
     if n == 0:
-        params: tuple = ()
+        params: list = []
     else:
         d   = date.today().replace(day=1)
         num = 5
@@ -89,29 +93,21 @@ def _explain(sql: str, parsed: dict | None = None) -> tuple[bool, str]:
         thr = (parsed or {}).get("threshold") or {}
         typ = thr.get("type","")
         if qt == "threshold" and typ == "percentage" and n == 5:
-            params = (d, d, num, d, d)      # start,end,pct_val,start,end
+            params = [d, d, num, d, d]      # start,end,pct_val,start,end
         elif qt == "threshold" and typ == "absolute" and n == 3:
-            params = (d, d, num)             # start,end,threshold_val
+            params = [d, d, num]             # start,end,threshold_val
         elif qt in ("comparison","growth_ranking") and n == 5:
-            params = (d, d, d, d, num)       # start1,end1,start2,end2,limit
+            params = [d, d, d, d, num]       # start1,end1,start2,end2,limit
         else:
-            params = tuple(d if i < n - 1 else num for i in range(n))
-    try:
-        conn = psycopg2.connect(**POSTGRES)
-        cur  = conn.cursor()
-        cur.execute(f"EXPLAIN {sql}", params)
-        cur.close()
-        conn.close()
-        return True, ""
-    except Exception as exc:
-        return False, str(exc).split("\n")[0]
+            params = [d if i < n - 1 else num for i in range(n)]
+    return explain_query(sql, params)
 
 
 def _build_llm_prompt(user_query: str, parsed: dict) -> str:
-    """Only used for custom-filter queries."""
+    """Used when deterministic builder is not suitable."""
     filters = parsed.get("filters", {})
     filter_desc = ", ".join(f"{k}={v}" for k, v in filters.items()) if filters else "none"
-    return f"""You are a PostgreSQL expert. Output ONLY raw SQL — no prose, no markdown.
+    return f"""You are a DuckDB SQL expert. Output ONLY raw SQL — no prose, no markdown.
 
 User question: "{user_query}"
 
@@ -125,7 +121,7 @@ Build a SELECT query that:
 - Aliases the primary group-by column as "name"
 - Aliases the metric aggregation as "value"
 - Applies the custom filters in the WHERE clause
-- Uses %s for ALL date/number placeholders
+- Uses ? for ALL date/number placeholders
 - No semicolons, no comments
 
 SQL:"""
@@ -183,7 +179,12 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     sql_source    = "builder"
 
     # ── Primary path: deterministic builder ───────────────────────────────────
-    if not filters:
+    force_llm = (
+        bool(filters)
+        or parsed.get("entity") not in _BUILDER_ENTITIES
+        or parsed.get("metric") not in _BUILDER_METRICS
+    )
+    if not force_llm:
         built = build_sql(parsed)
         if built:
             ok, reason = _is_safe(built)

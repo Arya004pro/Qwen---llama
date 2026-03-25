@@ -1,82 +1,64 @@
-# Qwen + LLaMA Sales Analytics (Live Workflow Demo)
+# Qwen + LLaMA Sales Analytics (DuckDB)
 
 This project lets you:
-1. Chat in terminal (`npm run start`).
-2. Watch the query run through a live workflow UI (`npm run dev`).
+1. Run the Motia workflow stack (`npm run dev`)
+2. Use the dashboard UI (`npm run dashboard`)
+3. Use terminal chat client (`npm run start`)
 
-Everything runs through Docker. No Python venv activation is required.
+## What changed
+- Database is now **DuckDB** (embedded file DB), not PostgreSQL.
+- No DB server setup and no account/signup is required.
 
-## Requirements (One-Time)
-1. Install Docker Desktop and keep it running.
-2. Install Node.js (includes npm).
-3. Have PostgreSQL running with your sales data.
-
-## Project Location
-Run all commands from:
-
-`C:\Users\DELL\Downloads\Qwen_llama`
+## Requirements
+1. Docker Desktop running
+2. Node.js + npm
+3. Python 3.11+ (for local dashboard/chatbot deps if needed)
 
 ## Setup
-1. Open `Qwen_llama/.env`
-2. Set your values:
+From project root:
+
+```powershell
+cd C:\Users\DELL\Downloads\Qwen_llama
+pip install -r requirements.txt
+pip install -r Qwen_llama\requirements.txt
+```
+
+Create/edit `Qwen_llama/.env`:
 
 ```env
 GROQ_API_TOKEN=your_token_here
 QWEN_MODEL=qwen/qwen3-32b
 LLAMA_MODEL=llama-3.1-8b-instant
-
-POSTGRES_HOST=host.docker.internal
-POSTGRES_PORT=5432
-POSTGRES_DB=your_db
-POSTGRES_USER=your_user
-POSTGRES_PASSWORD=your_password
+DUCKDB_PATH=motia/data/analytics.duckdb
 ```
 
-Important:
-If PostgreSQL is on your Windows machine, `POSTGRES_HOST` should be `host.docker.internal` (not `localhost`).
-
-## Run (Live Demo Mode)
-Open terminal 1:
+## Run
+Terminal 1 (Motia stack):
 
 ```powershell
-cd C:\Users\DELL\Downloads\Qwen_llama
 npm run dev
 ```
 
-Open terminal 2:
+Terminal 2 (dashboard):
 
 ```powershell
-cd C:\Users\DELL\Downloads\Qwen_llama
+npm run dashboard
+```
+
+Optional terminal 3 (chat CLI):
+
+```powershell
 npm run start
 ```
 
-Then type in terminal 2:
-`Top 4 products by revenue in March 2024`
-
-## UI URLs
-1. Workflow graph: `http://localhost:3113/flow`
-2. Traces (best for live run view): `http://localhost:3113/traces`
-3. Logs (best for step-by-step live logs): `http://localhost:3113/logs`
-
-Note:
-Flow view is mainly topology (boxes/arrows). Live activity is most visible in `Traces` and `Logs`.
-
 ## Useful Commands
-From project root:
+1. Start stack: `npm run dev`
+2. Stop stack: `npm run dev:down`
+3. Logs: `npm run dev:logs`
+4. Dashboard: `npm run dashboard`
+5. Terminal chat: `npm run start`
 
-1. Start workflow stack: `npm run dev`
-2. Stop workflow stack: `npm run dev:down`
-3. Tail workflow logs: `npm run dev:logs`
-4. Start terminal chat client: `npm run start`
-
-## pgAdmin4 Clarification
-pgAdmin4 does not need to stay open.
-Only PostgreSQL server must be running.
-
-## Troubleshooting
-1. `connection refused` to Postgres:
-   check `.env` values, especially `POSTGRES_HOST`.
-2. No traces in UI:
-   submit at least one query from `npm run start`, then refresh `/traces`.
-3. UI works on 3113 but Docker row shows 3111:
-   normal Docker Desktop display; use `http://localhost:3113` for console UI.
+## Update Workflow
+- Changed only `streamlit_app.py`: restart/reload `npm run dashboard`.
+- Changed Motia step files (`Qwen_llama/motia/steps/*.py`): usually hot-reloaded by engine watcher; if not, run `docker compose restart` or `npm run dev:down` then `npm run dev`.
+- Changed dependency files (`requirements`, `pyproject.toml`, Dockerfile): rerun `npm run dev` (rebuild) and reinstall local Python deps if needed.

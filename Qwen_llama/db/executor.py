@@ -1,10 +1,3 @@
-from db.connection import get_connection
+from db.duckdb_connection import run_query
 
-def run_query(query, params):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(query, params)
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return rows
+__all__ = ["run_query"]

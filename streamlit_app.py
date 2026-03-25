@@ -10,16 +10,19 @@ import streamlit.components.v1 as components
 import requests
 import time
 from datetime import datetime
+from pathlib import Path
 
-API           = "http://localhost:3121"
+API           = "http://127.0.0.1:3121"
 POLL_INTERVAL = 0.7
+SHARED_UPLOAD_DIR = Path("Qwen_llama/motia/data/uploads")
+CONTAINER_UPLOAD_DIR = "/app/motia/data/uploads"
 
 STEPS = [
     {"label": "Receive",      "sub": "REST entry point",    "icon": "⤵"},
     {"label": "Parse intent", "sub": "Qwen 3-32B",          "icon": "◈"},
     {"label": "Ambiguity",    "sub": "Clarification check", "icon": "?"},
     {"label": "Text → SQL",   "sub": "Builder / LLaMA",     "icon": "{}"},
-    {"label": "Execute SQL",  "sub": "PostgreSQL",           "icon": "▶"},
+    {"label": "Execute SQL",  "sub": "DuckDB",               "icon": "▶"},
     {"label": "Format",       "sub": "Result + chart",      "icon": "✦"},
 ]
 
@@ -379,7 +382,8 @@ def _build_export_pdf(state: dict, user_query: str) -> bytes:
 
 def api_ok():
     try:
-        requests.get(f"{API}/queries", timeout=2)
+        r = requests.get(f"{API}/schema", timeout=5)
+        r.raise_for_status()
         return True
     except Exception:
         return False
@@ -396,6 +400,70 @@ def fetch_state(query_id):
     r = requests.get(f"{API}/query/{query_id}", timeout=10)
     r.raise_for_status()
     return r.json()
+
+def _wait_for_ingest_ready(max_wait_seconds=20.0):
+    """Wait until core endpoints are reachable after Motia hot-reload."""
+    deadline = time.time() + max_wait_seconds
+    while time.time() < deadline:
+        try:
+            schema_r = requests.get(f"{API}/schema", timeout=3)
+            if schema_r.status_code < 500:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.6)
+    return False
+
+def ingest_uploaded_files(uploaded_files, reset_db=False, use_llm_grouping=False):
+    files_payload = []
+    SHARED_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    for f in uploaded_files or []:
+        raw = f.getvalue()
+        if not raw:
+            continue
+        safe_name = Path(f.name).name
+        local_path = SHARED_UPLOAD_DIR / safe_name
+        local_path.write_bytes(raw)
+        files_payload.append({
+            "name": safe_name,
+            "path": f"{CONTAINER_UPLOAD_DIR}/{safe_name}",
+        })
+    if not files_payload:
+        raise ValueError("No valid file content to upload.")
+
+    body = {
+        "files": files_payload,
+        "reset_db": bool(reset_db),
+        "use_llm_grouping": bool(use_llm_grouping),
+    }
+    _wait_for_ingest_ready(max_wait_seconds=20.0)
+    last_err = None
+    # Motia can briefly unregister/re-register routes during hot reload.
+    for attempt in range(12):
+        try:
+            r = requests.post(f"{API}/ingest", json=body, timeout=300)
+            if r.status_code >= 400:
+                msg = None
+                try:
+                    msg = r.json().get("error")
+                except Exception:
+                    msg = r.text[:500]
+                raise RuntimeError(f"HTTP {r.status_code}: {msg or 'ingest failed'}")
+            return r.json()
+        except Exception as exc:
+            last_err = exc
+            err_s = str(exc)
+            # Retry route-not-found / invocation-stop windows with backoff.
+            if ("HTTP 404" in err_s) or ("invocation_stopped" in err_s) or ("Connection aborted" in err_s):
+                _wait_for_ingest_ready(max_wait_seconds=6.0)
+                time.sleep(0.5 + attempt * 0.35)
+                continue
+            # Other failures: still retry a few times before giving up.
+            if attempt < 11:
+                time.sleep(0.4 + attempt * 0.25)
+                continue
+            raise last_err
+    raise last_err
 
 def fetch_chart_html(query_id):
     try:
@@ -514,6 +582,33 @@ with left:
     steps_placeholder = st.empty()
     with steps_placeholder.container():
         render_steps(-1, False, {})
+
+    st.divider()
+    st.markdown('<div class="section-lbl">Data source</div>', unsafe_allow_html=True)
+    with st.expander("Upload dataset files (CSV/JSON/Parquet)", expanded=False):
+        upload_files = st.file_uploader(
+            "Upload files",
+            type=["csv", "tsv", "json", "jsonl", "parquet"],
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+        )
+        reset_db = st.checkbox("Replace existing dataset", value=True)
+        ingest_btn = st.button("Ingest files", type="secondary")
+        if ingest_btn:
+            try:
+                if not upload_files:
+                    st.warning("Select at least one file.")
+                else:
+                    with st.spinner("Ingesting files into DuckDB..."):
+                        ingest_result = ingest_uploaded_files(
+                            upload_files,
+                            reset_db=reset_db,
+                            use_llm_grouping=False,
+                        )
+                    tnames = ", ".join(ingest_result.get("tables_created", []))
+                    st.success(f"Ingested tables: {tnames}" if tnames else "Ingestion completed.")
+            except Exception as e:
+                st.error(f"Ingestion failed: {e}")
 
     st.divider()
     st.markdown('<div class="section-lbl">Ask a question</div>', unsafe_allow_html=True)

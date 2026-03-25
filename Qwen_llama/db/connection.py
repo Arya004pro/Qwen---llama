@@ -1,5 +1,5 @@
-import psycopg2
-from config import POSTGRES
+"""Compatibility shim for legacy imports."""
 
-def get_connection():
-    return psycopg2.connect(**POSTGRES)
+from db.duckdb_connection import get_read_connection as get_connection
+
+__all__ = ["get_connection"]

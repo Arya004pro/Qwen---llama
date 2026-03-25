@@ -24,5 +24,8 @@ Qwen_llama/charts/
 
 # ── Motia Specific ────────────────────────────────────────
 motia/bin/
-motia/data/
+motia/data/*
+!motia/data/.gitkeep
+motia/data/*.duckdb
+motia/data/*.wal
 motia/uv.lock # optional: you can keep this out of gitignore if you want strict dep locking
