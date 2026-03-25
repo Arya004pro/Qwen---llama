@@ -1,16 +1,23 @@
-﻿"""Step 2: Parse Intent — Qwen extracts full structured intent as JSON.
+"""Step 2: Parse Intent — Qwen extracts full structured intent as JSON.
 
-Fix applied (Bug 3):
-  - System prompt now explicitly states: for query_type=aggregate,
-    entity is optional and is_complete=true when metric + time range known.
-  - Inline city/state/driver mentions go into filters{}, not entity grouping.
-  - ambiguity_check fallback also guards: aggregate + metric + time = complete.
+Generalised to work on ANY flat-table dataset (Uber, e-commerce, SaaS, etc.).
+
+Key changes:
+  - System prompt no longer assumes fixed sales-schema column names.
+  - Qwen is shown the LIVE schema columns so it can infer metric/entity
+    from actual column names (total_fare, driver_earnings, platform_commission,
+    etc.) rather than guessing from a hardcoded list.
+  - ENTITY RULES updated: entity = any groupable dimension column
+    (driver_name, vehicle_type, pickup_city, state, product_name, etc.)
+  - METRIC RULES updated: metric = any numeric column or a COUNT of rows.
+  - Bug 3 guard preserved: aggregate + metric + time = always complete.
 """
 
 import os
 import sys
 import re
 import json
+import calendar
 from datetime import datetime, timezone
 from typing import Any
 
@@ -25,45 +32,61 @@ import requests
 from motia import FlowContext, queue
 from shared_config import GROQ_API_TOKEN, QWEN_MODEL, GROQ_URL
 from utils.token_logger import log_tokens, add_tokens_to_state
+from db.schema_context import get_schema_prompt
 
 config = {
     "name": "ParseIntent",
     "description": (
-        "Qwen extracts full structured intent JSON. "
-        "Handles aggregate-without-entity, filter-embedded locations, "
-        "and all query types correctly."
+        "Qwen extracts full structured intent JSON from any flat-table dataset. "
+        "Schema columns are injected so entity/metric names match actual DB columns."
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::intent.parse")],
     "enqueues": ["query::ambiguity.check"],
 }
 
-# ── System prompt (Bug 3 fix) ─────────────────────────────────────────────────
-_SYSTEM = """You are an analytics query parser for business data.
-Extract the query intent and return ONLY valid JSON — no prose, no markdown.
+# ── System prompt — fully generalised ────────────────────────────────────────
+_SYSTEM_TEMPLATE = """You are an analytics query parser for business data stored in a database.
+
+The database has the following schema:
+{schema}
+
+Your job: extract the user's query intent and return ONLY valid JSON — no prose, no markdown fences.
 
 JSON schema (all fields required):
-{
+{{
   "entity":       string or null,
-  "metric":       string (e.g. revenue/total_fare/driver_earnings/quantity/order_count/rides/bookings),
+  "metric":       string (the EXACT column name to aggregate, or "count" for row counts),
   "query_type":   one of [top_n, bottom_n, aggregate, threshold, comparison, growth_ranking, intersection, zero_filter],
-  "top_n":        integer (default 5, use 1 for "highest/best/worst single entity"),
-  "time_ranges":  array of {start:YYYY-MM-DD, end:YYYY-MM-DD, label:string},
-  "threshold":    {value:number, type:absolute|percentage, operator:gt|lt} or null,
-  "filters":      object (key-value filters extracted from the query),
+  "top_n":        integer (default 5; use 1 for "highest/best/worst/which single entity"),
+  "time_ranges":  array of {{start:YYYY-MM-DD, end:YYYY-MM-DD, label:string}},
+  "threshold":    {{value:number, type:absolute|percentage, operator:gt|lt}} or null,
+  "filters":      object of key-value pairs for any WHERE conditions mentioned,
   "is_complete":  true or false,
-  "clarification_question": null or a single short question
-}
+  "clarification_question": null or a single short question string
+}}
 
 ENTITY RULES:
-- entity = the PRIMARY dimension to GROUP BY (e.g. driver, customer, city, state, vehicle_type).
-- For query_type=aggregate (scalar total): entity MUST be null. Do not ask for entity.
-- If the user names a specific city/state/driver/vehicle inline (e.g. "in Mumbai",
-  "for Gujarat", "SUV rides", "by Sedan"), put it in filters:{} — do NOT use it as entity.
-  Example: "How many rides in Mumbai in 2023?" → entity=null, query_type=aggregate,
-  filters:{"pickup_city":"Mumbai"}, is_complete=true (metric + time known).
+- entity = the column to GROUP BY (e.g. driver_name, vehicle_type, pickup_city, state,
+  product_name, category, customer_name — pick from the schema above).
+- For query_type=aggregate (scalar total/average/count): entity MUST be null.
+- If the user names a specific filter value inline (e.g. "in Mumbai", "for Gujarat",
+  "SUV rides"), put it in filters:{{column_name: value}} — do NOT use it as entity.
 - Only set is_complete=false when the grouping dimension for a ranked query is unknown,
   OR when the time period is genuinely missing.
+
+METRIC RULES:
+- metric MUST be an exact column name from the schema, OR "count" for ride/order counts.
+- Map user words to column names:
+    "earnings", "driver earnings"         → driver_earnings (if column exists)
+    "fare", "total fare", "revenue"       → total_fare (if exists), else revenue, else total_amount
+    "commission", "platform commission"   → platform_commission (if exists)
+    "rides", "trips", "bookings", "count" → count
+    "quantity", "units sold"              → quantity (if exists)
+    "distance"                            → distance_km (if exists)
+    "duration"                            → duration_min (if exists)
+- When multiple revenue-like columns exist (total_fare, driver_earnings, platform_commission),
+  pick the one most aligned with the user's question. Default to the largest revenue column.
 
 COMPLETENESS RULES:
 - query_type=aggregate + metric known + time_ranges known → is_complete=true (entity not needed)
@@ -72,27 +95,20 @@ COMPLETENESS RULES:
 - NEVER ask for entity when query_type=aggregate. NEVER.
 
 QUERY TYPE RULES:
-- top_n         → highest N values, one entity group
+- top_n         → highest N values for a grouped entity
 - bottom_n      → lowest N values
 - aggregate     → single scalar total/average/count (no grouping)
-- threshold     → HAVING filter by value or % of total
+- threshold     → HAVING filter by absolute value or % of total
 - comparison    → two periods side-by-side with delta
 - growth_ranking→ rank entities BY growth delta between two periods
 - intersection  → entities present in BOTH of two periods
 - zero_filter   → entities with zero activity in period
 
 TIME RANGES:
-- Single period → 1 entry
-- comparison / growth_ranking / intersection → 2 entries
-- For year-only queries (e.g. "in 2024"): start=2024-01-01, end=2024-12-31
-- For quarter queries (e.g. "Q1 2024"): start=2024-01-01, end=2024-03-31
-
-METRIC INFERENCE:
-- "earnings", "driver earnings" → driver_earnings
-- "fare", "total fare", "revenue", "amount" → total_fare (or revenue for sales data)
-- "commission", "platform commission" → platform_commission
-- "rides", "trips", "bookings", "number of rides", "count" → order_count
-- "quantity", "units" → quantity
+- Single period → 1 entry. Two-period queries (comparison/growth/intersection) → 2 entries.
+- Year-only (e.g. "in 2024"): start=2024-01-01, end=2024-12-31
+- Quarter (e.g. "Q1 2024"):   start=2024-01-01, end=2024-03-31
+- Month (e.g. "March 2024"):  start=2024-03-01, end=2024-03-31
 
 clarification_question: ask ONLY the single most critical missing field.
 For aggregate queries, NEVER ask about entity — only ask about missing time period.
@@ -110,9 +126,9 @@ def _extract_json_object(text: str) -> str:
     for i in range(start, len(text)):
         ch = text[i]
         if in_str:
-            if esc:       esc = False
-            elif ch == "\\": esc = True
-            elif ch == '"':  in_str = False
+            if esc:           esc = False
+            elif ch == "\\":  esc = True
+            elif ch == '"':   in_str = False
             continue
         if ch == '"':   in_str = True; continue
         if ch == "{":   depth += 1
@@ -123,17 +139,17 @@ def _extract_json_object(text: str) -> str:
     return ""
 
 
-def _default_clarification(user_query: str, parsed: dict) -> str:
+def _default_clarification(parsed: dict) -> str:
     qt = parsed.get("query_type", "top_n")
     if qt == "aggregate":
         return "What time period should I use? (e.g. 2024, Q1 2024, March 2024)"
     if not parsed.get("entity"):
-        return "Which group should I analyze (for example customer, city, driver, or vehicle type)?"
+        return "Which dimension should I group by? (e.g. driver, city, vehicle type, state, customer)"
     if not parsed.get("time_ranges"):
         return "What time period should I use? (e.g. 2024, Q1 2024, March 2024)"
     if not parsed.get("metric"):
-        return "What metric should I use? (for example revenue, rides, or driver earnings)"
-    return "Please clarify: which entity, metric, and time period do you want?"
+        return "What metric should I measure? (e.g. total fare, driver earnings, number of rides)"
+    return "Please clarify: which dimension, metric, and time period do you want?"
 
 
 def _fallback_parse(user_query: str) -> dict:
@@ -142,25 +158,45 @@ def _fallback_parse(user_query: str) -> dict:
     entity = None
     top_n  = 5
 
-    if any(x in q for x in ["driver", "drivers"]):       entity = "driver"
-    elif any(x in q for x in ["customer", "customers"]):  entity = "customer"
-    elif any(x in q for x in ["city", "cities"]):         entity = "city"
-    elif any(x in q for x in ["state", "states"]):        entity = "state"
-    elif any(x in q for x in ["product", "products"]):    entity = "product"
-    elif any(x in q for x in ["category", "categories"]): entity = "category"
+    # Generic entity detection — catches many dataset types
+    for kw, ent in [
+        ("driver",       "driver_name"),
+        ("customer",     "customer_name"),
+        ("city",         "pickup_city"),
+        ("pickup city",  "pickup_city"),
+        ("drop city",    "drop_city"),
+        ("state",        "state"),
+        ("vehicle type", "vehicle_type"),
+        ("vehicle",      "vehicle_type"),
+        ("product",      "product_name"),
+        ("category",     "category"),
+        ("store",        "store_name"),
+        ("region",       "region"),
+    ]:
+        if kw in q:
+            entity = ent
+            break
 
-    metric = "revenue"
-    if any(x in q for x in ["ride", "rides", "trip", "trips", "booking", "count"]):
-        metric = "order_count"
-    elif any(x in q for x in ["earnings", "driver earn"]):
-        metric = "driver_earnings"
-    elif any(x in q for x in ["commission"]):
-        metric = "platform_commission"
-    elif any(x in q for x in ["fare", "total fare"]):
-        metric = "total_fare"
+    # Generic metric detection
+    metric = "total_fare"  # sensible default for ride data
+    for kw, met in [
+        ("earning",    "driver_earnings"),
+        ("commission", "platform_commission"),
+        ("fare",       "total_fare"),
+        ("revenue",    "revenue"),
+        ("amount",     "total_amount"),
+        ("ride",       "count"),
+        ("trip",       "count"),
+        ("booking",    "count"),
+        ("quantity",   "quantity"),
+        ("units",      "quantity"),
+        ("distance",   "distance_km"),
+    ]:
+        if kw in q:
+            metric = met
+            break
 
-    # If no entity and question sounds like aggregate
-    if entity is None and any(x in q for x in ["total", "how much", "how many", "average", "what was"]):
+    if entity is None and any(x in q for x in ["total", "how much", "how many", "average"]):
         qt = "aggregate"
 
     m = _TOPN_RE.search(q)
@@ -178,11 +214,92 @@ def _fallback_parse(user_query: str) -> dict:
         "clarification_question": "",
     }
     if not is_complete:
-        parsed["clarification_question"] = _default_clarification(user_query, parsed)
+        parsed["clarification_question"] = _default_clarification(parsed)
     return parsed
 
 
-def _call_qwen(user_query: str) -> tuple[dict, dict]:
+# ── Time-range extraction patterns ──────────────────────────────────────────
+_YEAR_RE    = re.compile(r"\b(20\d{2})\b")
+_QUARTER_RE = re.compile(r"\bQ([1-4])\s+(20\d{2})\b", re.IGNORECASE)
+_MONTH_RE   = re.compile(
+    r"\b(January|February|March|April|May|June|July|August|"
+    r"September|October|November|December)\s+(20\d{2})\b",
+    re.IGNORECASE,
+)
+_MONTH_MAP  = {
+    m.lower(): i for i, m in enumerate(
+        ["january","february","march","april","may","june",
+         "july","august","september","october","november","december"], 1
+    )
+}
+_QUARTER_MONTHS = {1: (1, 3), 2: (4, 6), 3: (7, 9), 4: (10, 12)}
+
+
+def _extract_time_ranges_from_text(text: str) -> list[dict]:
+    """Try to extract time ranges from raw query text."""
+    # Month check (most specific first)
+    m = _MONTH_RE.search(text)
+    if m:
+        month_name, year = m.group(1).lower(), int(m.group(2))
+        mo = _MONTH_MAP[month_name]
+        last_day = calendar.monthrange(year, mo)[1]
+        return [{
+            "start": f"{year}-{mo:02d}-01",
+            "end":   f"{year}-{mo:02d}-{last_day:02d}",
+            "label": f"{m.group(1)} {year}",
+        }]
+    # Quarter check
+    q = _QUARTER_RE.search(text)
+    if q:
+        qnum, year = int(q.group(1)), int(q.group(2))
+        sm, em = _QUARTER_MONTHS[qnum]
+        last_day = calendar.monthrange(year, em)[1]
+        return [{
+            "start": f"{year}-{sm:02d}-01",
+            "end":   f"{year}-{em:02d}-{last_day:02d}",
+            "label": f"Q{qnum} {year}",
+        }]
+    # Year check
+    y = _YEAR_RE.search(text)
+    if y:
+        year = int(y.group(1))
+        return [{
+            "start": f"{year}-01-01",
+            "end":   f"{year}-12-31",
+            "label": str(year),
+        }]
+    return []
+
+
+def _post_process(parsed: dict, user_query: str = "") -> dict:
+    """Safety net: enforce completeness rules Qwen might miss."""
+    qt = parsed.get("query_type", "top_n")
+    tr = parsed.get("time_ranges", [])
+    m  = parsed.get("metric")
+
+    # If Qwen missed the time range, try to extract it from the raw query text
+    if not tr and user_query:
+        extracted = _extract_time_ranges_from_text(user_query)
+        if extracted:
+            parsed["time_ranges"] = extracted
+            tr = extracted
+
+    # Bug 3 guard: aggregate + metric + time → always complete
+    if qt == "aggregate" and m and tr:
+        parsed["is_complete"]            = True
+        parsed["clarification_question"] = None
+
+    # If a ranked query now has entity + time, mark complete
+    if qt in ("top_n", "bottom_n", "threshold", "growth_ranking", "zero_filter"):
+        if parsed.get("entity") and tr:
+            parsed["is_complete"]            = True
+            parsed["clarification_question"] = None
+
+    return parsed
+
+
+def _call_qwen(user_query: str, schema: str) -> tuple[dict, dict]:
+    system = _SYSTEM_TEMPLATE.format(schema=schema)
     resp = requests.post(
         GROQ_URL,
         headers={"Authorization": f"Bearer {GROQ_API_TOKEN}",
@@ -190,7 +307,7 @@ def _call_qwen(user_query: str) -> tuple[dict, dict]:
         json={
             "model": QWEN_MODEL,
             "messages": [
-                {"role": "system", "content": _SYSTEM},
+                {"role": "system", "content": system},
                 {"role": "user",   "content": user_query},
             ],
             "max_tokens": 700, "temperature": 0.0,
@@ -212,23 +329,6 @@ def _call_qwen(user_query: str) -> tuple[dict, dict]:
         return json.loads(obj), data.get("usage", {})
 
 
-def _post_process(parsed: dict) -> dict:
-    """
-    Safety net: enforce completeness rules that Qwen might miss.
-    Bug 3 guard: aggregate + metric + time_ranges → always complete.
-    """
-    qt = parsed.get("query_type", "top_n")
-    tr = parsed.get("time_ranges", [])
-    m  = parsed.get("metric")
-
-    if qt == "aggregate" and m and tr:
-        parsed["is_complete"]            = True
-        parsed["clarification_question"] = None
-        parsed["entity"]                 = parsed.get("entity")  # keep null if null
-
-    return parsed
-
-
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     query_id      = input_data.get("queryId")
     user_query    = input_data.get("query", "")
@@ -240,14 +340,16 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     else:
         ctx.logger.info("Qwen intent extraction", {"queryId": query_id, "query": user_query})
         try:
-            parsed, usage = _call_qwen(user_query)
-            parsed = _post_process(parsed)
+            # Inject live schema so Qwen sees actual column names
+            schema = get_schema_prompt()
+            parsed, usage = _call_qwen(user_query, schema)
+            parsed = _post_process(parsed, user_query)
             log_tokens(ctx, query_id, "ParseIntent", QWEN_MODEL, usage)
             await add_tokens_to_state(ctx, query_id, "ParseIntent", QWEN_MODEL, usage)
             ctx.logger.info("Intent parsed", {"queryId": query_id, "parsed": parsed})
         except Exception as exc:
             ctx.logger.error("Intent parse failed", {"error": str(exc), "queryId": query_id})
-            parsed = _fallback_parse(user_query)
+            parsed = _post_process(_fallback_parse(user_query), user_query)
 
     qs = await ctx.state.get("queries", query_id)
     if qs:

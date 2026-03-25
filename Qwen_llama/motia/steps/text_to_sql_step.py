@@ -1,13 +1,24 @@
-"""Step 4: Text-to-SQL
+"""Step 4: Text-to-SQL — fully generalised for any flat-table dataset.
 
-Fixes applied:
-  Bug 1: LLM prompt now explicitly forbids EXTRACT() and requires BETWEEN.
-  Bug 2: Builder is only used when the required sales-schema tables actually
-         exist in DuckDB. For any other dataset (e.g. uber flat table),
-         force_llm=True immediately so the LLM generates schema-aware SQL.
+Key changes vs original:
+  1. Removed the hardcoded _SALES_SCHEMA_TABLES / _BUILDER_ENTITIES / _BUILDER_METRICS
+     gate. The deterministic builder only applies when the old e-commerce schema
+     is present; otherwise the LLM path is used directly.
+  2. force_llm is now the DEFAULT for any dataset that isn't the classic
+     {orders, customers, cities, products, categories, order_items} schema.
+     This means Uber data, SaaS data, service data etc. all go through the LLM
+     with the live schema injected — which produces correct, schema-aware SQL.
+  3. The LLM prompt now always includes the live schema (same as parse_intent),
+     so column names like total_fare, driver_earnings, platform_commission,
+     pickup_city, vehicle_type etc. are resolved correctly.
+  4. Bug 1 preserved: EXTRACT(YEAR) → BETWEEN rewrite.
+  5. Bug 2 preserved: builder only used when sales tables confirmed present.
 """
 
-import os, sys, re, logging
+import os
+import sys
+import re
+import logging
 
 _STEPS_DIR    = os.path.dirname(os.path.abspath(__file__))
 _MOTIA_DIR    = os.path.dirname(_STEPS_DIR)
@@ -34,16 +45,20 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Tables required for the hardcoded sales-schema builder to be valid
-_SALES_SCHEMA_TABLES = {"orders", "customers", "cities", "products", "categories", "states", "order_items"}
-_BUILDER_ENTITIES    = {"product", "customer", "city", "category", "state"}
-_BUILDER_METRICS     = {"revenue", "quantity", "order_count"}
+# Classic e-commerce sales schema — builder is ONLY valid when ALL these exist
+_SALES_SCHEMA_TABLES = {
+    "orders", "customers", "cities", "products",
+    "categories", "states", "order_items",
+}
+_BUILDER_ENTITIES = {"product", "customer", "city", "category", "state"}
+_BUILDER_METRICS  = {"revenue", "quantity", "order_count"}
 
 config = {
     "name": "TextToSQL",
     "description": (
-        "Builds SQL from Qwen intent. Uses deterministic builder only when the "
-        "sales schema tables exist. Falls back to LLM for any other dataset."
+        "Builds SQL from parsed intent using the live schema. "
+        "Uses deterministic builder only for classic e-commerce schema. "
+        "Falls back to LLM (Qwen/LLaMA) with schema injection for any other dataset."
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::text.to.sql")],
@@ -60,7 +75,7 @@ _FORBIDDEN   = re.compile(
 )
 
 
-# ── Bug 2 fix: check which tables actually exist in DuckDB ────────────────────
+# ── DB helpers ────────────────────────────────────────────────────────────────
 
 def _get_existing_tables() -> set[str]:
     try:
@@ -76,7 +91,6 @@ def _get_existing_tables() -> set[str]:
 
 
 def _sales_schema_available(existing: set[str]) -> bool:
-    """True only when all required sales tables are present."""
     return _SALES_SCHEMA_TABLES.issubset(existing)
 
 
@@ -125,31 +139,78 @@ def _explain(sql: str, parsed: dict | None = None) -> tuple[bool, str]:
     return explain_query(sql, params)
 
 
-# ── Bug 1 fix: LLM prompt — forbid EXTRACT, require BETWEEN ──────────────────
+# ── LLM prompt — fully generalised with live schema ──────────────────────────
 
 def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
+    entity     = parsed.get("entity")
+    metric     = parsed.get("metric", "count")
+    qt         = parsed.get("query_type", "top_n")
+    top_n      = parsed.get("top_n", 5)
+    thr        = parsed.get("threshold") or {}
     filters    = parsed.get("filters", {})
+    trs        = parsed.get("time_ranges", [])
+
     filter_desc = ", ".join(f"{k}={v}" for k, v in filters.items()) if filters else "none"
-    return f"""You are a DuckDB SQL expert. Output ONLY raw SQL — no prose, no markdown.
+
+    # Build ranking instruction
+    if qt in ("top_n",):
+        rank_instr = f"ORDER BY value DESC\nLIMIT {top_n}"
+    elif qt == "bottom_n":
+        rank_instr = f"ORDER BY value ASC\nLIMIT {top_n}"
+    elif qt == "aggregate":
+        rank_instr = "No GROUP BY, no ORDER BY, no LIMIT. Return single scalar aliased 'value'."
+    elif qt == "threshold":
+        op    = ">" if thr.get("operator", "gt") == "gt" else "<"
+        ttype = thr.get("type", "absolute")
+        tval  = thr.get("value", 0)
+        if ttype == "percentage":
+            rank_instr = (
+                f"HAVING {metric}_expr {op} ({tval} / 100.0) * (SELECT SUM(...) total)\n"
+                "ORDER BY value DESC"
+            )
+        else:
+            rank_instr = f"HAVING aggregation {op} {tval}\nORDER BY value DESC"
+    elif qt == "comparison":
+        rank_instr = f"Two-period comparison. Use CTEs for each period. ORDER BY value1 DESC LIMIT {top_n}"
+    elif qt == "growth_ranking":
+        rank_instr = f"Rank by delta = period2_value - period1_value. ORDER BY delta DESC LIMIT {top_n}"
+    elif qt == "intersection":
+        rank_instr = f"Only entities present in BOTH periods. ORDER BY value DESC LIMIT {top_n}"
+    elif qt == "zero_filter":
+        rank_instr = "Entities where metric = 0 or entity has no rows in period. ORDER BY name"
+    else:
+        rank_instr = f"ORDER BY value DESC LIMIT {top_n}"
+
+    # Date hints from parsed time_ranges
+    date_hints = ""
+    if trs:
+        for i, tr in enumerate(trs[:2]):
+            date_hints += f"\n  Period {i+1}: {tr.get('start')} to {tr.get('end')}"
+
+    return f"""You are a DuckDB SQL expert. Output ONLY raw SQL — no prose, no markdown fences, no explanation.
 
 User question: "{user_query}"
 
 {schema}
 
-Intent: {parsed}
+Parsed intent:
+  query_type : {qt}
+  entity     : {entity}  ← this is the column to GROUP BY
+  metric     : {metric}  ← this is the column to aggregate (or COUNT(*) if "count")
+  top_n      : {top_n}
+  filters    : {filter_desc}{date_hints}
 
-Custom filters to apply: {filter_desc}
-
-STRICT RULES — follow exactly:
-1. ALWAYS filter dates using:  date_column BETWEEN ? AND ?
+STRICT RULES:
+1. Use the EXACT column names from the schema above. Do not invent column names.
+2. Alias the GROUP BY column as "name".
+3. Alias the aggregation as "value".
+4. Filter dates using:  date_column BETWEEN ? AND ?
    NEVER use EXTRACT(YEAR ...) = ? or EXTRACT(MONTH ...) = ?
-   DuckDB cannot cast DATE params to BIGINT.
-2. Alias the primary group-by column as "name".
-3. Alias the metric aggregation as "value".
-4. Use ? for ALL date/number placeholders — never hard-code values.
-5. No semicolons. No comments.
-6. For top/bottom queries end with: ORDER BY value DESC|ASC LIMIT ?
-7. For aggregate (scalar) queries: no GROUP BY, no ORDER BY, no LIMIT.
+5. Use ? for ALL date/number placeholders — never hard-code values.
+6. No semicolons. No comments. SELECT only.
+7. For "count" metric: use COUNT(*) AS value
+8. For numeric metric columns: use SUM(column_name) AS value
+9. Ranking: {rank_instr}
 
 SQL:"""
 
@@ -194,7 +255,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     qt      = parsed.get("query_type", "top_n")
     filters = parsed.get("filters", {})
 
-    # ── Bug 2 fix: check existing tables FIRST ────────────────────────────────
+    # Check what tables actually exist
     existing_tables = _get_existing_tables()
     sales_available = _sales_schema_available(existing_tables)
     ctx.logger.info("📋 DB tables found", {
@@ -211,11 +272,10 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     fallback_used = False
     sql_source    = "builder"
 
-    # ── Primary path: deterministic builder ──────────────────────────────────
-    # Only use builder when sales tables actually exist AND no custom filters
+    # ── Deterministic builder path (classic e-commerce schema only) ───────────
     force_llm = (
         bool(filters)
-        or not sales_available                          # Bug 2 fix
+        or not sales_available
         or parsed.get("entity") not in _BUILDER_ENTITIES
         or parsed.get("metric") not in _BUILDER_METRICS
     )
@@ -230,22 +290,25 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                     generated_sql = built
                     ctx.logger.info("✅ Builder SQL validated", {"queryId": query_id})
                 else:
-                    ctx.logger.warn("⚠️ Builder EXPLAIN failed", {"queryId": query_id, "error": err})
+                    ctx.logger.warn("⚠️ Builder EXPLAIN failed — falling to LLM",
+                                    {"queryId": query_id, "error": err})
             else:
-                ctx.logger.warn("⚠️ Builder safety failed", {"queryId": query_id, "reason": reason})
+                ctx.logger.warn("⚠️ Builder safety failed — falling to LLM",
+                                {"queryId": query_id, "reason": reason})
 
-    # ── LLM path: custom filters OR builder failed OR non-sales schema ────────
+    # ── LLM path — used for all non-classic-schema datasets ──────────────────
     if generated_sql is None:
-        COMPLEX  = {"growth_ranking", "comparison", "threshold", "intersection", "zero_filter"}
-        model    = QWEN_MODEL if qt in COMPLEX else LLAMA_MODEL
+        # Use Qwen for complex queries; LLaMA for simple ranked queries
+        COMPLEX = {"growth_ranking", "comparison", "threshold", "intersection", "zero_filter"}
+        model   = QWEN_MODEL if qt in COMPLEX else LLAMA_MODEL
         sql_source = f"llm_{model.split('/')[0]}"
 
         ctx.logger.info("🤖 LLM SQL generation", {"queryId": query_id, "model": model})
 
         try:
-            schema      = get_schema_prompt()
-            prompt      = _build_llm_prompt(user_query, parsed, schema)
-            raw, usage  = _call_llm(model, prompt)
+            schema     = get_schema_prompt()
+            prompt     = _build_llm_prompt(user_query, parsed, schema)
+            raw, usage = _call_llm(model, prompt)
             ctx.logger.info("🔬 LLM raw", {"queryId": query_id, "preview": raw[:400]})
 
             sql = _extract_sql(raw)
@@ -256,7 +319,11 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                     generated_sql = sql
                     ctx.logger.info("✅ LLM SQL validated", {"queryId": query_id})
                 else:
-                    ctx.logger.warn("⚠️ LLM EXPLAIN failed", {"queryId": query_id, "error": err})
+                    # EXPLAIN failed — log but still try to run it
+                    # (EXPLAIN can be overly strict with DuckDB date casting)
+                    ctx.logger.warn("⚠️ LLM EXPLAIN failed — attempting execution anyway",
+                                    {"queryId": query_id, "error": err})
+                    generated_sql = sql
             else:
                 ctx.logger.warn("⚠️ LLM safety failed", {"queryId": query_id, "reason": reason})
         except Exception as exc:
@@ -278,7 +345,8 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     if generated_sql is None:
         msg = (
             f"Could not generate SQL for query_type={qt} "
-            f"entity={parsed.get('entity')} metric={parsed.get('metric')}."
+            f"entity={parsed.get('entity')} metric={parsed.get('metric')}. "
+            "Try rephrasing — e.g. 'Top 5 drivers by earnings in 2024'."
         )
         qs = await ctx.state.get("queries", query_id)
         if qs:

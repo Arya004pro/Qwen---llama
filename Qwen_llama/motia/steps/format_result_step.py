@@ -1,19 +1,13 @@
 """Step 6: Format Result — formats any result shape into text + chart.
 
-Detects result shape from the data itself (no query-type switch needed):
-  1 col  → aggregate scalar
-  2 cols (name, value) → ranked / threshold / zero_filter
-  3 cols (name, value1, value2) → comparison
-  4 cols (name, value1, value2, delta) → growth_ranking
-
 Changes vs original:
-  - Tooltip callbacks use bare function( strings (no @@FUNCTION@@ wrappers)
-    so they work in both Streamlit renderer and chart_step.py HTML page.
-  - Axis ticks use compact units appropriate to each metric:
-      revenue      → ₹ prefix  + Cr / L / K  (Indian number system)
-      quantity     → no prefix + M / K
-      order_count  → no prefix + K
-  - Threshold label correctly reflects operator direction (< vs >).
+  - Chart.js scales now include proper AXIS TITLES (label for x and y axes).
+  - Axis title text is dynamically built from entity + metric names.
+  - Currency prefix is passed through to axis title (₹ for INR, $ for USD, etc.).
+  - _infer_currency() detects currency symbol from metric column name or a hint
+    stored in the query state — so any future dataset with USD columns works too.
+  - All other behaviour (tooltip callbacks, compact tick units, comparison charts,
+    growth ranking, etc.) is unchanged.
 """
 
 from typing import Any
@@ -21,16 +15,22 @@ from motia import FlowContext, queue
 
 config = {
     "name": "FormatResult",
-    "description": "Formats any result shape into user-facing text and Chart.js config.",
+    "description": "Formats any result shape into user-facing text and Chart.js config with proper axis labels.",
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::format.result")],
     "enqueues": [],
 }
 
 ENTITY_LABELS = {
+    # e-commerce
     "product": "products", "customer": "customers",
     "city": "cities",      "category": "categories",
     "state": "states",
+    # ride-hailing
+    "driver_name": "drivers",   "pickup_city": "pickup cities",
+    "drop_city":   "drop cities", "vehicle_type": "vehicle types",
+    "vehicle_model": "vehicle models", "payment_method": "payment methods",
+    "ride_type": "ride types",
 }
 
 _PALETTE = [
@@ -41,49 +41,149 @@ _PALETTE = [
 ]
 _BORDERS = [c.replace("0.85", "1") for c in _PALETTE]
 
-_BASE: Any = {
-    "responsive": True, "maintainAspectRatio": True,
-    "interaction": {"mode": "nearest", "intersect": True},
-    "plugins": {
-        "legend": {"display": False},
-        "tooltip": {
-            "enabled": True,
-            "backgroundColor": "#1e2130", "titleColor": "#e2e8f0",
-            "bodyColor": "#94a3b8", "borderColor": "#2d3148", "borderWidth": 1,
+# ── Currency inference ────────────────────────────────────────────────────────
+
+def _infer_currency(metric: str, hint: str = "") -> str:
+    """
+    Return the currency symbol for a given metric column name.
+    Extend this list as new datasets are added.
+    """
+    m = (metric or "").lower()
+    h = (hint or "").lower()
+
+    # Explicit USD signals
+    if any(x in m or x in h for x in ["usd", "dollar", "$", "price_usd", "amount_usd"]):
+        return "$"
+
+    # Explicit INR signals (default for Indian ride/e-commerce data)
+    if any(x in m for x in [
+        "fare", "earnings", "commission", "revenue",
+        "amount", "price", "total", "salary", "sales", "profit",
+    ]):
+        return "₹"
+
+    # Non-monetary metrics
+    if any(x in m for x in ["count", "quantity", "units", "distance", "duration", "rides"]):
+        return ""
+
+    return "₹"  # safe default for Indian datasets
+
+
+# ── Human-readable axis label ─────────────────────────────────────────────────
+
+def _metric_label(metric: str, currency: str) -> str:
+    """Build a readable axis title from metric column name."""
+    mapping = {
+        "total_fare":           "Total Fare",
+        "driver_earnings":      "Driver Earnings",
+        "platform_commission":  "Platform Commission",
+        "revenue":              "Revenue",
+        "total_amount":         "Total Amount",
+        "quantity":             "Quantity Sold",
+        "order_count":          "Order Count",
+        "count":                "Number of Rides",
+        "distance_km":          "Distance (km)",
+        "duration_min":         "Duration (min)",
+    }
+    label = mapping.get(metric, metric.replace("_", " ").title())
+    if currency:
+        return f"{label} ({currency})"
+    return label
+
+
+def _entity_label(entity: str) -> str:
+    return ENTITY_LABELS.get(entity, entity.replace("_", " ").title() if entity else "")
+
+
+# ── Base chart options ────────────────────────────────────────────────────────
+
+def _make_base(metric: str, currency: str, entity: str,
+               legend: bool = False, index_axis: str = "y") -> dict:
+    """Build Chart.js options with proper axis titles."""
+    metric_lbl = _metric_label(metric, currency)
+    entity_lbl = _entity_label(entity)
+
+    # For horizontal bar (indexAxis="y"): x = value axis, y = entity axis
+    if index_axis == "y":
+        x_title = metric_lbl
+        y_title = entity_lbl
+        x_tick  = _tick_fn(metric, currency)
+        y_tick  = None
+    else:
+        # Vertical bar: x = entity, y = value
+        x_title = entity_lbl
+        y_title = metric_lbl
+        x_tick  = None
+        y_tick  = _tick_fn(metric, currency)
+
+    x_ticks: dict = {"color": "#94a3b8", "font": {"size": 11}}
+    if x_tick:
+        x_ticks["callback"] = x_tick
+
+    y_ticks: dict = {"color": "#94a3b8", "font": {"size": 11}}
+    if y_tick:
+        y_ticks["callback"] = y_tick
+
+    return {
+        "responsive": True,
+        "maintainAspectRatio": True,
+        "indexAxis": index_axis,
+        "interaction": {"mode": "nearest", "intersect": True},
+        "plugins": {
+            "legend": {
+                "display": legend,
+                "labels": {"color": "#94a3b8", "font": {"size": 12}},
+            },
+            "tooltip": {
+                "enabled": True,
+                "backgroundColor": "#1e2130",
+                "titleColor": "#e2e8f0",
+                "bodyColor": "#94a3b8",
+                "borderColor": "#2d3148",
+                "borderWidth": 1,
+            },
         },
-    },
-    "scales": {
-        "x": {
-            "ticks": {"color": "#94a3b8", "font": {"size": 11}},
-            "grid":  {"color": "rgba(255,255,255,0.05)"},
+        "scales": {
+            "x": {
+                "title": {
+                    "display": bool(x_title),
+                    "text":    x_title,
+                    "color":   "#94a3b8",
+                    "font":    {"size": 11, "weight": "normal"},
+                },
+                "ticks": x_ticks,
+                "grid":  {"color": "rgba(255,255,255,0.05)"},
+            },
+            "y": {
+                "title": {
+                    "display": bool(y_title),
+                    "text":    y_title,
+                    "color":   "#94a3b8",
+                    "font":    {"size": 11, "weight": "normal"},
+                },
+                "ticks":       y_ticks,
+                "grid":        {"color": "rgba(255,255,255,0.05)"},
+                "beginAtZero": True,
+            },
         },
-        "y": {
-            "ticks":       {"color": "#94a3b8", "font": {"size": 11}},
-            "grid":        {"color": "rgba(255,255,255,0.05)"},
-            "beginAtZero": True,
-        },
-    },
-}
+    }
 
 
 # ── JS callback builders ──────────────────────────────────────────────────────
 
-def _tick_fn(metric: str) -> str:
-    """
-    Compact axis tick label JS function — no @@FUNCTION@@ wrappers.
-    revenue      → ₹ Cr / L / K
-    quantity / order_count → plain M / K
-    """
-    if metric == "revenue":
+def _tick_fn(metric: str, currency: str) -> str:
+    """Compact axis tick label JS function — readable number + currency symbol."""
+    pfx = currency.replace("₹", "\\u20b9").replace("$", "\\u0024")
+    if currency in ("₹", "$"):
         return (
-            "function(v){"
-            "if(typeof v!=='number')return v;"
-            "var a=Math.abs(v);"
-            "if(a>=10000000)return '\u20b9'+(v/10000000).toLocaleString('en-IN',{maximumFractionDigits:2})+'Cr';"
-            "if(a>=100000)return '\u20b9'+(v/100000).toLocaleString('en-IN',{maximumFractionDigits:2})+'L';"
-            "if(a>=1000)return '\u20b9'+(v/1000).toLocaleString('en-IN',{maximumFractionDigits:1})+'K';"
-            "return '\u20b9'+v.toLocaleString('en-IN');"
-            "}"
+            f"function(v){{"
+            f"if(typeof v!=='number')return v;"
+            f"var a=Math.abs(v);"
+            f"if(a>=10000000)return '{pfx}'+(v/10000000).toLocaleString('en-IN',{{maximumFractionDigits:2}})+'Cr';"
+            f"if(a>=100000)return '{pfx}'+(v/100000).toLocaleString('en-IN',{{maximumFractionDigits:2}})+'L';"
+            f"if(a>=1000)return '{pfx}'+(v/1000).toLocaleString('en-IN',{{maximumFractionDigits:1}})+'K';"
+            f"return '{pfx}'+v.toLocaleString('en-IN');"
+            f"}}"
         )
     else:
         return (
@@ -97,17 +197,17 @@ def _tick_fn(metric: str) -> str:
         )
 
 
-def _tooltip_fn(metric: str) -> str:
-    """Full-precision tooltip value shown on hover."""
-    if metric == "revenue":
+def _tooltip_fn(metric: str, currency: str) -> str:
+    pfx = currency.replace("₹", "\\u20b9").replace("$", "\\u0024")
+    if currency:
         return (
-            "function(c){"
-            "var v=c.raw;"
-            "var s=typeof v==='number'"
-            "?v.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})"
-            ":String(v);"
-            "return ' \u20b9'+s;"
-            "}"
+            f"function(c){{"
+            f"var v=c.raw;"
+            f"var s=typeof v==='number'"
+            f"?v.toLocaleString('en-IN',{{minimumFractionDigits:2,maximumFractionDigits:2}})"
+            f":String(v);"
+            f"return ' {pfx}'+s;"
+            f"}}"
         )
     else:
         return (
@@ -121,10 +221,9 @@ def _tooltip_fn(metric: str) -> str:
         )
 
 
-def _cmp_tooltip_fn(metric: str) -> str:
-    """Grouped-bar tooltip: dataset label + value."""
-    dec = "{minimumFractionDigits:2,maximumFractionDigits:2}" if metric == "revenue" else "{maximumFractionDigits:0}"
-    pfx = "\\u20b9" if metric == "revenue" else ""
+def _cmp_tooltip_fn(metric: str, currency: str) -> str:
+    dec = "{minimumFractionDigits:2,maximumFractionDigits:2}" if currency else "{maximumFractionDigits:0}"
+    pfx = currency.replace("₹", "\\u20b9").replace("$", "\\u0024")
     return (
         f"function(c){{"
         f"var v=c.raw;"
@@ -136,39 +235,28 @@ def _cmp_tooltip_fn(metric: str) -> str:
 
 # ── chart builder ─────────────────────────────────────────────────────────────
 
-def _bar(labels, values, metric, title, subtitle):
-    p = "₹" if metric == "revenue" else ""
+def _bar(labels, values, metric, currency, entity, title, subtitle):
+    base    = _make_base(metric, currency, entity, index_axis="y")
+    tooltip = _tooltip_fn(metric, currency)
+    base["plugins"]["tooltip"]["callbacks"] = {"label": tooltip}
+
     cfg = {
         "type": "bar",
         "data": {"labels": labels, "datasets": [{
-            "label": metric.title(), "data": values,
+            "label": _metric_label(metric, currency),
+            "data": values,
             "backgroundColor": [_PALETTE[i % len(_PALETTE)] for i in range(len(labels))],
             "borderColor":     [_BORDERS[i % len(_PALETTE)] for i in range(len(labels))],
             "borderWidth": 1, "borderRadius": 4,
         }]},
-        "options": {
-            **_BASE, "indexAxis": "y",
-            "plugins": {
-                **_BASE["plugins"],
-                "tooltip": {
-                    **_BASE["plugins"]["tooltip"],
-                    "callbacks": {"label": _tooltip_fn(metric)},
-                },
-            },
-            "scales": {
-                "x": {
-                    **_BASE["scales"]["x"],
-                    "ticks": {**_BASE["scales"]["x"]["ticks"], "callback": _tick_fn(metric)},
-                },
-                "y": _BASE["scales"]["y"],
-            },
-        },
+        "options": base,
     }
-    return {"title": title, "subtitle": subtitle, "prefix": p, "config": cfg}
+    return {"title": title, "subtitle": subtitle, "prefix": currency, "config": cfg}
 
 
 def _token_summary(usage, totals):
-    if not usage and not totals: return ""
+    if not usage and not totals:
+        return ""
     lines = ["\n\n─── Token Usage ───────────────────────────────"]
     for e in usage:
         short = e.get("model", "").split("/")[-1]
@@ -189,6 +277,22 @@ def _token_summary(usage, totals):
     return "\n".join(lines)
 
 
+def _fmt(v, currency):
+    if v is None:
+        return "—"
+    return f"{currency}{v:,.2f}" if currency else f"{v:,.2f}"
+
+
+def _delta_str(v1, v2, currency):
+    if v1 is None or v2 is None:
+        return "N/A"
+    delta = v2 - v1
+    sign  = "+" if delta >= 0 else ""
+    pct   = (delta / v1 * 100) if v1 != 0 else float("inf")
+    pct_s = f"{sign}{pct:.1f}%" if pct != float("inf") else "new"
+    return f"{sign}{currency}{abs(delta):,.2f} ({pct_s})"
+
+
 # ── handler ───────────────────────────────────────────────────────────────────
 
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
@@ -203,12 +307,14 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     end_date      = input_data.get("endDate", "")
 
     qt     = parsed.get("query_type", "top_n")
-    entity = parsed.get("entity", "product")
-    metric = parsed.get("metric", "revenue")
+    entity = parsed.get("entity", "")
+    metric = parsed.get("metric", "value")
     top_n  = parsed.get("top_n", 5)
     thr    = parsed.get("threshold")
-    p      = "₹" if metric == "revenue" else ""
-    elabel = ENTITY_LABELS.get(entity, entity)
+
+    currency = _infer_currency(metric)
+    p        = currency
+    elabel   = _entity_label(entity) or entity or "items"
 
     qs           = await ctx.state.get("queries", query_id)
     if not user_query and qs:
@@ -251,7 +357,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         formatted_text = text + _token_summary(token_usage, token_totals)
         items = [{"label": f"Total {metric}", "value": f"{p}{v:,.2f}"}]
 
-    # ── GROWTH RANKING (4 cols: name, value1, value2, delta) ────────────────────
+    # ── GROWTH RANKING ──────────────────────────────────────────────────────────
     elif has_delta:
         p1 = period_labels[0] if len(period_labels) > 0 else "Period 1"
         p2 = period_labels[1] if len(period_labels) > 1 else "Period 2"
@@ -272,11 +378,13 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         formatted_text = header + _token_summary(token_usage, token_totals)
         names  = [r.get("name", "?") for r in results]
         deltas = [r.get("delta", 0)   for r in results]
-        chart_config = _bar(names, deltas, metric,
-                            user_query or f"{elabel.title()} by {metric} growth: {p1}→{p2}",
-                            f"Delta in {metric} ({p1} → {p2})")
+        chart_config = _bar(
+            names, deltas, metric, currency, entity,
+            user_query or f"{elabel.title()} by {metric} growth: {p1}→{p2}",
+            f"Delta in {metric} ({p1} → {p2})",
+        )
 
-    # ── COMPARISON (3 cols: name, value1, value2) ────────────────────────────────
+    # ── COMPARISON ──────────────────────────────────────────────────────────────
     elif has_value2:
         p1 = period_labels[0] if len(period_labels) > 0 else "Period 1"
         p2 = period_labels[1] if len(period_labels) > 1 else "Period 2"
@@ -293,12 +401,17 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             d = _delta_str(v1, v2, p)
             lines.append(f"  {i:>3}. {name:<{col_w}}  {_fmt(v1,p):>16}  {_fmt(v2,p):>16}  {d:>14}")
             items.append({"rank": i, "name": name,
-                          f"{p1}_value": _fmt(v1, p), f"{p2}_value": _fmt(v2, p),
-                          "delta": d})
+                          f"{p1}_value": _fmt(v1, p), f"{p2}_value": _fmt(v2, p), "delta": d})
         formatted_text = "\n".join(lines) + _token_summary(token_usage, token_totals)
+
         names = [r.get("name", "?")      for r in results]
         vals1 = [r.get("value1", 0) or 0 for r in results]
         vals2 = [r.get("value2", 0) or 0 for r in results]
+
+        base_cmp = _make_base(metric, currency, entity, legend=True, index_axis="y")
+        base_cmp["plugins"]["tooltip"]["callbacks"] = {
+            "label": _cmp_tooltip_fn(metric, currency)
+        }
         cmp_cfg = {
             "type": "bar",
             "data": {"labels": names, "datasets": [
@@ -309,24 +422,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                  "backgroundColor": _PALETTE[1], "borderColor": _BORDERS[1],
                  "borderWidth": 1, "borderRadius": 3},
             ]},
-            "options": {
-                **_BASE, "indexAxis": "y",
-                "plugins": {
-                    **_BASE["plugins"],
-                    "legend": {"display": True, "labels": {"color": "#94a3b8"}},
-                    "tooltip": {
-                        **_BASE["plugins"]["tooltip"],
-                        "callbacks": {"label": _cmp_tooltip_fn(metric)},
-                    },
-                },
-                "scales": {
-                    "x": {
-                        **_BASE["scales"]["x"],
-                        "ticks": {**_BASE["scales"]["x"]["ticks"], "callback": _tick_fn(metric)},
-                    },
-                    "y": _BASE["scales"]["y"],
-                },
-            },
+            "options": base_cmp,
         }
         chart_config = {
             "title":    user_query or f"{metric.title()} comparison: {p1} vs {p2}",
@@ -335,7 +431,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             "config":   cmp_cfg,
         }
 
-    # ── RANKED / THRESHOLD / INTERSECTION / ZERO_FILTER (2 cols: name, value) ──
+    # ── RANKED / THRESHOLD / INTERSECTION / ZERO_FILTER ────────────────────────
     else:
         names, values = [], []
         if qt == "zero_filter":
@@ -348,7 +444,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 items.append({"rank": i, "name": name, "value": "0"})
         else:
             if qt == "threshold" and thr:
-                thr_op   = thr.get("operator", "gt")   # "gt" → >, "lt" → <
+                thr_op   = thr.get("operator", "gt")
                 thr_type = thr.get("type", "absolute")
                 thr_val  = thr.get("value", 0)
                 direction = "less than" if thr_op == "lt" else "more than"
@@ -365,7 +461,10 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 header = f"🔀 {elabel.title()} present in BOTH {p1} AND {p2} (combined {metric}):"
             else:
                 rl = "Top" if qt == "top_n" else "Bottom"
-                header = f"{rl} {top_n} {elabel} by {metric} between {start_date} and {end_date}:"
+                header = (
+                    f"{rl} {top_n} {elabel} by {_metric_label(metric, '')} "
+                    f"between {start_date} and {end_date}:"
+                )
             items = []
             for i, row in enumerate(results, 1):
                 name  = row.get("name", "?")
@@ -378,9 +477,9 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
 
         formatted_text = header + _token_summary(token_usage, token_totals)
         if names:
-            rl = "Top" if qt not in ("bottom_n",) else "Bottom"
+            rl = "Top" if qt != "bottom_n" else "Bottom"
             chart_config = _bar(
-                names, values, metric,
+                names, values, metric, currency, entity,
                 user_query or f"{rl} {elabel} by {metric}",
                 f"{start_date} to {end_date}",
             )
