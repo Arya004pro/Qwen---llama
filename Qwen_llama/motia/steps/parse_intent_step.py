@@ -7,8 +7,8 @@ Key changes:
   - Qwen is shown the LIVE schema columns so it can infer metric/entity
     from actual column names (total_fare, driver_earnings, platform_commission,
     etc.) rather than guessing from a hardcoded list.
-  - ENTITY RULES updated: entity = any groupable dimension column
-    (driver_name, vehicle_type, pickup_city, state, product_name, etc.)
+  - ENTITY RULES updated: entity = the human-readable NAME column
+    (driver_name, customer_name, product_name) — never raw ID columns.
   - METRIC RULES updated: metric = any numeric column or a COUNT of rows.
   - Bug 3 guard preserved: aggregate + metric + time = always complete.
 """
@@ -67,13 +67,19 @@ JSON schema (all fields required):
 }}
 
 ENTITY RULES:
-- entity = the column to GROUP BY (e.g. driver_id, customer_id, product_id, sku,
-  pickup_city, category — pick the most specific ID or name from the schema).
+- entity = the DISPLAY column to show in results — ALWAYS prefer the human-readable
+  NAME column over raw ID columns.
+  Good examples: driver_name, customer_name, product_name, pickup_city, vehicle_type, state.
+  BAD examples:  driver_id, customer_id, product_id  ← NEVER use raw ID columns as entity.
 - CRITICAL: If the schema has BOTH an ID column and a name column for the same entity
-  (e.g. customer_id and customer_name), use the ID column as entity to ensure 
-  distinct items are not merged.
+  (e.g. driver_id + driver_name, customer_id + customer_name, product_id + product_name),
+  you MUST use the NAME column as entity (driver_name, customer_name, product_name).
+  The SQL generator will automatically GROUP BY the ID column for uniqueness.
+  NEVER return raw ID codes like "D377" or "C001" — always use human-readable names.
+- For columns that are already categorical strings with no ID pair (pickup_city, state,
+  vehicle_type, payment_method, ride_type), use that column directly as entity.
 - For query_type=aggregate (scalar total/average/count): entity MUST be null.
-- If the user names a specific filter value inline (e.g. "in Mumbai"), 
+- If the user names a specific filter value inline (e.g. "in Mumbai"),
   put it in filters:{{column_name: value}} — do NOT use it as entity.
 
 METRIC RULES:
@@ -159,22 +165,22 @@ def _fallback_parse(user_query: str) -> dict:
     entity = None
     top_n  = 5
 
-    # Generic entity detection — catches many dataset types
+    # Generic entity detection — uses NAME columns (not ID columns) for display
     for kw, ent in [
-        ("driver",       "driver_id"),
-        ("customer",     "customer_id"),
-        ("user",         "user_id"),
-        ("client",       "client_id"),
+        ("driver",       "driver_name"),
+        ("customer",     "customer_name"),
+        ("user",         "user_name"),
+        ("client",       "client_name"),
         ("city",         "pickup_city"),
         ("pickup city",  "pickup_city"),
         ("drop city",    "drop_city"),
         ("state",        "state"),
         ("vehicle type", "vehicle_type"),
         ("vehicle",      "vehicle_type"),
-        ("product",      "product_id"),
-        ("item",         "item_id"),
-        ("category",     "category"),
-        ("store",        "store_id"),
+        ("product",      "product_name"),
+        ("item",         "item_name"),
+        ("category",     "category_name"),
+        ("store",        "store_name"),
         ("region",       "region"),
     ]:
         if kw in q:
@@ -287,6 +293,14 @@ def _post_process(parsed: dict, user_query: str = "") -> dict:
         if extracted:
             parsed["time_ranges"] = extracted
             tr = extracted
+
+    # Guard: if Qwen returned an ID column as entity, swap to name column
+    entity = parsed.get("entity", "") or ""
+    if entity.endswith("_id"):
+        base = entity[:-3]
+        name_col = base + "_name"
+        # We optimistically set the name column; SQL generation will validate
+        parsed["entity"] = name_col
 
     # Bug 3 guard: aggregate + metric + time → always complete
     if qt == "aggregate" and m and tr:

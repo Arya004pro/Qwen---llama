@@ -1,7 +1,9 @@
 """Step 6: Format Result — formats any result shape into text + chart.
 
 Changes vs original:
-  - Chart.js scales now include proper AXIS TITLES (label for x and y axes).
+  - _entity_label() is now fully generic: strips _name/_id/_type suffixes and
+    pluralises automatically, so "driver_name" → "drivers" works for any dataset.
+  - Chart.js scales include proper AXIS TITLES (label for x and y axes).
   - Axis title text is dynamically built from entity + metric names.
   - Currency prefix is passed through to axis title (₹ for INR, $ for USD, etc.).
   - _infer_currency() detects currency symbol from metric column name or a hint
@@ -21,15 +23,28 @@ config = {
     "enqueues": [],
 }
 
-ENTITY_LABELS = {
+# ── Entity label mapping ──────────────────────────────────────────────────────
+# Explicit overrides — the _entity_label() fallback handles everything else.
+ENTITY_LABELS: dict[str, str] = {
     # e-commerce
-    "product": "products", "customer": "customers",
-    "city": "cities",      "category": "categories",
+    "product_name": "products",
+    "customer_name": "customers",
+    "city_name": "cities",
+    "category_name": "categories",
+    "state_name": "states",
+    # legacy non-suffixed keys (kept for backward compat with old e-commerce flows)
+    "product": "products",
+    "customer": "customers",
+    "city": "cities",
+    "category": "categories",
     "state": "states",
     # ride-hailing
-    "driver_name": "drivers",   "pickup_city": "pickup cities",
-    "drop_city":   "drop cities", "vehicle_type": "vehicle types",
-    "vehicle_model": "vehicle models", "payment_method": "payment methods",
+    "driver_name": "drivers",
+    "pickup_city": "pickup cities",
+    "drop_city": "drop cities",
+    "vehicle_type": "vehicle types",
+    "vehicle_model": "vehicle models",
+    "payment_method": "payment methods",
     "ride_type": "ride types",
 }
 
@@ -92,7 +107,32 @@ def _metric_label(metric: str, currency: str) -> str:
 
 
 def _entity_label(entity: str) -> str:
-    return ENTITY_LABELS.get(entity, entity.replace("_", " ").title() if entity else "")
+    """
+    Convert a DB column name to a human-readable plural label.
+
+    Priority:
+      1. Explicit entry in ENTITY_LABELS  (e.g. driver_name → "drivers")
+      2. Strip _name/_id/_type suffix, pluralise base word  (product_name → "products")
+      3. Replace underscores with spaces, title-case, append 's' as generic fallback.
+    """
+    if not entity:
+        return ""
+
+    # 1 — explicit override
+    if entity in ENTITY_LABELS:
+        return ENTITY_LABELS[entity]
+
+    # 2 — strip common suffixes, derive readable plural
+    base = entity
+    for suffix in ("_name", "_id", "_type", "_code"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+
+    words = base.replace("_", " ").strip()
+    if words and not words.endswith("s"):
+        words += "s"
+    return words
 
 
 # ── Base chart options ────────────────────────────────────────────────────────

@@ -11,8 +11,11 @@ Key changes vs original:
   3. The LLM prompt now always includes the live schema (same as parse_intent),
      so column names like total_fare, driver_earnings, platform_commission,
      pickup_city, vehicle_type etc. are resolved correctly.
-  4. Bug 1 preserved: EXTRACT(YEAR) → BETWEEN rewrite.
-  5. Bug 2 preserved: builder only used when sales tables confirmed present.
+  4. _detect_id_name_pairs() dynamically finds name_col → id_col pairs so the
+     SQL prompt can emit correct GROUP BY driver_id, driver_name instructions,
+     guaranteeing human-readable names are shown (not raw IDs like D377).
+  5. Bug 1 preserved: EXTRACT(YEAR) → BETWEEN rewrite.
+  6. Bug 2 preserved: builder only used when sales tables confirmed present.
 """
 
 import os
@@ -94,6 +97,36 @@ def _sales_schema_available(existing: set[str]) -> bool:
     return _SALES_SCHEMA_TABLES.issubset(existing)
 
 
+def _detect_id_name_pairs() -> dict[str, str]:
+    """
+    Scan all columns in the live DB and return a mapping of
+    name_column -> id_column for every detected pair.
+
+    e.g. if the table has driver_id + driver_name columns:
+         returns {"driver_name": "driver_id"}
+
+    This is fully generic — works for any dataset, no hardcoding.
+    """
+    try:
+        conn = get_read_connection()
+        rows = conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'main'"
+        ).fetchall()
+        conn.close()
+        cols = {r[0] for r in rows}
+        pairs: dict[str, str] = {}
+        for col in cols:
+            if col.endswith("_name"):
+                base   = col[:-5]          # strip _name
+                id_col = base + "_id"
+                if id_col in cols:
+                    pairs[col] = id_col    # driver_name -> driver_id
+        return pairs
+    except Exception:
+        return {}
+
+
 # ── SQL extraction / safety ───────────────────────────────────────────────────
 
 def _extract_sql(raw: str) -> str:
@@ -152,7 +185,40 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
 
     filter_desc = ", ".join(f"{k}={v}" for k, v in filters.items()) if filters else "none"
 
-    # Build ranking instruction
+    # ── Detect ID-name pairs for correct GROUP BY generation ─────────────────
+    id_name_pairs = _detect_id_name_pairs()
+
+    if entity and entity in id_name_pairs:
+        id_col = id_name_pairs[entity]
+        groupby_rule = (
+            f"10. GROUPING (CRITICAL):\n"
+            f"    entity='{entity}' has a corresponding ID column '{id_col}'.\n"
+            f"    You MUST:\n"
+            f"      - SELECT {entity} AS name   (the human-readable name, NOT {id_col})\n"
+            f"      - GROUP BY {id_col}, {entity}  (both columns for uniqueness)\n"
+            f"    Correct example:\n"
+            f"      SELECT {entity} AS name, SUM({metric}) AS value\n"
+            f"      FROM <table> WHERE <date_col> BETWEEN ? AND ?\n"
+            f"      GROUP BY {id_col}, {entity}\n"
+            f"      ORDER BY value DESC LIMIT ?\n"
+            f"    WRONG (never do this): SELECT {id_col} AS name ..."
+        )
+    elif entity:
+        groupby_rule = (
+            f"10. GROUPING:\n"
+            f"    entity='{entity}' — GROUP BY {entity}, SELECT {entity} AS name.\n"
+            f"    Example:\n"
+            f"      SELECT {entity} AS name, SUM({metric}) AS value\n"
+            f"      FROM <table> WHERE <date_col> BETWEEN ? AND ?\n"
+            f"      GROUP BY {entity}\n"
+            f"      ORDER BY value DESC LIMIT ?"
+        )
+    else:
+        groupby_rule = (
+            "10. GROUPING: aggregate query — no GROUP BY, return single scalar AS value."
+        )
+
+    # ── Build ranking instruction ─────────────────────────────────────────────
     if qt in ("top_n",):
         rank_instr = f"ORDER BY value DESC\nLIMIT {top_n}"
     elif qt == "bottom_n":
@@ -195,14 +261,14 @@ User question: "{user_query}"
 
 Parsed intent:
   query_type : {qt}
-  entity     : {entity}  ← this is the column to GROUP BY
+  entity     : {entity}  ← this is the DISPLAY name column to show in results
   metric     : {metric}  ← this is the column to aggregate (or COUNT(*) if "count")
   top_n      : {top_n}
   filters    : {filter_desc}{date_hints}
 
 STRICT RULES:
 1. Use the EXACT column names from the schema above. Do not invent column names.
-2. Alias the GROUP BY column as "name".
+2. Alias the display column as "name" in SELECT.
 3. Alias the aggregation as "value".
 4. Filter dates using:  date_column BETWEEN ? AND ?
    NEVER use EXTRACT(YEAR ...) = ? or EXTRACT(MONTH ...) = ?
@@ -211,16 +277,7 @@ STRICT RULES:
 7. For "count" metric: use COUNT(*) AS value
 8. For numeric metric columns: use SUM(column_name) AS value
 9. Ranking: {rank_instr}
-10. CRITICAL — unique ID vs display name:
-    If the schema has BOTH an ID column AND a name/label column for the same entity
-    (e.g., customer_id and customer_name, product_id and product_name),
-    you MUST GROUP BY the unique ID column to ensure accuracy. 
-    Then SELECT the corresponding name column AS "name".
-    Example:
-      SELECT customer_name AS name, COUNT(*) AS value
-      FROM table WHERE ...
-      GROUP BY customer_id, customer_name
-      ORDER BY value DESC LIMIT ?
+{groupby_rule}
 
 SQL:"""
 
