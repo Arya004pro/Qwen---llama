@@ -1,8 +1,9 @@
-"""Step 3: Ambiguity Check — reads is_complete from Qwen's parsed intent.
+"""Step 3: Ambiguity Check
 
-Qwen already determined if the query is complete and what to ask.
-This step either routes to SQL generation or saves the clarification question.
-No second LLM call needed unless Qwen failed to parse.
+Fix applied (Bug 3 safety net):
+  If query_type=aggregate AND metric AND time_ranges are present,
+  force is_complete=True regardless of what Qwen returned.
+  This prevents unnecessary clarification questions for scalar total queries.
 """
 
 import os, sys
@@ -19,11 +20,53 @@ from motia import FlowContext, queue
 
 config = {
     "name": "AmbiguityCheck",
-    "description": "Routes to SQL generation or saves clarification question from Qwen intent.",
+    "description": "Routes to SQL generation or saves clarification. Aggregate queries never ask for entity.",
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::ambiguity.check")],
     "enqueues": ["query::text.to.sql"],
 }
+
+
+def _is_actually_complete(parsed: dict) -> tuple[bool, str | None]:
+    """
+    Determine true completeness. Overrides Qwen's is_complete for edge cases.
+
+    Returns (complete, clarification_question_or_None)
+    """
+    qt  = parsed.get("query_type", "top_n")
+    tr  = parsed.get("time_ranges", [])
+    m   = parsed.get("metric")
+    ent = parsed.get("entity")
+    cq  = parsed.get("clarification_question")
+
+    # Bug 3 fix: aggregate queries NEVER need entity
+    if qt == "aggregate":
+        if m and tr:
+            return True, None
+        if not tr:
+            return False, "What time period should I use? (e.g. 2024, Q1 2024, March 2024)"
+        if not m:
+            return False, "What metric should I use? (e.g. revenue, total fare, rides, or driver earnings)"
+        return True, None
+
+    # For ranked queries, entity IS required
+    if qt in ("top_n", "bottom_n", "threshold", "growth_ranking", "zero_filter"):
+        if not ent:
+            return False, (cq or "Which group should I analyze? (e.g. driver, customer, city, state, vehicle type)")
+        if not tr:
+            return False, "What time period should I use? (e.g. 2024, Q1 2024, March 2024)"
+        return True, None
+
+    # comparison / intersection need 2 time ranges
+    if qt in ("comparison", "intersection"):
+        if not tr or len(tr) < 2:
+            return False, (cq or "Please specify two time periods to compare (e.g. Q1 2024 vs Q2 2024)")
+        return True, None
+
+    # Default: trust Qwen
+    is_complete   = parsed.get("is_complete", True)
+    clarification = parsed.get("clarification_question") if not is_complete else None
+    return is_complete, clarification
 
 
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
@@ -31,13 +74,13 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     user_query = input_data.get("query", "")
     parsed     = input_data.get("parsed", {})
 
-    is_complete = parsed.get("is_complete", True)
-    clarification = parsed.get("clarification_question")
+    is_complete, clarification = _is_actually_complete(parsed)
 
     ctx.logger.info("🔎 Ambiguity check", {
         "queryId": query_id,
         "is_complete": is_complete,
         "clarification": clarification,
+        "query_type": parsed.get("query_type"),
     })
 
     qs = await ctx.state.get("queries", query_id)

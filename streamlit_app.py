@@ -12,6 +12,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+def fetch_schema():
+        try:
+            r = requests.get(f"{API}/schema", timeout=5)
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            return None
+
 API           = "http://127.0.0.1:3121"
 POLL_INTERVAL = 0.7
 SHARED_UPLOAD_DIR = Path("Qwen_llama/motia/data/uploads")
@@ -61,6 +69,24 @@ for key, default in {
     if key not in st.session_state:
         st.session_state[key] = default
 
+def _on_enter():
+        val = st.session_state.get("query_input_field", "").strip()
+        if not val or st.session_state.polling:
+            return
+        st.session_state.polling        = True
+        st.session_state.final_state    = None
+        st.session_state.current_status = ""
+        st.session_state.step_times     = {}
+        st.session_state.last_completed = -1
+        st.session_state.poll_start     = time.time()
+        try:
+            resp = submit_query(val, session_id=st.session_state.pending_session)
+            st.session_state.query_id        = resp["queryId"]
+            st.session_state.pending_session = None
+        except Exception as e:
+            st.session_state.polling = False
+            st.error(f"Failed to submit: {e}")
+            
 st.set_page_config(
     page_title="Sales Analytics Pipeline",
     page_icon="📊",
@@ -609,18 +635,71 @@ with left:
                     st.success(f"Ingested tables: {tnames}" if tnames else "Ingestion completed.")
             except Exception as e:
                 st.error(f"Ingestion failed: {e}")
+                
+    # ── Schema viewer ─────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown('<div class="section-lbl">Loaded dataset schema</div>',
+                unsafe_allow_html=True)
+    schema_data = fetch_schema()
+ 
+    if not schema_data or not schema_data.get("tables"):
+        st.caption("No data loaded yet — upload a file above.")
+    else:
+        tables = schema_data.get("tables", [])
+        rels   = schema_data.get("relationships", [])
+ 
+        # Summary line
+        total_tables = len(tables)
+        st.caption(f"{total_tables} table{'s' if total_tables != 1 else ''} loaded")
+ 
+        # One expander per table
+        for tbl in tables:
+            tname = tbl.get("table", "unknown")
+            cols  = tbl.get("columns", [])
+            with st.expander(f"📋 {tname}  ({len(cols)} columns)", expanded=False):
+                if cols:
+                    col_data = [
+                        {"Column": c["name"], "Type": c["type"]}
+                        for c in cols
+                    ]
+                    st.dataframe(col_data, hide_index=True, use_container_width=True)
+                else:
+                    st.caption("No column info available.")
+ 
+        # Relationships
+        if rels:
+            with st.expander(f"🔗 Relationships detected ({len(rels)})", expanded=False):
+                for r in rels:
+                    confidence = r.get("confidence", "")
+                    badge = "🟢" if confidence == "HIGH" else "🟡"
+                    st.markdown(
+                        f"{badge} `{r.get('from_table')}.{r.get('from_column')}` "
+                        f"→ `{r.get('to_table')}.{r.get('to_column')}`  "
+                        f"*({r.get('type', 'FK')})*"
+                    )
+ 
+        # Refresh button
+        if st.button("↻ Refresh schema", key="refresh_schema", type="secondary"):
+            st.rerun()
 
     st.divider()
     st.markdown('<div class="section-lbl">Ask a question</div>', unsafe_allow_html=True)
 
     query_input = st.text_input(
         "query", label_visibility="collapsed",
-        placeholder="e.g. Top 5 products by revenue in March 2024",
+        placeholder="e.g. Top 5 drivers by earnings in 2024",
         disabled=st.session_state.polling,
+        on_change=_on_enter,          # ← fires when user presses Enter
+        key="query_input_field",
     )
     send_col, status_col = st.columns([1, 3])
-    send_btn             = send_col.button("Send", disabled=st.session_state.polling,
-                                           width="stretch", type="primary")
+    send_btn = send_col.button(
+        "Send",
+        disabled=st.session_state.polling,
+        width="stretch",
+        type="primary",
+        on_click=_on_enter,           # ← same handler for button click
+    )
     status_placeholder   = status_col.empty()
     clarify_placeholder  = st.empty()
     result_placeholder   = st.empty()
@@ -648,23 +727,6 @@ if st.session_state.history:
             </div>""", unsafe_allow_html=True)
 
 
-# ── Send handler ──────────────────────────────────────────────────────────────
-if send_btn and query_input.strip():
-    st.session_state.polling        = True
-    st.session_state.final_state    = None
-    st.session_state.current_status = ""
-    st.session_state.step_times     = {}
-    st.session_state.last_completed = -1
-    st.session_state.poll_start     = time.time()
-    try:
-        resp = submit_query(query_input.strip(),
-                            session_id=st.session_state.pending_session)
-        st.session_state.query_id        = resp["queryId"]
-        st.session_state.pending_session = None
-        st.rerun()
-    except Exception as e:
-        st.session_state.polling = False
-        st.error(f"Failed to submit: {e}")
 
 
 # ── Polling OR Final State ────────────────────────────────────────────────────
