@@ -67,13 +67,14 @@ JSON schema (all fields required):
 }}
 
 ENTITY RULES:
-- entity = the column to GROUP BY (e.g. driver_name, vehicle_type, pickup_city, state,
-  product_name, category, customer_name — pick from the schema above).
+- entity = the column to GROUP BY (e.g. driver_id, customer_id, product_id, sku,
+  pickup_city, category — pick the most specific ID or name from the schema).
+- CRITICAL: If the schema has BOTH an ID column and a name column for the same entity
+  (e.g. customer_id and customer_name), use the ID column as entity to ensure 
+  distinct items are not merged.
 - For query_type=aggregate (scalar total/average/count): entity MUST be null.
-- If the user names a specific filter value inline (e.g. "in Mumbai", "for Gujarat",
-  "SUV rides"), put it in filters:{{column_name: value}} — do NOT use it as entity.
-- Only set is_complete=false when the grouping dimension for a ranked query is unknown,
-  OR when the time period is genuinely missing.
+- If the user names a specific filter value inline (e.g. "in Mumbai"), 
+  put it in filters:{{column_name: value}} — do NOT use it as entity.
 
 METRIC RULES:
 - metric MUST be an exact column name from the schema, OR "count" for ride/order counts.
@@ -160,17 +161,20 @@ def _fallback_parse(user_query: str) -> dict:
 
     # Generic entity detection — catches many dataset types
     for kw, ent in [
-        ("driver",       "driver_name"),
-        ("customer",     "customer_name"),
+        ("driver",       "driver_id"),
+        ("customer",     "customer_id"),
+        ("user",         "user_id"),
+        ("client",       "client_id"),
         ("city",         "pickup_city"),
         ("pickup city",  "pickup_city"),
         ("drop city",    "drop_city"),
         ("state",        "state"),
         ("vehicle type", "vehicle_type"),
         ("vehicle",      "vehicle_type"),
-        ("product",      "product_name"),
+        ("product",      "product_id"),
+        ("item",         "item_id"),
         ("category",     "category"),
-        ("store",        "store_name"),
+        ("store",        "store_id"),
         ("region",       "region"),
     ]:
         if kw in q:

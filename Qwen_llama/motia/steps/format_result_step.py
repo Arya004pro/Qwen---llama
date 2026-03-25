@@ -315,6 +315,16 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     currency = _infer_currency(metric)
     p        = currency
     elabel   = _entity_label(entity) or entity or "items"
+    mlabel   = _metric_label(metric, "")
+
+    # Build a human-readable time period phrase from parsed time_ranges
+    _trs = parsed.get("time_ranges", [])
+    if _trs and _trs[0].get("label"):
+        _period_phrase = f"in {_trs[0]['label']}"
+    elif start_date and end_date:
+        _period_phrase = f"between {start_date} and {end_date}"
+    else:
+        _period_phrase = ""
 
     qs           = await ctx.state.get("queries", query_id)
     if not user_query and qs:
@@ -353,9 +363,9 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     # ── AGGREGATE scalar ────────────────────────────────────────────────────────
     elif is_scalar:
         v = results[0]["value"]
-        text = f"Total {metric} between {start_date} and {end_date} is {p}{v:,.2f}"
-        formatted_text = text + _token_summary(token_usage, token_totals)
-        items = [{"label": f"Total {metric}", "value": f"{p}{v:,.2f}"}]
+        period_str = _period_phrase if _period_phrase else f"between {start_date} and {end_date}"
+        formatted_text = f"Total {mlabel} {period_str} is {p}{v:,.2f}"
+        items = [{"label": f"Total {mlabel}", "value": f"{p}{v:,.2f}"}]
 
     # ── GROWTH RANKING ──────────────────────────────────────────────────────────
     elif has_delta:
@@ -461,9 +471,10 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 header = f"🔀 {elabel.title()} present in BOTH {p1} AND {p2} (combined {metric}):"
             else:
                 rl = "Top" if qt == "top_n" else "Bottom"
+                period_str = _period_phrase if _period_phrase else f"between {start_date} and {end_date}"
                 header = (
-                    f"{rl} {top_n} {elabel} by {_metric_label(metric, '')} "
-                    f"between {start_date} and {end_date}:"
+                    f"{rl} {top_n} {elabel} by {mlabel} "
+                    f"{period_str}:"
                 )
             items = []
             for i, row in enumerate(results, 1):

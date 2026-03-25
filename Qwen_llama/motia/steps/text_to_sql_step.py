@@ -211,6 +211,16 @@ STRICT RULES:
 7. For "count" metric: use COUNT(*) AS value
 8. For numeric metric columns: use SUM(column_name) AS value
 9. Ranking: {rank_instr}
+10. CRITICAL — unique ID vs display name:
+    If the schema has BOTH an ID column AND a name/label column for the same entity
+    (e.g., customer_id and customer_name, product_id and product_name),
+    you MUST GROUP BY the unique ID column to ensure accuracy. 
+    Then SELECT the corresponding name column AS "name".
+    Example:
+      SELECT customer_name AS name, COUNT(*) AS value
+      FROM table WHERE ...
+      GROUP BY customer_id, customer_name
+      ORDER BY value DESC LIMIT ?
 
 SQL:"""
 
