@@ -1,10 +1,10 @@
 """Step 3: Ambiguity Check — generalised for any dataset.
 
 Changes vs original:
-  - Clarification questions use generic language (dimension, metric)
-    rather than hard-coding entity types or metric names.
-  - aggregate + metric + time = always complete (Bug 3 guard preserved).
-  - All query type routing logic unchanged.
+  - time_series query type is handled: only metric + time_ranges needed.
+    Entity is NEVER required for time_series — asking for a dimension like
+    "driver/city" would be wrong for a trend query.
+  - All other routing logic unchanged.
 """
 
 import os
@@ -23,7 +23,11 @@ from motia import FlowContext, queue
 
 config = {
     "name": "AmbiguityCheck",
-    "description": "Routes to SQL generation or saves clarification. Generalised for any dataset.",
+    "description": (
+        "Routes to SQL generation or saves clarification. "
+        "Handles time_series (trend) queries — never asks for a business dimension "
+        "when the user wants a month/week/quarter breakdown."
+    ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::ambiguity.check")],
     "enqueues": ["query::text.to.sql"],
@@ -32,8 +36,7 @@ config = {
 
 def _is_actually_complete(parsed: dict) -> tuple[bool, str | None]:
     """
-    Determine true completeness. Overrides Qwen's is_complete for edge cases.
-    Returns (complete, clarification_question_or_None).
+    Determine true completeness. Returns (complete, clarification_question_or_None).
     """
     qt  = parsed.get("query_type", "top_n")
     tr  = parsed.get("time_ranges", [])
@@ -41,7 +44,25 @@ def _is_actually_complete(parsed: dict) -> tuple[bool, str | None]:
     ent = parsed.get("entity")
     cq  = parsed.get("clarification_question")
 
-    # Bug 3 fix: aggregate queries NEVER need entity
+    # ── time_series (trend) ────────────────────────────────────────────────────
+    # Month-wise / weekly / quarterly trend — entity is a time bucket, not a
+    # business dimension.  Only metric + time_ranges are required.
+    if qt == "time_series":
+        if m and tr:
+            return True, None
+        if not tr:
+            return False, (
+                "What time period should I use? "
+                "(e.g. all of 2024, Q1 2025, January to June 2025)"
+            )
+        if not m:
+            return False, (
+                "What metric should I measure? "
+                "(e.g. total fare, driver earnings, number of rides, revenue)"
+            )
+        return True, None
+
+    # ── aggregate ─────────────────────────────────────────────────────────────
     if qt == "aggregate":
         if m and tr:
             return True, None
@@ -51,7 +72,7 @@ def _is_actually_complete(parsed: dict) -> tuple[bool, str | None]:
             return False, "What metric should I measure? (e.g. total fare, driver earnings, revenue, number of rides)"
         return True, None
 
-    # Ranked queries need an entity/dimension
+    # ── ranked queries ────────────────────────────────────────────────────────
     if qt in ("top_n", "bottom_n", "threshold", "growth_ranking", "zero_filter"):
         if not ent:
             return False, (
@@ -63,7 +84,7 @@ def _is_actually_complete(parsed: dict) -> tuple[bool, str | None]:
             return False, "What time period should I use? (e.g. 2024, Q1 2024, March 2024)"
         return True, None
 
-    # Comparison / intersection need 2 time ranges
+    # ── comparison / intersection ─────────────────────────────────────────────
     if qt in ("comparison", "intersection"):
         if not tr or len(tr) < 2:
             return False, (
@@ -73,7 +94,7 @@ def _is_actually_complete(parsed: dict) -> tuple[bool, str | None]:
             )
         return True, None
 
-    # Default: trust Qwen's is_complete flag
+    # Default — trust Qwen's is_complete flag
     is_complete   = parsed.get("is_complete", True)
     clarification = parsed.get("clarification_question") if not is_complete else None
     return is_complete, clarification
@@ -91,6 +112,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         "is_complete":    is_complete,
         "clarification":  clarification,
         "query_type":     parsed.get("query_type"),
+        "time_bucket":    parsed.get("time_bucket"),
     })
 
     qs = await ctx.state.get("queries", query_id)

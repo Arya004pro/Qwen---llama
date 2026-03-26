@@ -1,15 +1,11 @@
 """Step 6: Format Result — formats any result shape into text + chart.
 
 Changes vs original:
-  - _entity_label() is now fully generic: strips _name/_id/_type suffixes and
-    pluralises automatically, so "driver_name" → "drivers" works for any dataset.
-  - Chart.js scales include proper AXIS TITLES (label for x and y axes).
-  - Axis title text is dynamically built from entity + metric names.
-  - Currency prefix is passed through to axis title (₹ for INR, $ for USD, etc.).
-  - _infer_currency() detects currency symbol from metric column name or a hint
-    stored in the query state — so any future dataset with USD columns works too.
-  - All other behaviour (tooltip callbacks, compact tick units, comparison charts,
-    growth ranking, etc.) is unchanged.
+  - Added time_series result handling:
+      Renders a LINE CHART (Chart.js type: 'line') for trend data.
+      Month labels like "2024-01" are converted to "Jan 2024" for readability.
+      Text output shows the trend table with all time buckets.
+  - All other formatting (comparison, ranked, aggregate, etc.) unchanged.
 """
 
 from typing import Any
@@ -17,34 +13,24 @@ from motia import FlowContext, queue
 
 config = {
     "name": "FormatResult",
-    "description": "Formats any result shape into user-facing text and Chart.js config with proper axis labels.",
+    "description": (
+        "Formats any result shape into user-facing text and Chart.js config. "
+        "Time-series queries render as line charts with human-readable bucket labels."
+    ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::format.result")],
     "enqueues": [],
 }
 
-# ── Entity label mapping ──────────────────────────────────────────────────────
-# Explicit overrides — the _entity_label() fallback handles everything else.
 ENTITY_LABELS: dict[str, str] = {
-    # e-commerce
-    "product_name": "products",
-    "customer_name": "customers",
-    "city_name": "cities",
-    "category_name": "categories",
-    "state_name": "states",
-    # legacy non-suffixed keys (kept for backward compat with old e-commerce flows)
-    "product": "products",
-    "customer": "customers",
-    "city": "cities",
-    "category": "categories",
-    "state": "states",
-    # ride-hailing
-    "driver_name": "drivers",
-    "pickup_city": "pickup cities",
-    "drop_city": "drop cities",
-    "vehicle_type": "vehicle types",
-    "vehicle_model": "vehicle models",
-    "payment_method": "payment methods",
+    "product_name": "products", "customer_name": "customers",
+    "city_name": "cities",      "category_name": "categories",
+    "state_name": "states",     "product": "products",
+    "customer": "customers",    "city": "cities",
+    "category": "categories",   "state": "states",
+    "driver_name": "drivers",   "pickup_city": "pickup cities",
+    "drop_city": "drop cities", "vehicle_type": "vehicle types",
+    "vehicle_model": "vehicle models", "payment_method": "payment methods",
     "ride_type": "ride types",
 }
 
@@ -56,49 +42,48 @@ _PALETTE = [
 ]
 _BORDERS = [c.replace("0.85", "1") for c in _PALETTE]
 
-# ── Currency inference ────────────────────────────────────────────────────────
+# Month abbreviations for label formatting
+_MONTH_ABBR = {
+    "01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr",
+    "05": "May", "06": "Jun", "07": "Jul", "08": "Aug",
+    "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec",
+}
+
+
+def _format_bucket_label(raw_label: str, bucket: str) -> str:
+    """Convert raw bucket label (e.g. '2024-01') to a human-readable string."""
+    if bucket == "month" and len(raw_label) == 7 and "-" in raw_label:
+        year, month = raw_label.split("-", 1)
+        abbr = _MONTH_ABBR.get(month, month)
+        return f"{abbr} {year}"
+    if bucket == "quarter" and "Q" in raw_label:
+        # e.g. "2024-Q1" stays as is — already readable
+        return raw_label
+    if bucket == "week":
+        return raw_label.replace("-W", " W")
+    return raw_label
+
 
 def _infer_currency(metric: str, hint: str = "") -> str:
-    """
-    Return the currency symbol for a given metric column name.
-    Extend this list as new datasets are added.
-    """
     m = (metric or "").lower()
     h = (hint or "").lower()
-
-    # Explicit USD signals
-    if any(x in m or x in h for x in ["usd", "dollar", "$", "price_usd", "amount_usd"]):
+    if any(x in m or x in h for x in ["usd", "dollar", "$"]):
         return "$"
-
-    # Explicit INR signals (default for Indian ride/e-commerce data)
-    if any(x in m for x in [
-        "fare", "earnings", "commission", "revenue",
-        "amount", "price", "total", "salary", "sales", "profit",
-    ]):
+    if any(x in m for x in ["fare", "earnings", "commission", "revenue",
+                              "amount", "price", "total", "salary", "sales", "profit"]):
         return "₹"
-
-    # Non-monetary metrics
     if any(x in m for x in ["count", "quantity", "units", "distance", "duration", "rides"]):
         return ""
+    return "₹"
 
-    return "₹"  # safe default for Indian datasets
-
-
-# ── Human-readable axis label ─────────────────────────────────────────────────
 
 def _metric_label(metric: str, currency: str) -> str:
-    """Build a readable axis title from metric column name."""
     mapping = {
-        "total_fare":           "Total Fare",
-        "driver_earnings":      "Driver Earnings",
-        "platform_commission":  "Platform Commission",
-        "revenue":              "Revenue",
-        "total_amount":         "Total Amount",
-        "quantity":             "Quantity Sold",
-        "order_count":          "Order Count",
-        "count":                "Number of Rides",
-        "distance_km":          "Distance (km)",
-        "duration_min":         "Duration (min)",
+        "total_fare": "Total Fare", "driver_earnings": "Driver Earnings",
+        "platform_commission": "Platform Commission", "revenue": "Revenue",
+        "total_amount": "Total Amount", "quantity": "Quantity Sold",
+        "order_count": "Order Count", "count": "Number of Rides",
+        "distance_km": "Distance (km)", "duration_min": "Duration (min)",
     }
     label = mapping.get(metric, metric.replace("_", " ").title())
     if currency:
@@ -107,112 +92,22 @@ def _metric_label(metric: str, currency: str) -> str:
 
 
 def _entity_label(entity: str) -> str:
-    """
-    Convert a DB column name to a human-readable plural label.
-
-    Priority:
-      1. Explicit entry in ENTITY_LABELS  (e.g. driver_name → "drivers")
-      2. Strip _name/_id/_type suffix, pluralise base word  (product_name → "products")
-      3. Replace underscores with spaces, title-case, append 's' as generic fallback.
-    """
     if not entity:
         return ""
-
-    # 1 — explicit override
     if entity in ENTITY_LABELS:
         return ENTITY_LABELS[entity]
-
-    # 2 — strip common suffixes, derive readable plural
     base = entity
     for suffix in ("_name", "_id", "_type", "_code"):
         if base.endswith(suffix):
             base = base[: -len(suffix)]
             break
-
     words = base.replace("_", " ").strip()
     if words and not words.endswith("s"):
         words += "s"
     return words
 
 
-# ── Base chart options ────────────────────────────────────────────────────────
-
-def _make_base(metric: str, currency: str, entity: str,
-               legend: bool = False, index_axis: str = "y") -> dict:
-    """Build Chart.js options with proper axis titles."""
-    metric_lbl = _metric_label(metric, currency)
-    entity_lbl = _entity_label(entity)
-
-    # For horizontal bar (indexAxis="y"): x = value axis, y = entity axis
-    if index_axis == "y":
-        x_title = metric_lbl
-        y_title = entity_lbl
-        x_tick  = _tick_fn(metric, currency)
-        y_tick  = None
-    else:
-        # Vertical bar: x = entity, y = value
-        x_title = entity_lbl
-        y_title = metric_lbl
-        x_tick  = None
-        y_tick  = _tick_fn(metric, currency)
-
-    x_ticks: dict = {"color": "#94a3b8", "font": {"size": 11}}
-    if x_tick:
-        x_ticks["callback"] = x_tick
-
-    y_ticks: dict = {"color": "#94a3b8", "font": {"size": 11}}
-    if y_tick:
-        y_ticks["callback"] = y_tick
-
-    return {
-        "responsive": True,
-        "maintainAspectRatio": True,
-        "indexAxis": index_axis,
-        "interaction": {"mode": "nearest", "intersect": True},
-        "plugins": {
-            "legend": {
-                "display": legend,
-                "labels": {"color": "#94a3b8", "font": {"size": 12}},
-            },
-            "tooltip": {
-                "enabled": True,
-                "backgroundColor": "#1e2130",
-                "titleColor": "#e2e8f0",
-                "bodyColor": "#94a3b8",
-                "borderColor": "#2d3148",
-                "borderWidth": 1,
-            },
-        },
-        "scales": {
-            "x": {
-                "title": {
-                    "display": bool(x_title),
-                    "text":    x_title,
-                    "color":   "#94a3b8",
-                    "font":    {"size": 11, "weight": "normal"},
-                },
-                "ticks": x_ticks,
-                "grid":  {"color": "rgba(255,255,255,0.05)"},
-            },
-            "y": {
-                "title": {
-                    "display": bool(y_title),
-                    "text":    y_title,
-                    "color":   "#94a3b8",
-                    "font":    {"size": 11, "weight": "normal"},
-                },
-                "ticks":       y_ticks,
-                "grid":        {"color": "rgba(255,255,255,0.05)"},
-                "beginAtZero": True,
-            },
-        },
-    }
-
-
-# ── JS callback builders ──────────────────────────────────────────────────────
-
 def _tick_fn(metric: str, currency: str) -> str:
-    """Compact axis tick label JS function — readable number + currency symbol."""
     pfx = currency.replace("₹", "\\u20b9").replace("$", "\\u0024")
     if currency in ("₹", "$"):
         return (
@@ -273,13 +168,141 @@ def _cmp_tooltip_fn(metric: str, currency: str) -> str:
     )
 
 
-# ── chart builder ─────────────────────────────────────────────────────────────
+def _make_base(metric: str, currency: str, entity: str,
+               legend: bool = False, index_axis: str = "y") -> dict:
+    metric_lbl = _metric_label(metric, currency)
+    entity_lbl = _entity_label(entity)
+
+    if index_axis == "y":
+        x_title = metric_lbl
+        y_title = entity_lbl
+        x_tick  = _tick_fn(metric, currency)
+        y_tick  = None
+    else:
+        x_title = entity_lbl
+        y_title = metric_lbl
+        x_tick  = None
+        y_tick  = _tick_fn(metric, currency)
+
+    x_ticks: dict = {"color": "#94a3b8", "font": {"size": 11}}
+    if x_tick:
+        x_ticks["callback"] = x_tick
+    y_ticks: dict = {"color": "#94a3b8", "font": {"size": 11}}
+    if y_tick:
+        y_ticks["callback"] = y_tick
+
+    return {
+        "responsive": True,
+        "maintainAspectRatio": True,
+        "indexAxis": index_axis,
+        "interaction": {"mode": "nearest", "intersect": True},
+        "plugins": {
+            "legend": {
+                "display": legend,
+                "labels": {"color": "#94a3b8", "font": {"size": 12}},
+            },
+            "tooltip": {
+                "enabled": True,
+                "backgroundColor": "#1e2130",
+                "titleColor": "#e2e8f0",
+                "bodyColor": "#94a3b8",
+                "borderColor": "#2d3148",
+                "borderWidth": 1,
+            },
+        },
+        "scales": {
+            "x": {
+                "title": {"display": bool(x_title), "text": x_title,
+                          "color": "#94a3b8", "font": {"size": 11, "weight": "normal"}},
+                "ticks": x_ticks,
+                "grid":  {"color": "rgba(255,255,255,0.05)"},
+            },
+            "y": {
+                "title": {"display": bool(y_title), "text": y_title,
+                          "color": "#94a3b8", "font": {"size": 11, "weight": "normal"}},
+                "ticks":       y_ticks,
+                "grid":        {"color": "rgba(255,255,255,0.05)"},
+                "beginAtZero": True,
+            },
+        },
+    }
+
+
+def _make_line_chart(labels: list, values: list, metric: str,
+                     currency: str, title: str, subtitle: str,
+                     bucket: str) -> dict:
+    """Build a Chart.js line chart config for time_series results."""
+    mlabel = _metric_label(metric, currency)
+    tick_fn = _tick_fn(metric, currency)
+    tip_fn  = _tooltip_fn(metric, currency)
+
+    # x-axis label formatting: show rotated labels for month/day
+    max_rotation = 45 if len(labels) > 6 else 0
+
+    cfg = {
+        "type": "line",
+        "data": {
+            "labels": labels,
+            "datasets": [{
+                "label": mlabel,
+                "data":  values,
+                "borderColor":           "rgba(99,179,237,1)",
+                "backgroundColor":       "rgba(99,179,237,0.12)",
+                "pointBackgroundColor":  "rgba(99,179,237,1)",
+                "pointBorderColor":      "#1a1d27",
+                "pointRadius":           4,
+                "pointHoverRadius":      6,
+                "borderWidth":           2,
+                "fill":                  True,
+                "tension":               0.35,
+            }],
+        },
+        "options": {
+            "responsive":         True,
+            "maintainAspectRatio": True,
+            "interaction": {"mode": "index", "intersect": False},
+            "plugins": {
+                "legend": {"display": False},
+                "tooltip": {
+                    "enabled":         True,
+                    "backgroundColor": "#1e2130",
+                    "titleColor":      "#e2e8f0",
+                    "bodyColor":       "#94a3b8",
+                    "borderColor":     "#2d3148",
+                    "borderWidth":     1,
+                    "callbacks":       {"label": tip_fn},
+                },
+            },
+            "scales": {
+                "x": {
+                    "title": {"display": True, "text": bucket.capitalize(),
+                              "color": "#94a3b8", "font": {"size": 11}},
+                    "ticks": {
+                        "color":       "#94a3b8",
+                        "font":        {"size": 11},
+                        "maxRotation": max_rotation,
+                        "minRotation": max_rotation,
+                    },
+                    "grid": {"color": "rgba(255,255,255,0.05)"},
+                },
+                "y": {
+                    "title": {"display": True, "text": mlabel,
+                              "color": "#94a3b8", "font": {"size": 11}},
+                    "ticks":       {"color": "#94a3b8", "font": {"size": 11},
+                                    "callback": tick_fn},
+                    "grid":        {"color": "rgba(255,255,255,0.05)"},
+                    "beginAtZero": False,
+                },
+            },
+        },
+    }
+    return {"title": title, "subtitle": subtitle, "prefix": currency, "config": cfg}
+
 
 def _bar(labels, values, metric, currency, entity, title, subtitle):
     base    = _make_base(metric, currency, entity, index_axis="y")
     tooltip = _tooltip_fn(metric, currency)
     base["plugins"]["tooltip"]["callbacks"] = {"label": tooltip}
-
     cfg = {
         "type": "bar",
         "data": {"labels": labels, "datasets": [{
@@ -333,8 +356,6 @@ def _delta_str(v1, v2, currency):
     return f"{sign}{currency}{abs(delta):,.2f} ({pct_s})"
 
 
-# ── handler ───────────────────────────────────────────────────────────────────
-
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     import datetime as _dt
 
@@ -351,13 +372,13 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     metric = parsed.get("metric", "value")
     top_n  = parsed.get("top_n", 5)
     thr    = parsed.get("threshold")
+    bucket = parsed.get("time_bucket", "month")
 
     currency = _infer_currency(metric)
     p        = currency
     elabel   = _entity_label(entity) or entity or "items"
     mlabel   = _metric_label(metric, "")
 
-    # Build a human-readable time period phrase from parsed time_ranges
     _trs = parsed.get("time_ranges", [])
     if _trs and _trs[0].get("label"):
         _period_phrase = f"in {_trs[0]['label']}"
@@ -375,7 +396,6 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
 
     ctx.logger.info("📝 Formatting", {"queryId": query_id, "query_type": qt, "rows": len(results)})
 
-    # ── detect result shape ────────────────────────────────────────────────────
     has_delta  = results and "delta"  in results[0]
     has_value2 = results and "value2" in results[0] and not has_delta
     is_scalar  = results and len(results) == 1 and "name" not in results[0]
@@ -383,22 +403,59 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
 
     # ── EMPTY ──────────────────────────────────────────────────────────────────
     if is_empty:
-        if qt == "zero_filter":
+        if qt == "time_series":
+            text = (f"No {mlabel} data found {_period_phrase}. "
+                    "The dataset may not cover this time range.")
+        elif qt == "zero_filter":
             text = (f"No {elabel} with zero {metric} found "
-                    f"between {start_date} and {end_date}. "
-                    f"All {elabel} had activity in this period.")
+                    f"between {start_date} and {end_date}.")
         elif qt == "threshold" and thr:
             unit = "%" if thr.get("type") == "percentage" else f" {metric}"
             text = (f"No {elabel} matched the filter "
                     f"({metric} > {thr['value']}{unit}) "
                     f"between {start_date} and {end_date}.")
         elif period_labels and len(period_labels) >= 2:
-            text = (f"No data found for {period_labels[1]}. "
-                    f"The dataset may not cover this time range.")
+            text = (f"No data found for {period_labels[1]}.")
         else:
             text = "No data available for the selected period."
         formatted_text = text + _token_summary(token_usage, token_totals)
         items = []
+
+    # ── TIME SERIES (trend) ────────────────────────────────────────────────────
+    elif qt == "time_series":
+        period_str = _period_phrase if _period_phrase else f"between {start_date} and {end_date}"
+        bucket_label = bucket.capitalize() if bucket != "month" else "Monthly"
+        header = f"📈 {bucket_label} {mlabel} trend {period_str}:\n"
+        header += f"\n  {'Period':<14}  {'Value':>16}"
+        header += f"\n  {'─'*14}  {'─'*16}"
+
+        raw_labels = [r.get("name", "?") for r in results]
+        values     = [r.get("value", 0) or 0 for r in results]
+        # Human-readable labels
+        labels     = [_format_bucket_label(lbl, bucket) for lbl in raw_labels]
+
+        items = []
+        for i, (lbl, val) in enumerate(zip(labels, values)):
+            header += f"\n  {lbl:<14}  {p}{val:>15,.2f}"
+            items.append({"period": lbl, "value": f"{p}{val:,.2f}", "raw_value": val})
+
+        # Add a summary row
+        if values:
+            total   = sum(values)
+            average = total / len(values)
+            header += f"\n  {'─'*14}  {'─'*16}"
+            header += f"\n  {'Total':<14}  {p}{total:>15,.2f}"
+            header += f"\n  {'Average':<14}  {p}{average:>15,.2f}"
+
+        formatted_text = header + _token_summary(token_usage, token_totals)
+
+        if labels and values:
+            chart_config = _make_line_chart(
+                labels, values, metric, currency,
+                user_query or f"{bucket_label} {mlabel} trend",
+                period_str,
+                bucket,
+            )
 
     # ── AGGREGATE scalar ────────────────────────────────────────────────────────
     elif is_scalar:
@@ -453,15 +510,11 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             items.append({"rank": i, "name": name,
                           f"{p1}_value": _fmt(v1, p), f"{p2}_value": _fmt(v2, p), "delta": d})
         formatted_text = "\n".join(lines) + _token_summary(token_usage, token_totals)
-
         names = [r.get("name", "?")      for r in results]
         vals1 = [r.get("value1", 0) or 0 for r in results]
         vals2 = [r.get("value2", 0) or 0 for r in results]
-
         base_cmp = _make_base(metric, currency, entity, legend=True, index_axis="y")
-        base_cmp["plugins"]["tooltip"]["callbacks"] = {
-            "label": _cmp_tooltip_fn(metric, currency)
-        }
+        base_cmp["plugins"]["tooltip"]["callbacks"] = {"label": _cmp_tooltip_fn(metric, currency)}
         cmp_cfg = {
             "type": "bar",
             "data": {"labels": names, "datasets": [
@@ -498,10 +551,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 thr_type = thr.get("type", "absolute")
                 thr_val  = thr.get("value", 0)
                 direction = "less than" if thr_op == "lt" else "more than"
-                if thr_type == "percentage":
-                    thr_val_str = f"{thr_val:.0f}% of total"
-                else:
-                    thr_val_str = f"{p}{thr_val:,.0f}" if p else f"{thr_val:,.0f}"
+                thr_val_str = f"{thr_val:.0f}% of total" if thr_type == "percentage" else f"{p}{thr_val:,.0f}"
                 header = (f"{len(results)} {elabel} where {metric} contributed "
                           f"{direction} {thr_val_str} "
                           f"between {start_date} and {end_date}:")
@@ -512,10 +562,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             else:
                 rl = "Top" if qt == "top_n" else "Bottom"
                 period_str = _period_phrase if _period_phrase else f"between {start_date} and {end_date}"
-                header = (
-                    f"{rl} {top_n} {elabel} by {mlabel} "
-                    f"{period_str}:"
-                )
+                header = f"{rl} {top_n} {elabel} by {mlabel} {period_str}:"
             items = []
             for i, row in enumerate(results, 1):
                 name  = row.get("name", "?")

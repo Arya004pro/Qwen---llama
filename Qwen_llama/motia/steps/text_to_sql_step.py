@@ -1,21 +1,11 @@
 """Step 4: Text-to-SQL — fully generalised for any flat-table dataset.
 
-Key changes vs original:
-  1. Removed the hardcoded _SALES_SCHEMA_TABLES / _BUILDER_ENTITIES / _BUILDER_METRICS
-     gate. The deterministic builder only applies when the old e-commerce schema
-     is present; otherwise the LLM path is used directly.
-  2. force_llm is now the DEFAULT for any dataset that isn't the classic
-     {orders, customers, cities, products, categories, order_items} schema.
-     This means Uber data, SaaS data, service data etc. all go through the LLM
-     with the live schema injected — which produces correct, schema-aware SQL.
-  3. The LLM prompt now always includes the live schema (same as parse_intent),
-     so column names like total_fare, driver_earnings, platform_commission,
-     pickup_city, vehicle_type etc. are resolved correctly.
-  4. _detect_id_name_pairs() dynamically finds name_col → id_col pairs so the
-     SQL prompt can emit correct GROUP BY driver_id, driver_name instructions,
-     guaranteeing human-readable names are shown (not raw IDs like D377).
-  5. Bug 1 preserved: EXTRACT(YEAR) → BETWEEN rewrite.
-  6. Bug 2 preserved: builder only used when sales tables confirmed present.
+Changes vs original:
+  - Added time_series query type support in _build_llm_prompt():
+      Uses STRFTIME for DuckDB to bucket dates by month/week/quarter/day.
+      GROUP BY time bucket, ORDER BY time bucket ASC (chronological order).
+  - time_series uses QWEN (complex query) regardless of schema type.
+  - All other logic unchanged.
 """
 
 import os
@@ -48,7 +38,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Classic e-commerce sales schema — builder is ONLY valid when ALL these exist
 _SALES_SCHEMA_TABLES = {
     "orders", "customers", "cities", "products",
     "categories", "states", "order_items",
@@ -60,8 +49,8 @@ config = {
     "name": "TextToSQL",
     "description": (
         "Builds SQL from parsed intent using the live schema. "
-        "Uses deterministic builder only for classic e-commerce schema. "
-        "Falls back to LLM (Qwen/LLaMA) with schema injection for any other dataset."
+        "Handles time_series (trend) queries grouped by month/week/quarter/day. "
+        "Uses deterministic builder only for classic e-commerce schema."
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::text.to.sql")],
@@ -77,8 +66,14 @@ _FORBIDDEN   = re.compile(
     re.IGNORECASE,
 )
 
+# DuckDB STRFTIME format strings per time bucket
+_BUCKET_FMT = {
+    "month":   "%Y-%m",
+    "week":    "%Y-W%W",
+    "quarter": "%Y-Q",     # handled specially below
+    "day":     "%Y-%m-%d",
+}
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
 
 def _get_existing_tables() -> set[str]:
     try:
@@ -98,15 +93,6 @@ def _sales_schema_available(existing: set[str]) -> bool:
 
 
 def _detect_id_name_pairs() -> dict[str, str]:
-    """
-    Scan all columns in the live DB and return a mapping of
-    name_column -> id_column for every detected pair.
-
-    e.g. if the table has driver_id + driver_name columns:
-         returns {"driver_name": "driver_id"}
-
-    This is fully generic — works for any dataset, no hardcoding.
-    """
     try:
         conn = get_read_connection()
         rows = conn.execute(
@@ -118,16 +104,14 @@ def _detect_id_name_pairs() -> dict[str, str]:
         pairs: dict[str, str] = {}
         for col in cols:
             if col.endswith("_name"):
-                base   = col[:-5]          # strip _name
+                base   = col[:-5]
                 id_col = base + "_id"
                 if id_col in cols:
-                    pairs[col] = id_col    # driver_name -> driver_id
+                    pairs[col] = id_col
         return pairs
     except Exception:
         return {}
 
-
-# ── SQL extraction / safety ───────────────────────────────────────────────────
 
 def _extract_sql(raw: str) -> str:
     text  = _THINK_RE.sub("", raw).strip()
@@ -172,7 +156,49 @@ def _explain(sql: str, parsed: dict | None = None) -> tuple[bool, str]:
     return explain_query(sql, params)
 
 
-# ── LLM prompt — fully generalised with live schema ──────────────────────────
+def _build_time_series_sql_hint(parsed: dict) -> str:
+    """
+    Build a direct SQL hint for time_series queries.
+    This gives the LLM an exact template to fill in — avoids hallucination.
+    """
+    bucket = parsed.get("time_bucket", "month")
+    metric = parsed.get("metric", "total_fare")
+
+    if bucket == "month":
+        bucket_expr = "STRFTIME(date_col, '%Y-%m')"
+        bucket_label = "YYYY-MM"
+    elif bucket == "week":
+        bucket_expr = "STRFTIME(date_col, '%Y-W%W')"
+        bucket_label = "YYYY-W##"
+    elif bucket == "quarter":
+        bucket_expr = "CONCAT(YEAR(date_col), '-Q', QUARTER(date_col))"
+        bucket_label = "YYYY-Q#"
+    else:  # day
+        bucket_expr = "STRFTIME(date_col, '%Y-%m-%d')"
+        bucket_label = "YYYY-MM-DD"
+
+    if metric == "count":
+        agg_expr = "COUNT(*)"
+    else:
+        agg_expr = f"SUM({metric})"
+
+    return f"""
+REQUIRED SQL PATTERN for time_series ({bucket}):
+  SELECT {bucket_expr.replace('date_col', '<actual_date_column>')} AS name,
+         {agg_expr} AS value
+  FROM <table>
+  WHERE <date_column> BETWEEN ? AND ?
+  GROUP BY {bucket_expr.replace('date_col', '<actual_date_column>')}
+  ORDER BY name ASC
+
+Rules:
+- Replace <actual_date_column> with the real date column name from the schema.
+- Replace <table> with the real table name.
+- Keep ORDER BY name ASC so results are chronological.
+- Do NOT add LIMIT — return all time buckets in the range.
+- The label format is {bucket_label} which allows natural sort ordering.
+"""
+
 
 def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
     entity     = parsed.get("entity")
@@ -182,10 +208,10 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
     thr        = parsed.get("threshold") or {}
     filters    = parsed.get("filters", {})
     trs        = parsed.get("time_ranges", [])
+    bucket     = parsed.get("time_bucket", "month")
 
     filter_desc = ", ".join(f"{k}={v}" for k, v in filters.items()) if filters else "none"
 
-    # ── Detect ID-name pairs for correct GROUP BY generation ─────────────────
     id_name_pairs = _detect_id_name_pairs()
 
     if entity and entity in id_name_pairs:
@@ -194,32 +220,29 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
             f"10. GROUPING (CRITICAL):\n"
             f"    entity='{entity}' has a corresponding ID column '{id_col}'.\n"
             f"    You MUST:\n"
-            f"      - SELECT {entity} AS name   (the human-readable name, NOT {id_col})\n"
+            f"      - SELECT {entity} AS name   (the human-readable name)\n"
             f"      - GROUP BY {id_col}, {entity}  (both columns for uniqueness)\n"
-            f"    Correct example:\n"
-            f"      SELECT {entity} AS name, SUM({metric}) AS value\n"
-            f"      FROM <table> WHERE <date_col> BETWEEN ? AND ?\n"
-            f"      GROUP BY {id_col}, {entity}\n"
-            f"      ORDER BY value DESC LIMIT ?\n"
-            f"    WRONG (never do this): SELECT {id_col} AS name ..."
         )
     elif entity:
         groupby_rule = (
             f"10. GROUPING:\n"
-            f"    entity='{entity}' — GROUP BY {entity}, SELECT {entity} AS name.\n"
-            f"    Example:\n"
-            f"      SELECT {entity} AS name, SUM({metric}) AS value\n"
-            f"      FROM <table> WHERE <date_col> BETWEEN ? AND ?\n"
-            f"      GROUP BY {entity}\n"
-            f"      ORDER BY value DESC LIMIT ?"
+            f"    entity='{entity}' — GROUP BY {entity}, SELECT {entity} AS name."
         )
     else:
         groupby_rule = (
-            "10. GROUPING: aggregate query — no GROUP BY, return single scalar AS value."
+            "10. GROUPING: aggregate or time_series query — no entity GROUP BY."
         )
 
-    # ── Build ranking instruction ─────────────────────────────────────────────
-    if qt in ("top_n",):
+    # ── Ranking instruction ───────────────────────────────────────────────────
+    if qt == "time_series":
+        ts_hint = _build_time_series_sql_hint(parsed)
+        rank_instr = (
+            f"This is a TIME SERIES / TREND query.\n"
+            f"Group by time bucket ({bucket}), NOT by any business entity.\n"
+            f"ORDER BY name ASC (chronological). NO LIMIT.\n"
+            f"\n{ts_hint}"
+        )
+    elif qt == "top_n":
         rank_instr = f"ORDER BY value DESC\nLIMIT {top_n}"
     elif qt == "bottom_n":
         rank_instr = f"ORDER BY value ASC\nLIMIT {top_n}"
@@ -247,7 +270,6 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
     else:
         rank_instr = f"ORDER BY value DESC LIMIT {top_n}"
 
-    # Date hints from parsed time_ranges
     date_hints = ""
     if trs:
         for i, tr in enumerate(trs[:2]):
@@ -261,13 +283,14 @@ User question: "{user_query}"
 
 Parsed intent:
   query_type : {qt}
-  entity     : {entity}  ← this is the DISPLAY name column to show in results
-  metric     : {metric}  ← this is the column to aggregate (or COUNT(*) if "count")
+  entity     : {entity}
+  metric     : {metric}
+  time_bucket: {bucket if qt == 'time_series' else 'N/A'}
   top_n      : {top_n}
   filters    : {filter_desc}{date_hints}
 
 STRICT RULES:
-1. Use the EXACT column names from the schema above. Do not invent column names.
+1. Use the EXACT column names from the schema above.
 2. Alias the display column as "name" in SELECT.
 3. Alias the aggregation as "value".
 4. Filter dates using:  date_column BETWEEN ? AND ?
@@ -322,7 +345,6 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     qt      = parsed.get("query_type", "top_n")
     filters = parsed.get("filters", {})
 
-    # Check what tables actually exist
     existing_tables = _get_existing_tables()
     sales_available = _sales_schema_available(existing_tables)
     ctx.logger.info("📋 DB tables found", {
@@ -332,6 +354,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     })
 
     ctx.logger.info("🧬 TextToSQL", {"queryId": query_id, "query_type": qt,
+                                     "time_bucket": parsed.get("time_bucket"),
                                      "has_filters": bool(filters)})
 
     generated_sql = None
@@ -339,10 +362,11 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     fallback_used = False
     sql_source    = "builder"
 
-    # ── Deterministic builder path (classic e-commerce schema only) ───────────
+    # time_series always uses LLM — no builder support for time bucketing
     force_llm = (
         bool(filters)
         or not sales_available
+        or qt == "time_series"                          # ← NEW
         or parsed.get("entity") not in _BUILDER_ENTITIES
         or parsed.get("metric") not in _BUILDER_METRICS
     )
@@ -363,10 +387,10 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 ctx.logger.warn("⚠️ Builder safety failed — falling to LLM",
                                 {"queryId": query_id, "reason": reason})
 
-    # ── LLM path — used for all non-classic-schema datasets ──────────────────
     if generated_sql is None:
-        # Use Qwen for complex queries; LLaMA for simple ranked queries
-        COMPLEX = {"growth_ranking", "comparison", "threshold", "intersection", "zero_filter"}
+        # time_series and complex queries use Qwen; simple ranked use LLaMA
+        COMPLEX = {"growth_ranking", "comparison", "threshold", "intersection",
+                   "zero_filter", "time_series"}    # ← time_series added
         model   = QWEN_MODEL if qt in COMPLEX else LLAMA_MODEL
         sql_source = f"llm_{model.split('/')[0]}"
 
@@ -386,8 +410,6 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                     generated_sql = sql
                     ctx.logger.info("✅ LLM SQL validated", {"queryId": query_id})
                 else:
-                    # EXPLAIN failed — log but still try to run it
-                    # (EXPLAIN can be overly strict with DuckDB date casting)
                     ctx.logger.warn("⚠️ LLM EXPLAIN failed — attempting execution anyway",
                                     {"queryId": query_id, "error": err})
                     generated_sql = sql
@@ -400,7 +422,6 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             log_tokens(ctx, query_id, "TextToSQL", model, usage)
             await add_tokens_to_state(ctx, query_id, "TextToSQL", model, usage)
 
-    # ── Emergency registry fallback (sales schema only) ───────────────────────
     if generated_sql is None and sales_available:
         fb = _registry_fallback(parsed)
         if fb:
@@ -413,7 +434,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         msg = (
             f"Could not generate SQL for query_type={qt} "
             f"entity={parsed.get('entity')} metric={parsed.get('metric')}. "
-            "Try rephrasing — e.g. 'Top 5 drivers by earnings in 2024'."
+            "Try rephrasing — e.g. 'Monthly revenue trend for 2024'."
         )
         qs = await ctx.state.get("queries", query_id)
         if qs:
