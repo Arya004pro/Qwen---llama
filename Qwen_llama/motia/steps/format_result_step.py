@@ -82,7 +82,12 @@ def _metric_label(metric: str, currency: str) -> str:
         "total_fare": "Total Fare", "driver_earnings": "Driver Earnings",
         "platform_commission": "Platform Commission", "revenue": "Revenue",
         "total_amount": "Total Amount", "quantity": "Quantity Sold",
-        "order_count": "Order Count", "count": "Number of Rides",
+        "order_count": "Order Count", "count": "Count",
+        "avg_final_price": "Avg Order Value",
+        "avg_total_fare": "Avg Fare",
+        "avg_driver_earnings": "Avg Driver Earnings",
+        "avg_unit_price": "Avg Unit Price",
+        "final_price": "Revenue (Final Price)",
         "distance_km": "Distance (km)", "duration_min": "Duration (min)",
     }
     label = mapping.get(metric, metric.replace("_", " ").title())
@@ -458,7 +463,11 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     # ── TIME SERIES (trend) ────────────────────────────────────────────────────
     elif qt == "time_series":
         period_str = _period_phrase if _period_phrase else f"between {start_date} and {end_date}"
-        bucket_label = bucket.capitalize() if bucket != "month" else "Monthly"
+        _bucket_map = {
+            "year": "Yearly", "month": "Monthly", "quarter": "Quarterly",
+            "week": "Weekly", "day": "Daily",
+        }
+        bucket_label = _bucket_map.get(bucket, bucket.capitalize()) 
         header = f"📈 {bucket_label} {mlabel} trend {period_str}:\n"
         header += f"\n  {'Period':<14}  {'Value':>16}"
         header += f"\n  {'─'*14}  {'─'*16}"

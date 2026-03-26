@@ -619,7 +619,7 @@ def render_schema_section():
                 if cols:
                     st.dataframe(
                         [{"Column": c["name"], "Type": c["type"]} for c in cols],
-                        hide_index=True, use_container_width=True,
+                        hide_index=True, width='stretch',              
                     )
                 else:
                     st.caption("No column info available.")

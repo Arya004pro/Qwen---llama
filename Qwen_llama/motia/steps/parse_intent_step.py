@@ -93,13 +93,23 @@ METRIC RULES — map user language to EXACT column names from the schema above:
     → prefer final_price if it exists (post-discount actual revenue)
     → else total_fare, driver_earnings, total_amount, revenue — in that preference order
     → NEVER use unit_price alone (that's the pre-discount list price)
+- "average order value", "average fare", "average revenue", "avg order", "mean order"
+    → metric = "avg_final_price"  (use AVG(final_price) in SQL — NOT SUM)
+- "average fare", "avg fare", "mean fare"
+    → metric = "avg_total_fare"   (use AVG(total_fare) in SQL)
+- "average earnings", "avg earnings"
+    → metric = "avg_driver_earnings" (use AVG(driver_earnings) in SQL)
 - "driver earnings", "driver income"  → driver_earnings
 - "platform commission", "commission" → platform_commission
 - "fare", "trip cost", "ride cost"    → total_fare  (else final_price)
 - "discount"                          → discount
 - "rides", "trips", "bookings", "orders", "count of", "number of", "how many"
-    → metric = "count"  (use COUNT(*) in SQL)
-- "quantity", "units sold", "items"   → quantity
+    → metric = "count"
+    → IMPORTANT: use COUNT(DISTINCT <order_id_column>) NOT COUNT(*)
+      because each row may be an ORDER ITEM (one order has many rows).
+      Look for the primary order identifier column (e.g. order_id, ride_id)
+      and use COUNT(DISTINCT that_column) AS value
+- "quantity", "units sold", "items"   → quantity  (SUM(quantity))
 - "distance"                          → distance_km  (else the nearest distance column)
 - "duration", "time taken"            → duration_min  (else nearest duration column)
 - When in doubt for a food/delivery dataset: default metric = final_price
@@ -149,6 +159,8 @@ _TREND_KEYWORDS = {
     "by day", "per day", "by quarter", "per quarter", "over time", "trend",
     "time series", "breakdown by month", "breakdown by week",
     "revenue trend", "fare trend", "earnings trend", "how did", "how has",
+    "yearly", "year-wise", "per year", "annual", "annually", "by year",
+    "year over year", "yoy", "each year", "every year", "year-on-year",
 }
 
 # ── Auto-detect mandatory filters from live schema ────────────────────────────
@@ -220,11 +232,18 @@ def _default_clarification(parsed: dict) -> str:
 
 def _detect_time_bucket(query: str) -> str:
     q = query.lower()
-    if any(x in q for x in ["quarter", "q1", "q2", "q3", "q4", "quarterly"]):
+    # Year bucket — check FIRST before "per" could match "per month"
+    if any(x in q for x in ["per year", "by year", "each year", "yearly",
+                              "year-wise", "annual", "annually",
+                              "year over year", "yoy", "every year",
+                              "year-on-year", "per annum"]):
+        return "year"
+    if any(x in q for x in ["quarter", "q1", "q2", "q3", "q4", "quarterly",
+                              "per quarter", "quarter-wise"]):
         return "quarter"
-    if any(x in q for x in ["week", "weekly", "week-wise"]):
+    if any(x in q for x in ["week", "weekly", "week-wise", "per week"]):
         return "week"
-    if any(x in q for x in ["day", "daily", "day-wise"]):
+    if any(x in q for x in ["day", "daily", "day-wise", "per day"]):
         return "day"
     return "month"
 
@@ -240,6 +259,9 @@ def _fallback_parse(user_query: str) -> dict:
     if _is_trend_query(user_query):
         metric = "final_price"
         for kw, met in [
+            ("average order", "avg_final_price"), ("avg order", "avg_final_price"),
+            ("average fare", "avg_total_fare"), ("avg fare", "avg_total_fare"),
+            ("average earning", "avg_driver_earnings"),
             ("earning", "driver_earnings"), ("commission", "platform_commission"),
             ("final", "final_price"), ("fare", "total_fare"),
             ("revenue", "final_price"), ("ride", "count"),

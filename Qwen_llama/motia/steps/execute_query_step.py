@@ -8,6 +8,7 @@ Includes runtime repairs:
 1) EXTRACT(YEAR FROM date_col)=? -> col >= ? AND col < ?
 2) BETWEEN ? AND ?  -> >= ? AND < ?  (for datetime-hinted column names)
 3) GROUP BY mismatch repair
+4) [NEW] Missing GROUP BY entirely for EXTRACT/STRFTIME/YEAR() in SELECT
 """
 
 import os
@@ -32,7 +33,8 @@ config = {
     "description": (
         "Executes LLM-generated SQL against DuckDB. "
         "Uses exclusive end-date (>= start AND < end+1day) to avoid missing "
-        "the last day when filtering datetime columns."
+        "the last day when filtering datetime columns. "
+        "Auto-repairs missing GROUP BY for time-series EXTRACT/STRFTIME queries."
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::execute")],
@@ -54,12 +56,18 @@ _GROUP_BY_CLAUSE_RE = re.compile(
 _NAME_EXPR_RE = re.compile(r"(?is)\bSELECT\s+(?P<expr>.*?)\s+AS\s+name\b")
 _MISSING_GB_COL_RE = re.compile(
     r'column\s+"([^"]+)"\s+must appear in the GROUP BY', re.IGNORECASE)
+_HAS_GROUP_BY_RE = re.compile(r"\bGROUP\s+BY\b", re.IGNORECASE)
 
 # Column name substrings that hint at a datetime column
 _DATETIME_COL_HINTS = {
     "date", "time", "datetime", "timestamp", "created", "updated",
     "at", "on", "when", "order_date", "order_datetime", "ride_date",
 }
+
+# Patterns in SELECT that indicate a time-bucket expression (not a plain column)
+_TIME_BUCKET_EXPR_PATTERNS = [
+    "EXTRACT(", "STRFTIME(", "DATE_TRUNC(", "YEAR(", "MONTH(", "QUARTER(", "WEEK(",
+]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -107,6 +115,7 @@ def _has_extract(sql: str) -> bool:
 
 
 def _repair_group_by_missing_name(sql: str, error_text: str) -> str | None:
+    """Repair GROUP BY when the group-by clause exists but is missing the name expression."""
     err_m  = _MISSING_GB_COL_RE.search(error_text or "")
     gb_m   = _GROUP_BY_CLAUSE_RE.search(sql or "")
     name_m = _NAME_EXPR_RE.search(sql or "")
@@ -123,6 +132,53 @@ def _repair_group_by_missing_name(sql: str, error_text: str) -> str | None:
     fixed = f"{group_by_raw.strip()}, {name_expr}"
     s, e  = gb_m.span("group_by")
     return sql[:s] + " " + fixed + " " + sql[e:]
+
+
+def _repair_add_missing_group_by(sql: str, error_text: str) -> str | None:
+    """
+    [NEW] Repair the case where GROUP BY is ENTIRELY MISSING from a
+    time-series query that has EXTRACT/STRFTIME/YEAR() in SELECT AS name.
+
+    This handles the common LLM mistake:
+        SELECT EXTRACT(YEAR FROM col) AS name, SUM(x) AS value
+        FROM tbl WHERE ...
+        -- missing GROUP BY!
+
+    Repair injects:  GROUP BY <name_expr>  before ORDER BY or at end.
+    """
+    # Only trigger if there's actually no GROUP BY
+    if _HAS_GROUP_BY_RE.search(sql):
+        return None
+
+    name_m = _NAME_EXPR_RE.search(sql or "")
+    if not name_m:
+        return None
+
+    name_expr = name_m.group("expr").strip()
+
+    # Only repair if the name expression looks like a time-bucketing function
+    expr_upper = name_expr.upper()
+    is_time_bucket = any(kw in expr_upper for kw in [
+        "EXTRACT(", "STRFTIME(", "DATE_TRUNC(", "YEAR(", "MONTH(",
+        "QUARTER(", "WEEK(", "DAY(",
+    ])
+    if not is_time_bucket:
+        return None
+
+    # Find insertion point: before ORDER BY, before LIMIT, or at end
+    order_m = re.search(r"\bORDER\s+BY\b", sql, re.IGNORECASE)
+    limit_m = re.search(r"\bLIMIT\b", sql, re.IGNORECASE)
+
+    group_by_clause = f"\nGROUP BY {name_expr}"
+
+    if order_m:
+        pos = order_m.start()
+        return sql[:pos].rstrip() + group_by_clause + "\n" + sql[pos:]
+    elif limit_m:
+        pos = limit_m.start()
+        return sql[:pos].rstrip() + group_by_clause + "\n" + sql[pos:]
+    else:
+        return sql.rstrip() + group_by_clause
 
 
 def _run_sql(sql: str, params: tuple) -> list:
@@ -278,6 +334,14 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     if between_rewritten:
         ctx.logger.info("Rewrote BETWEEN->range for datetime col", {"queryId": query_id})
 
+    # ── Rewrite 3: [NEW] Add missing GROUP BY for time-bucket SELECT expressions
+    # This handles the common LLM mistake of forgetting GROUP BY in time_series queries
+    if qt == "time_series" and not _HAS_GROUP_BY_RE.search(generated_sql):
+        repaired = _repair_add_missing_group_by(generated_sql, "")
+        if repaired:
+            ctx.logger.info("Auto-added missing GROUP BY for time_series", {"queryId": query_id})
+            generated_sql = repaired
+
     ctx.logger.info("Executing SQL", {"queryId": query_id, "query_type": qt})
     ctx.logger.info("Final SQL + params", {
         "queryId": query_id,
@@ -291,7 +355,12 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         rows    = _run_sql(generated_sql, params)
         results = _rows_to_dicts(rows)
     except Exception as exc:
-        repaired_sql = _repair_group_by_missing_name(generated_sql, str(exc))
+        err_str = str(exc)
+        # Try repair 1: add missing GROUP BY (e.g. for EXTRACT in SELECT without GROUP BY)
+        repaired_sql = _repair_add_missing_group_by(generated_sql, err_str)
+        if not repaired_sql:
+            # Try repair 2: fix existing GROUP BY that is missing the name expression
+            repaired_sql = _repair_group_by_missing_name(generated_sql, err_str)
         if not repaired_sql:
             qs = await ctx.state.get("queries", query_id)
             await _error(ctx, qs, query_id, f"SQL execution failed: {exc}")
@@ -300,7 +369,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             rows    = _run_sql(repaired_sql, params)
             results = _rows_to_dicts(rows)
             generated_sql = repaired_sql
-            ctx.logger.warn("Repaired GROUP BY mismatch and retried", {"queryId": query_id})
+            ctx.logger.warn("Repaired GROUP BY and retried", {"queryId": query_id})
         except Exception as exc2:
             qs = await ctx.state.get("queries", query_id)
             await _error(ctx, qs, query_id, f"SQL execution failed: {exc2}")

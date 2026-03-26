@@ -198,39 +198,61 @@ def _check_filters_present(sql: str, filters: dict, ctx, query_id: str) -> None:
 def _build_time_series_sql_hint(parsed: dict) -> str:
     bucket = parsed.get("time_bucket", "month")
     metric = parsed.get("metric", "total_fare")
-
-    if bucket == "month":
+ 
+    if bucket == "year":
+        bucket_expr  = "CAST(YEAR(date_col) AS VARCHAR)"
+        bucket_label = "YYYY"
+    elif bucket == "month":
         bucket_expr  = "STRFTIME(date_col, '%Y-%m')"
         bucket_label = "YYYY-MM"
     elif bucket == "week":
         bucket_expr  = "STRFTIME(date_col, '%Y-W%W')"
         bucket_label = "YYYY-W##"
     elif bucket == "quarter":
-        bucket_expr  = "CONCAT(YEAR(date_col), '-Q', QUARTER(date_col))"
+        bucket_expr  = "CONCAT(CAST(YEAR(date_col) AS VARCHAR), '-Q', CAST(QUARTER(date_col) AS VARCHAR))"
         bucket_label = "YYYY-Q#"
     else:
         bucket_expr  = "STRFTIME(date_col, '%Y-%m-%d')"
         bucket_label = "YYYY-MM-DD"
-
-    agg_expr = "COUNT(*)" if metric == "count" else f"SUM({metric})"
-
+ 
+    # Determine aggregation based on metric name
+    if metric == "count":
+        # Use COUNT(DISTINCT) — tables often store order items (one order = many rows)
+        agg_expr = "COUNT(DISTINCT <order_pk_column>)"
+    elif metric.startswith("avg_"):
+        # avg_ prefix means AVG aggregation; strip prefix to get actual column
+        actual_col = metric[4:]
+        agg_expr = f"AVG({actual_col})"
+    else:
+        agg_expr = f"SUM({metric})"
+ 
+    dc = "<actual_date_column>"
+    bucket_expr_filled = bucket_expr.replace("date_col", dc)
+ 
     return f"""
 REQUIRED SQL PATTERN for time_series ({bucket}):
-  SELECT {bucket_expr.replace('date_col', '<actual_date_column>')} AS name,
+ 
+  SELECT {bucket_expr_filled} AS name,
          {agg_expr} AS value
-  FROM <table>
-  WHERE <date_column> BETWEEN ? AND ?
-  <BUSINESS_FILTERS>          ← replace with actual filter conditions
-  GROUP BY {bucket_expr.replace('date_col', '<actual_date_column>')}
+  FROM <table_name>
+  WHERE {dc} >= ?
+    AND {dc} < ?
+    <BUSINESS_FILTERS>
+  GROUP BY {bucket_expr_filled}
   ORDER BY name ASC
-
-Rules:
-- Replace <actual_date_column> with the real date column name from the schema.
-- Replace <table> with the real table name.
-- Replace <BUSINESS_FILTERS> with the mandatory filter conditions listed in Rule 11.
-- Keep ORDER BY name ASC so results are chronological.
-- Do NOT add LIMIT.
-- Label format: {bucket_label}
+ 
+CRITICAL RULES for time_series (ALL MUST BE FOLLOWED):
+1. GROUP BY IS MANDATORY — always include it. Without GROUP BY the query WILL FAIL.
+2. Replace <actual_date_column> with the REAL date/datetime column from the schema.
+3. Replace <table_name> with the REAL table name.
+4. Replace <order_pk_column> with the primary order identifier column (e.g. order_id, ride_id).
+5. Replace <BUSINESS_FILTERS> with the mandatory filter conditions from Rule 11.
+6. ORDER BY name ASC ensures chronological output.
+7. Do NOT add LIMIT for time_series.
+8. Label format: {bucket_label}
+9. For count metric: COUNT(DISTINCT <order_id_col>) NOT COUNT(*).
+   One order may have many rows (items), so COUNT(*) overcounts transactions.
+10. For avg_ metrics: use AVG(<column>) not SUM.
 """
 
 
@@ -359,7 +381,14 @@ STRICT RULES:
 5. Use ? for ALL date/number placeholders — never hard-code values.
 6. No semicolons. No comments. SELECT only.
 7. For "count" metric: use COUNT(*) AS value
-8. For numeric metric columns: use SUM(column_name) AS value
+8. For metric columns:
+   - Default: SUM(column_name) AS value
+   - If metric starts with "avg_" (e.g. avg_final_price, avg_total_fare):
+     use AVG(<column_without_avg_prefix>) AS value
+     Example: metric=avg_final_price → AVG(final_price) AS value
+   - If metric is "count": use COUNT(DISTINCT <primary_order_id_column>) AS value
+     NOT COUNT(*). The table stores order items — each order appears on multiple
+     rows. Use the unique order identifier (order_id, ride_id, trip_id, etc.).
 9. Ranking: {rank_instr}
 {groupby_rule}
 {filter_rule}
