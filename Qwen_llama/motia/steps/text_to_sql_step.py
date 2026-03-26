@@ -92,24 +92,63 @@ def _sales_schema_available(existing: set[str]) -> bool:
 
 
 def _detect_id_name_pairs() -> dict[str, str]:
+    """
+    Scan the live schema and return {name_col: best_discriminator_col}.
+
+    Priority per *_name column:
+      1. <base>_id / <base>_code / <base>_key / <base>_uuid  (surrogate key)
+      2. phone / phone_number / mobile / email               (contact ID)
+      3. <base>_no / <base>_number                           (alternate key)
+
+    Handles datasets with no surrogate key (e.g. Zomato customers identified
+    by phone, not by customer_id). The discriminator is used to GROUP BY so
+    that two entities sharing the same display name are never collapsed.
+    """
+    from collections import defaultdict
     try:
         conn = get_read_connection()
         rows = conn.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema = 'main'"
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema = 'main' ORDER BY table_name, ordinal_position"
         ).fetchall()
         conn.close()
-        cols = {r[0] for r in rows}
-        pairs: dict[str, str] = {}
-        for col in cols:
-            if col.endswith("_name"):
-                base   = col[:-5]
-                id_col = base + "_id"
-                if id_col in cols:
-                    pairs[col] = id_col
-        return pairs
     except Exception:
         return {}
+
+    table_cols: dict = defaultdict(list)
+    for table, col in rows:
+        table_cols[table].append(col.lower())
+
+    _CONTACT_DISCRIMINATORS = (
+        "phone", "phone_number", "mobile", "mobile_number",
+        "email", "email_address", "contact",
+    )
+
+    def _best_disc(name_col: str, col_set: set) -> str | None:
+        base = name_col[:-5] if name_col.endswith("_name") else name_col
+        for suffix in ("_id", "_code", "_key", "_uuid", "_no", "_number"):
+            c = base + suffix
+            if c in col_set:
+                return c
+        for c in _CONTACT_DISCRIMINATORS:
+            if c in col_set:
+                return c
+        return None
+
+    pairs: dict[str, str] = {}
+    for table, cols in table_cols.items():
+        col_set = set(cols)
+        for col in cols:
+            if col.endswith("_name"):
+                disc = _best_disc(col, col_set)
+                if disc and col not in pairs:
+                    pairs[col] = disc
+        if "name" in col_set and "name" not in pairs:
+            for c in (f"{table}_id", "id", f"{table}_code"):
+                if c in col_set:
+                    pairs["name"] = c
+                    break
+    return pairs
 
 
 def _extract_sql(raw: str) -> str:
@@ -156,19 +195,8 @@ def _explain(sql: str, parsed: dict | None = None) -> tuple[bool, str]:
 
 
 def _render_filter_clause(filters: dict) -> str:
-    """
-    Convert a filters dict like {"is_cancelled": 0, "city": "Mumbai"}
-    into SQL WHERE fragment lines, e.g.:
-      AND is_cancelled = 0
-      AND city = 'Mumbai'
-    These are NOT parameterised here — they are embedded as literals in the
-    prompt so the LLM knows exactly what to add.  The generated SQL should
-    still use ? for user-supplied values where possible, but equality checks
-    on known-boolean columns are safe to embed directly.
-    """
     if not filters:
         return ""
-
     lines = []
     for col, val in filters.items():
         if isinstance(val, bool):
@@ -178,15 +206,12 @@ def _render_filter_clause(filters: dict) -> str:
         elif isinstance(val, float):
             lines.append(f"  AND {col} = {val}")
         else:
-            # String — use single quotes
             safe_val = str(val).replace("'", "''")
             lines.append(f"  AND {col} = '{safe_val}'")
-
     return "\n".join(lines)
 
 
 def _check_filters_present(sql: str, filters: dict, ctx, query_id: str) -> None:
-    """Warn if the LLM forgot to include a mandatory filter in the SQL."""
     for col, val in filters.items():
         if col.lower() not in sql.lower():
             ctx.logger.warn(
@@ -198,7 +223,7 @@ def _check_filters_present(sql: str, filters: dict, ctx, query_id: str) -> None:
 def _build_time_series_sql_hint(parsed: dict) -> str:
     bucket = parsed.get("time_bucket", "month")
     metric = parsed.get("metric", "total_fare")
- 
+
     if bucket == "year":
         bucket_expr  = "CAST(YEAR(date_col) AS VARCHAR)"
         bucket_label = "YYYY"
@@ -214,24 +239,21 @@ def _build_time_series_sql_hint(parsed: dict) -> str:
     else:
         bucket_expr  = "STRFTIME(date_col, '%Y-%m-%d')"
         bucket_label = "YYYY-MM-DD"
- 
-    # Determine aggregation based on metric name
+
     if metric == "count":
-        # Use COUNT(DISTINCT) — tables often store order items (one order = many rows)
         agg_expr = "COUNT(DISTINCT <order_pk_column>)"
     elif metric.startswith("avg_"):
-        # avg_ prefix means AVG aggregation; strip prefix to get actual column
         actual_col = metric[4:]
         agg_expr = f"AVG({actual_col})"
     else:
         agg_expr = f"SUM({metric})"
- 
+
     dc = "<actual_date_column>"
     bucket_expr_filled = bucket_expr.replace("date_col", dc)
- 
+
     return f"""
 REQUIRED SQL PATTERN for time_series ({bucket}):
- 
+
   SELECT {bucket_expr_filled} AS name,
          {agg_expr} AS value
   FROM <table_name>
@@ -240,7 +262,7 @@ REQUIRED SQL PATTERN for time_series ({bucket}):
     <BUSINESS_FILTERS>
   GROUP BY {bucket_expr_filled}
   ORDER BY name ASC
- 
+
 CRITICAL RULES for time_series (ALL MUST BE FOLLOWED):
 1. GROUP BY IS MANDATORY — always include it. Without GROUP BY the query WILL FAIL.
 2. Replace <actual_date_column> with the REAL date/datetime column from the schema.
@@ -273,25 +295,17 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
         else "  none"
     )
 
-    id_name_pairs = _detect_id_name_pairs()
-
-    if entity and entity in id_name_pairs:
-        id_col = id_name_pairs[entity]
+    if entity:
         groupby_rule = (
             f"10. GROUPING (CRITICAL):\n"
-            f"    entity='{entity}' has a corresponding ID column '{id_col}'.\n"
-            f"    You MUST:\n"
-            f"      - SELECT {entity} AS name\n"
-            f"      - GROUP BY {id_col}, {entity}\n"
-        )
-    elif entity:
-        groupby_rule = (
-            f"10. GROUPING:\n"
-            f"    entity='{entity}' — GROUP BY {entity}, SELECT {entity} AS name."
+            f"    GROUP BY {entity}\n"
+            f"    Only use additional identifier columns (like id/phone) "
+            f"IF explicitly required.\n"
+            f"    Do NOT assume phone/email is unique identifier.\n"
         )
     else:
         groupby_rule = (
-            "10. GROUPING: aggregate or time_series query — no entity GROUP BY."
+            "10. GROUPING: aggregate or time_series query — no entity GROUP BY needed."
         )
 
     # ── Ranking instruction ───────────────────────────────────────────────────
@@ -336,7 +350,6 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
         for i, tr in enumerate(trs[:2]):
             date_hints += f"\n  Period {i+1}: {tr.get('start')} to {tr.get('end')}"
 
-    # Build the mandatory filter instruction block
     if filter_clause:
         filter_rule = (
             f"11. BUSINESS FILTERS — MANDATORY (add these to EVERY query):\n"
@@ -456,9 +469,8 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     fallback_used = False
     sql_source    = "builder"
 
-    # time_series and queries with non-standard filters always use LLM
     force_llm = (
-        bool(filters)                                           # has business filters → LLM
+        bool(filters)
         or not sales_available
         or qt == "time_series"
         or parsed.get("entity") not in _BUILDER_ENTITIES
@@ -498,9 +510,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             sql = _extract_sql(raw)
             ok, reason = _is_safe(sql)
             if ok:
-                # Warn if mandatory filters appear to be missing
                 _check_filters_present(sql, filters, ctx, query_id)
-
                 ok2, err = _explain(sql, parsed)
                 if ok2:
                     generated_sql = sql
