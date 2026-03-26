@@ -340,10 +340,44 @@ def _token_summary(usage, totals):
     return "\n".join(lines)
 
 
-def _fmt(v, currency):
+def _fmt_indian(v: Any, currency: str, decimals: int = 2) -> str:
     if v is None:
         return "—"
-    return f"{currency}{v:,.2f}" if currency else f"{v:,.2f}"
+    try:
+        val = float(v)
+    except Exception:
+        return str(v)
+    
+    sign = "-" if val < 0 else ""
+    abs_val = abs(val)
+    
+    # Format with requested decimals
+    s = f"{abs_val:.{decimals}f}"
+    parts = s.split('.')
+    integer_part = parts[0]
+    decimal_part = parts[1] if len(parts) > 1 else ""
+    
+    # Indian grouping: last 3, then every 2
+    res = ""
+    if len(integer_part) > 3:
+        res = "," + integer_part[-3:]
+        remaining = integer_part[:-3]
+        while len(remaining) > 2:
+            res = "," + remaining[-2:] + res
+            remaining = remaining[:-2]
+        if remaining:
+            res = remaining + res
+    else:
+        res = integer_part
+        
+    formatted = f"{sign}{currency}{res}"
+    if decimals > 0:
+        formatted += f".{decimal_part}"
+    return formatted
+
+
+def _fmt(v, currency):
+    return _fmt_indian(v, currency)
 
 
 def _delta_str(v1, v2, currency):
@@ -353,7 +387,7 @@ def _delta_str(v1, v2, currency):
     sign  = "+" if delta >= 0 else ""
     pct   = (delta / v1 * 100) if v1 != 0 else float("inf")
     pct_s = f"{sign}{pct:.1f}%" if pct != float("inf") else "new"
-    return f"{sign}{currency}{abs(delta):,.2f} ({pct_s})"
+    return f"{sign}{_fmt_indian(abs(delta), currency)} ({pct_s})"
 
 
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
@@ -436,16 +470,17 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
 
         items = []
         for i, (lbl, val) in enumerate(zip(labels, values)):
-            header += f"\n  {lbl:<14}  {p}{val:>15,.2f}"
-            items.append({"period": lbl, "value": f"{p}{val:,.2f}", "raw_value": val})
+            val_s = _fmt_indian(val, p)
+            header += f"\n  {lbl:<14}  {val_s:>16}"
+            items.append({"period": lbl, "value": val_s, "raw_value": val})
 
         # Add a summary row
         if values:
             total   = sum(values)
             average = total / len(values)
             header += f"\n  {'─'*14}  {'─'*16}"
-            header += f"\n  {'Total':<14}  {p}{total:>15,.2f}"
-            header += f"\n  {'Average':<14}  {p}{average:>15,.2f}"
+            header += f"\n  {'Total':<14}  {_fmt_indian(total, p):>16}"
+            header += f"\n  {'Average':<14}  {_fmt_indian(average, p):>16}"
 
         formatted_text = header + _token_summary(token_usage, token_totals)
 
@@ -461,8 +496,9 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     elif is_scalar:
         v = results[0]["value"]
         period_str = _period_phrase if _period_phrase else f"between {start_date} and {end_date}"
-        formatted_text = f"Total {mlabel} {period_str} is {p}{v:,.2f}"
-        items = [{"label": f"Total {mlabel}", "value": f"{p}{v:,.2f}"}]
+        val_s = _fmt_indian(v, p)
+        formatted_text = f"Total {mlabel} {period_str} is {val_s}"
+        items = [{"label": f"Total {mlabel}", "value": val_s}]
 
     # ── GROWTH RANKING ──────────────────────────────────────────────────────────
     elif has_delta:
@@ -478,9 +514,9 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             pct   = (d / v1 * 100) if v1 != 0 else float("inf")
             pct_s = f"{sign}{pct:.1f}%" if pct != float("inf") else "new entry"
             header += (f"\n{i}. {name}"
-                       f"\n   {p1}: {p}{v1:,.2f}"
-                       f"\n   {p2}: {p}{v2:,.2f}"
-                       f"\n   Growth: {sign}{p}{abs(d):,.2f} ({pct_s})")
+                       f"\n   {p1}: {_fmt_indian(v1, p)}"
+                       f"\n   {p2}: {_fmt_indian(v2, p)}"
+                       f"\n   Growth: {sign}{_fmt_indian(abs(d), p)} ({pct_s})")
             items.append({"rank": i, "name": name, "delta": d})
         formatted_text = header + _token_summary(token_usage, token_totals)
         names  = [r.get("name", "?") for r in results]
@@ -551,7 +587,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 thr_type = thr.get("type", "absolute")
                 thr_val  = thr.get("value", 0)
                 direction = "less than" if thr_op == "lt" else "more than"
-                thr_val_str = f"{thr_val:.0f}% of total" if thr_type == "percentage" else f"{p}{thr_val:,.0f}"
+                thr_val_str = f"{thr_val:.0f}% of total" if thr_type == "percentage" else _fmt_indian(thr_val, p, decimals=0)
                 header = (f"{len(results)} {elabel} where {metric} contributed "
                           f"{direction} {thr_val_str} "
                           f"between {start_date} and {end_date}:")
@@ -567,9 +603,10 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             for i, row in enumerate(results, 1):
                 name  = row.get("name", "?")
                 value = row.get("value", 0) or 0
-                header += f"\n{i}. {name} — {p}{value:,.2f}"
+                val_s = _fmt_indian(value, p)
+                header += f"\n{i}. {name} — {val_s}"
                 items.append({"rank": i, "name": name,
-                              "value": f"{p}{value:,.2f}", "raw_value": value})
+                              "value": val_s, "raw_value": value})
                 names.append(name)
                 values.append(value)
 

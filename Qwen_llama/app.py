@@ -23,8 +23,42 @@ ENTITY_LABELS = {
 }
 
 
+def _fmt_indian(val, prefix, decimals=2):
+    if val is None:
+        return "—"
+    try:
+        f_val = float(val)
+    except (ValueError, TypeError):
+        return str(val)
+    
+    sign = "-" if f_val < 0 else ""
+    abs_val = abs(f_val)
+    
+    s = f"{abs_val:.{decimals}f}"
+    parts = s.split('.')
+    integer_part = parts[0]
+    decimal_part = parts[1] if len(parts) > 1 else ""
+    
+    res = ""
+    if len(integer_part) > 3:
+        res = "," + integer_part[-3:]
+        remaining = integer_part[:-3]
+        while len(remaining) > 2:
+            res = "," + remaining[-2:] + res
+            remaining = remaining[:-2]
+        if remaining:
+            res = remaining + res
+    else:
+        res = integer_part
+    
+    formatted = f"{sign}{prefix}{res}"
+    if decimals > 0:
+        formatted += f".{decimal_part}"
+    return formatted
+
+
 def fmt_value(value, prefix):
-    return f"{prefix}{value:,.2f}"
+    return _fmt_indian(value, prefix)
 
 
 def delta_str(v1, v2, prefix):
@@ -33,7 +67,7 @@ def delta_str(v1, v2, prefix):
     delta = v2 - v1
     sign  = "+" if delta >= 0 else ""
     pct   = (delta / v1 * 100) if v1 != 0 else float("inf")
-    return f"{sign}{prefix}{abs(delta):,.2f}  ({sign}{pct:.1f}%)"
+    return f"{sign}{_fmt_indian(abs(delta), prefix)}  ({sign}{pct:.1f}%)"
 
 
 def print_token_summary():
@@ -158,7 +192,7 @@ while True:
         print(f"\nAssistant: 🔀 Top {len(combined)} {entity_label} present in "
               f"BOTH {p1} AND {p2} (combined {state.metric}):")
         for i, (name, value) in enumerate(combined, start=1):
-            print(f"  {i}. {name} — {prefix}{value:,.2f}")
+            print(f"  {i}. {name} — {_fmt_indian(value, prefix)}")
 
         print_token_summary()
         state = ConversationState()
@@ -263,7 +297,7 @@ while True:
         print(
             f"Assistant: Total {state.metric} between "
             f"{start_date:%d %B %Y} and {end_date:%d %B %Y} "
-            f"is {prefix}{value:,.2f}"
+            f"is {_fmt_indian(value, prefix)}"
         )
     else:
         rank_label = "Top" if state.ranking == "top" else "Bottom"
@@ -272,7 +306,7 @@ while True:
             f"between {start_date:%d %B %Y} and {end_date:%d %B %Y}:"
         )
         for i, (name, value) in enumerate(rows, start=1):
-            print(f"  {i}. {name} — {prefix}{value:,.2f}")
+            print(f"  {i}. {name} — {_fmt_indian(value, prefix)}")
 
     print_token_summary()
     state = ConversationState()

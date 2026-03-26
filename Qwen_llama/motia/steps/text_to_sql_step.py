@@ -1,11 +1,11 @@
 """Step 4: Text-to-SQL — fully generalised for any flat-table dataset.
 
-Changes vs original:
-  - Added time_series query type support in _build_llm_prompt():
-      Uses STRFTIME for DuckDB to bucket dates by month/week/quarter/day.
-      GROUP BY time bucket, ORDER BY time bucket ASC (chronological order).
-  - time_series uses QWEN (complex query) regardless of schema type.
-  - All other logic unchanged.
+Key changes:
+  - _build_llm_prompt() now receives `filters` from parsed intent and renders
+    them as an explicit MANDATORY WHERE clause in the prompt.
+  - Added Rule 11: "BUSINESS FILTERS — apply ALL parsed filters as WHERE conditions".
+  - time_series query type support (unchanged from previous version).
+  - Validates generated SQL contains expected filter conditions and warns if missing.
 """
 
 import os
@@ -49,8 +49,8 @@ config = {
     "name": "TextToSQL",
     "description": (
         "Builds SQL from parsed intent using the live schema. "
-        "Handles time_series (trend) queries grouped by month/week/quarter/day. "
-        "Uses deterministic builder only for classic e-commerce schema."
+        "Injects business-validity filters (e.g. is_cancelled=0) into every query. "
+        "Handles time_series (trend) queries grouped by month/week/quarter/day."
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::text.to.sql")],
@@ -66,11 +66,10 @@ _FORBIDDEN   = re.compile(
     re.IGNORECASE,
 )
 
-# DuckDB STRFTIME format strings per time bucket
 _BUCKET_FMT = {
     "month":   "%Y-%m",
     "week":    "%Y-W%W",
-    "quarter": "%Y-Q",     # handled specially below
+    "quarter": "%Y-Q",
     "day":     "%Y-%m-%d",
 }
 
@@ -156,31 +155,64 @@ def _explain(sql: str, parsed: dict | None = None) -> tuple[bool, str]:
     return explain_query(sql, params)
 
 
+def _render_filter_clause(filters: dict) -> str:
+    """
+    Convert a filters dict like {"is_cancelled": 0, "city": "Mumbai"}
+    into SQL WHERE fragment lines, e.g.:
+      AND is_cancelled = 0
+      AND city = 'Mumbai'
+    These are NOT parameterised here — they are embedded as literals in the
+    prompt so the LLM knows exactly what to add.  The generated SQL should
+    still use ? for user-supplied values where possible, but equality checks
+    on known-boolean columns are safe to embed directly.
+    """
+    if not filters:
+        return ""
+
+    lines = []
+    for col, val in filters.items():
+        if isinstance(val, bool):
+            lines.append(f"  AND {col} = {1 if val else 0}")
+        elif isinstance(val, int):
+            lines.append(f"  AND {col} = {val}")
+        elif isinstance(val, float):
+            lines.append(f"  AND {col} = {val}")
+        else:
+            # String — use single quotes
+            safe_val = str(val).replace("'", "''")
+            lines.append(f"  AND {col} = '{safe_val}'")
+
+    return "\n".join(lines)
+
+
+def _check_filters_present(sql: str, filters: dict, ctx, query_id: str) -> None:
+    """Warn if the LLM forgot to include a mandatory filter in the SQL."""
+    for col, val in filters.items():
+        if col.lower() not in sql.lower():
+            ctx.logger.warn(
+                f"⚠️ Filter '{col}' may be missing from generated SQL",
+                {"queryId": query_id, "col": col, "expected_val": val},
+            )
+
+
 def _build_time_series_sql_hint(parsed: dict) -> str:
-    """
-    Build a direct SQL hint for time_series queries.
-    This gives the LLM an exact template to fill in — avoids hallucination.
-    """
     bucket = parsed.get("time_bucket", "month")
     metric = parsed.get("metric", "total_fare")
 
     if bucket == "month":
-        bucket_expr = "STRFTIME(date_col, '%Y-%m')"
+        bucket_expr  = "STRFTIME(date_col, '%Y-%m')"
         bucket_label = "YYYY-MM"
     elif bucket == "week":
-        bucket_expr = "STRFTIME(date_col, '%Y-W%W')"
+        bucket_expr  = "STRFTIME(date_col, '%Y-W%W')"
         bucket_label = "YYYY-W##"
     elif bucket == "quarter":
-        bucket_expr = "CONCAT(YEAR(date_col), '-Q', QUARTER(date_col))"
+        bucket_expr  = "CONCAT(YEAR(date_col), '-Q', QUARTER(date_col))"
         bucket_label = "YYYY-Q#"
-    else:  # day
-        bucket_expr = "STRFTIME(date_col, '%Y-%m-%d')"
+    else:
+        bucket_expr  = "STRFTIME(date_col, '%Y-%m-%d')"
         bucket_label = "YYYY-MM-DD"
 
-    if metric == "count":
-        agg_expr = "COUNT(*)"
-    else:
-        agg_expr = f"SUM({metric})"
+    agg_expr = "COUNT(*)" if metric == "count" else f"SUM({metric})"
 
     return f"""
 REQUIRED SQL PATTERN for time_series ({bucket}):
@@ -188,29 +220,36 @@ REQUIRED SQL PATTERN for time_series ({bucket}):
          {agg_expr} AS value
   FROM <table>
   WHERE <date_column> BETWEEN ? AND ?
+  <BUSINESS_FILTERS>          ← replace with actual filter conditions
   GROUP BY {bucket_expr.replace('date_col', '<actual_date_column>')}
   ORDER BY name ASC
 
 Rules:
 - Replace <actual_date_column> with the real date column name from the schema.
 - Replace <table> with the real table name.
+- Replace <BUSINESS_FILTERS> with the mandatory filter conditions listed in Rule 11.
 - Keep ORDER BY name ASC so results are chronological.
-- Do NOT add LIMIT — return all time buckets in the range.
-- The label format is {bucket_label} which allows natural sort ordering.
+- Do NOT add LIMIT.
+- Label format: {bucket_label}
 """
 
 
 def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
-    entity     = parsed.get("entity")
-    metric     = parsed.get("metric", "count")
-    qt         = parsed.get("query_type", "top_n")
-    top_n      = parsed.get("top_n", 5)
-    thr        = parsed.get("threshold") or {}
-    filters    = parsed.get("filters", {})
-    trs        = parsed.get("time_ranges", [])
-    bucket     = parsed.get("time_bucket", "month")
+    entity   = parsed.get("entity")
+    metric   = parsed.get("metric", "count")
+    qt       = parsed.get("query_type", "top_n")
+    top_n    = parsed.get("top_n", 5)
+    thr      = parsed.get("threshold") or {}
+    filters  = parsed.get("filters", {}) or {}
+    trs      = parsed.get("time_ranges", [])
+    bucket   = parsed.get("time_bucket", "month")
 
-    filter_desc = ", ".join(f"{k}={v}" for k, v in filters.items()) if filters else "none"
+    filter_clause = _render_filter_clause(filters)
+    filter_desc   = (
+        f"\n  MANDATORY FILTERS (from Rule 11):\n{filter_clause}"
+        if filter_clause
+        else "  none"
+    )
 
     id_name_pairs = _detect_id_name_pairs()
 
@@ -220,8 +259,8 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
             f"10. GROUPING (CRITICAL):\n"
             f"    entity='{entity}' has a corresponding ID column '{id_col}'.\n"
             f"    You MUST:\n"
-            f"      - SELECT {entity} AS name   (the human-readable name)\n"
-            f"      - GROUP BY {id_col}, {entity}  (both columns for uniqueness)\n"
+            f"      - SELECT {entity} AS name\n"
+            f"      - GROUP BY {id_col}, {entity}\n"
         )
     elif entity:
         groupby_rule = (
@@ -235,7 +274,7 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
 
     # ── Ranking instruction ───────────────────────────────────────────────────
     if qt == "time_series":
-        ts_hint = _build_time_series_sql_hint(parsed)
+        ts_hint    = _build_time_series_sql_hint(parsed)
         rank_instr = (
             f"This is a TIME SERIES / TREND query.\n"
             f"Group by time bucket ({bucket}), NOT by any business entity.\n"
@@ -275,6 +314,21 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
         for i, tr in enumerate(trs[:2]):
             date_hints += f"\n  Period {i+1}: {tr.get('start')} to {tr.get('end')}"
 
+    # Build the mandatory filter instruction block
+    if filter_clause:
+        filter_rule = (
+            f"11. BUSINESS FILTERS — MANDATORY (add these to EVERY query):\n"
+            f"    The following WHERE conditions MUST be included.\n"
+            f"    They exclude cancelled, deleted, or fraudulent rows and are\n"
+            f"    CRITICAL for correct revenue / count figures:\n"
+            f"{filter_clause}\n"
+            f"    Add them after the date filter:\n"
+            f"      WHERE date_col BETWEEN ? AND ?\n"
+            f"{filter_clause}\n"
+        )
+    else:
+        filter_rule = "11. No additional business filters required."
+
     return f"""You are a DuckDB SQL expert. Output ONLY raw SQL — no prose, no markdown fences, no explanation.
 
 User question: "{user_query}"
@@ -293,7 +347,14 @@ STRICT RULES:
 1. Use the EXACT column names from the schema above.
 2. Alias the display column as "name" in SELECT.
 3. Alias the aggregation as "value".
-4. Filter dates using:  date_column BETWEEN ? AND ?
+4. DATE FILTER — CRITICAL:
+   Use the EXCLUSIVE-RANGE pattern for datetime/timestamp columns:
+       col >= ?  AND  col < ?
+   where the second ? is the day AFTER the period end.
+   Example for "year 2023":
+       order_datetime >= ?   -- bound to 2023-01-01
+       AND order_datetime < ?  -- bound to 2024-01-01  (exclusive)
+   NEVER use BETWEEN for datetime columns — it silently drops the last day.
    NEVER use EXTRACT(YEAR ...) = ? or EXTRACT(MONTH ...) = ?
 5. Use ? for ALL date/number placeholders — never hard-code values.
 6. No semicolons. No comments. SELECT only.
@@ -301,6 +362,7 @@ STRICT RULES:
 8. For numeric metric columns: use SUM(column_name) AS value
 9. Ranking: {rank_instr}
 {groupby_rule}
+{filter_rule}
 
 SQL:"""
 
@@ -343,30 +405,33 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     parsed["_user_query"] = user_query
 
     qt      = parsed.get("query_type", "top_n")
-    filters = parsed.get("filters", {})
+    filters = parsed.get("filters", {}) or {}
 
     existing_tables = _get_existing_tables()
     sales_available = _sales_schema_available(existing_tables)
     ctx.logger.info("📋 DB tables found", {
-        "queryId": query_id,
-        "tables":  list(existing_tables),
+        "queryId":      query_id,
+        "tables":       list(existing_tables),
         "sales_schema": sales_available,
     })
 
-    ctx.logger.info("🧬 TextToSQL", {"queryId": query_id, "query_type": qt,
-                                     "time_bucket": parsed.get("time_bucket"),
-                                     "has_filters": bool(filters)})
+    ctx.logger.info("🧬 TextToSQL", {
+        "queryId":     query_id,
+        "query_type":  qt,
+        "time_bucket": parsed.get("time_bucket"),
+        "filters":     filters,
+    })
 
     generated_sql = None
     usage         = {}
     fallback_used = False
     sql_source    = "builder"
 
-    # time_series always uses LLM — no builder support for time bucketing
+    # time_series and queries with non-standard filters always use LLM
     force_llm = (
-        bool(filters)
+        bool(filters)                                           # has business filters → LLM
         or not sales_available
-        or qt == "time_series"                          # ← NEW
+        or qt == "time_series"
         or parsed.get("entity") not in _BUILDER_ENTITIES
         or parsed.get("metric") not in _BUILDER_METRICS
     )
@@ -388,10 +453,9 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                                 {"queryId": query_id, "reason": reason})
 
     if generated_sql is None:
-        # time_series and complex queries use Qwen; simple ranked use LLaMA
         COMPLEX = {"growth_ranking", "comparison", "threshold", "intersection",
-                   "zero_filter", "time_series"}    # ← time_series added
-        model   = QWEN_MODEL if qt in COMPLEX else LLAMA_MODEL
+                   "zero_filter", "time_series"}
+        model      = QWEN_MODEL if qt in COMPLEX else LLAMA_MODEL
         sql_source = f"llm_{model.split('/')[0]}"
 
         ctx.logger.info("🤖 LLM SQL generation", {"queryId": query_id, "model": model})
@@ -405,6 +469,9 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             sql = _extract_sql(raw)
             ok, reason = _is_safe(sql)
             if ok:
+                # Warn if mandatory filters appear to be missing
+                _check_filters_present(sql, filters, ctx, query_id)
+
                 ok2, err = _explain(sql, parsed)
                 if ok2:
                     generated_sql = sql
@@ -434,7 +501,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         msg = (
             f"Could not generate SQL for query_type={qt} "
             f"entity={parsed.get('entity')} metric={parsed.get('metric')}. "
-            "Try rephrasing — e.g. 'Monthly revenue trend for 2024'."
+            "Try rephrasing — e.g. 'Top 5 restaurants by revenue in 2023'."
         )
         qs = await ctx.state.get("queries", query_id)
         if qs:
