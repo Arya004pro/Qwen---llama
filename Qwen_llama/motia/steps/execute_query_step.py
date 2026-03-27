@@ -42,7 +42,7 @@ config = {
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::execute")],
-    "enqueues": ["query::format.result"],
+    "enqueues": ["query::detect.anomalies"],
 }
 
 # ── SQL rewrite patterns ─────────────────────────────────────────────────────
@@ -524,7 +524,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     start_date    = trs[0]["start"] if trs else ""
     end_date      = trs[-1]["end"]  if trs else ""
 
-    await ctx.enqueue({"topic": "query::format.result", "data": {
+    await ctx.enqueue({"topic": "query::detect.anomalies", "data": {
         "queryId":       query_id,
         "query":         user_query,
         "parsed":        parsed,

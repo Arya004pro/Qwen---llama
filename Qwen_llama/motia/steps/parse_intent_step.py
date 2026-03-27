@@ -324,6 +324,16 @@ def _is_trend_query(query: str) -> bool:
     return any(kw in q for kw in _TREND_KEYWORDS)
 
 
+def _has_ranking_cue(query: str) -> bool:
+    q = f" {query.lower()} "
+    if _TOPN_RE.search(q):
+        return True
+    return any(x in q for x in [
+        " top ", " bottom ", "highest", "lowest", "least", "most",
+        "best", "worst", "top-", "bottom-",
+    ])
+
+
 def _fallback_parse(user_query: str) -> dict:
     q  = user_query.lower()
 
@@ -416,12 +426,24 @@ def _post_process(parsed: dict, user_query: str = "",
     m  = parsed.get("metric")
 
     # ── Detect trend query that Qwen may have misclassified ───────────────────
-    if _is_trend_query(user_query) and qt not in ("time_series",):
+    ranking_cue = _has_ranking_cue(user_query)
+    if _is_trend_query(user_query) and not ranking_cue and qt not in ("time_series",):
         parsed["query_type"] = "time_series"
         parsed["entity"]     = None
         qt = "time_series"
         if not parsed.get("time_bucket"):
             parsed["time_bucket"] = _detect_time_bucket(user_query)
+
+    if qt == "time_series" and ranking_cue:
+        mtop = _TOPN_RE.search(user_query)
+        parsed["query_type"] = "top_n"
+        if mtop:
+            parsed["query_type"] = "bottom_n" if mtop.group(1).lower() == "bottom" else "top_n"
+            parsed["top_n"] = int(mtop.group(2))
+        elif any(x in user_query.lower() for x in ["lowest", "least", "bottom", "worst"]):
+            parsed["query_type"] = "bottom_n"
+        parsed["time_bucket"] = None
+        qt = parsed["query_type"]
 
     if qt == "time_series" and not parsed.get("time_bucket"):
         parsed["time_bucket"] = _detect_time_bucket(user_query)

@@ -418,6 +418,37 @@ def _insights_ranked(items: list[dict], currency: str) -> list[str]:
     return insights
 
 
+def _anomaly_insights(anomalies: dict[str, Any], currency: str) -> list[str]:
+    if not isinstance(anomalies, dict):
+        return []
+    flagged = anomalies.get("items") or []
+    if not flagged:
+        return []
+    out = []
+    for a in flagged[:3]:
+        label = a.get("label", "unknown")
+        value = _fmt_indian(a.get("value", 0), currency)
+        z = a.get("z_score")
+        ratio = a.get("ratio_to_mean")
+        ratio_txt = f", {ratio:.1f}x mean" if isinstance(ratio, (int, float)) else ""
+        if isinstance(z, (int, float)):
+            out.append(f"Potential anomaly: {label} at {value} (z={z:.2f}{ratio_txt}).")
+        else:
+            out.append(f"Potential anomaly: {label} at {value}{ratio_txt}.")
+    return out
+
+
+def _inject_insight_block(formatted_text: str, lines: list[str]) -> str:
+    if not lines:
+        return formatted_text
+    block = "\n\nAnomalies:\n" + "\n".join(f"- {x}" for x in lines)
+    marker = "\n\n Token Usage "
+    if marker in formatted_text:
+        head, tail = formatted_text.split(marker, 1)
+        return head + block + marker + tail
+    return formatted_text + block
+
+
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     import datetime as _dt
 
@@ -425,6 +456,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     user_query    = input_data.get("query", "")
     parsed        = input_data.get("parsed", {})
     results       = input_data.get("results", [])
+    anomalies     = input_data.get("anomalies", {})
     period_labels = input_data.get("period_labels", [])
     start_date    = input_data.get("startDate", "")
     end_date      = input_data.get("endDate", "")
@@ -679,6 +711,10 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 f"{start_date} to {end_date}",
             )
 
+    anomaly_lines = _anomaly_insights(anomalies, p)
+    if anomaly_lines:
+        formatted_text = _inject_insight_block(formatted_text, anomaly_lines)
+
     ctx.logger.info(" Formatted", {"queryId": query_id})
     if qs:
         now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -689,6 +725,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             "formattedText":  formatted_text,
             "formattedItems": items,
             "chart_config":   chart_config,
+            "anomalies":      anomalies,
             "token_usage":    token_usage,
             "token_totals":   token_totals,
             "completedAt":    now_iso,

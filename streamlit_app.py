@@ -264,8 +264,9 @@ def _build_pdf_chart(chart_config):
             line_c = _to_rl_color(c, colors.HexColor("#60a5fa"))
             chart.lines[i].strokeColor = line_c
             chart.lines[i].strokeWidth = 1.7
-            # Keep tiny markers only when the series is short.
-            chart.lines[i].symbol = None if len(labels) > 36 else chart.lines[i].symbol
+            # Some reportlab versions do not expose `symbol` on line props.
+            if hasattr(chart.lines[i], "symbol") and len(labels) > 36:
+                chart.lines[i].symbol = None
     else:
         chart.groupSpacing = 5
         chart.barSpacing = 2
