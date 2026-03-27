@@ -166,6 +166,8 @@ Requirements
 ------------
 - Alias the group-by column as  name  and the aggregation as  value
 - Use ? placeholders for every date and numeric limit (never hard-code values)
+- Read "Uniqueness Profile" and "Safe Grouping Keys" from schema first.
+- If entity labels are non-unique, group by stable key + label to avoid merged entities.
 - {rank_instruction}
 
 SQL:"""

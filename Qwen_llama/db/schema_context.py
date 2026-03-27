@@ -52,6 +52,207 @@ _STATUS_BAD_VALUES: set[str] = {
     "rejected", "returned", "closed", "inactive", "deleted",
 }
 
+_ENTITY_NAME_HINTS: tuple[str, ...] = (
+    "name", "title", "label", "code", "id", "location", "warehouse",
+    "store", "branch", "driver", "brand", "vendor", "customer",
+    "employee", "agent", "partner", "city", "state", "region",
+)
+
+_NON_ENTITY_NAME_HINTS: tuple[str, ...] = (
+    "date", "time", "timestamp", "created", "updated", "deleted",
+    "status", "type", "description", "comment", "note", "month",
+    "year", "week", "day",
+)
+
+
+def _is_text_type(dtype: str) -> bool:
+    d = dtype.upper()
+    return any(t in d for t in ("VARCHAR", "CHAR", "TEXT", "STRING"))
+
+
+def _is_numeric_type(dtype: str) -> bool:
+    d = dtype.upper()
+    return any(t in d for t in ("INT", "BIGINT", "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC", "REAL"))
+
+
+def _looks_like_date_column(col_name: str) -> bool:
+    n = col_name.lower()
+    return any(k in n for k in ("date", "time", "timestamp", "month", "year", "week", "day"))
+
+
+def _looks_like_entity_column(col_name: str) -> bool:
+    n = col_name.lower()
+    if _looks_like_date_column(n):
+        return False
+    if any(k in n for k in _NON_ENTITY_NAME_HINTS):
+        return False
+    if n == "id" or n.endswith("_id"):
+        return True
+    return any(k in n for k in _ENTITY_NAME_HINTS)
+
+
+def _detect_entities(conn, tables: list[str]) -> list[str]:
+    """
+    Detect likely business entities from high-cardinality text columns.
+    """
+    hints: list[str] = []
+
+    for table in tables:
+        try:
+            cols = [(c[0], c[1].upper()) for c in conn.execute(f'DESCRIBE "{table}"').fetchall()]
+        except Exception:
+            continue
+
+        candidates: list[tuple[float, str, int, int, float]] = []
+        for col_name, dtype in cols:
+            if not _is_text_type(dtype):
+                continue
+            if _looks_like_date_column(col_name):
+                continue
+            if not _looks_like_entity_column(col_name):
+                continue
+
+            try:
+                non_null, distinct_cnt = conn.execute(
+                    f'''
+                    SELECT
+                        COUNT("{col_name}") AS non_null_count,
+                        COUNT(DISTINCT "{col_name}") AS distinct_count
+                    FROM "{table}"
+                    '''
+                ).fetchone()
+            except Exception:
+                continue
+
+            non_null = int(non_null or 0)
+            distinct_cnt = int(distinct_cnt or 0)
+            if non_null == 0:
+                continue
+
+            ratio = distinct_cnt / non_null
+            id_like = col_name.lower() == "id" or col_name.lower().endswith("_id")
+            high_card = (
+                (distinct_cnt >= 10 and ratio >= 0.30) or
+                (distinct_cnt >= 50 and ratio >= 0.15) or
+                (id_like and distinct_cnt >= 10 and ratio >= 0.60)
+            )
+            if not high_card:
+                continue
+
+            score = ratio
+            n = col_name.lower()
+            if "name" in n:
+                score += 0.40
+            elif id_like:
+                score += 0.30
+            elif any(k in n for k in ("location", "store", "warehouse", "branch", "code")):
+                score += 0.25
+            if distinct_cnt >= 100:
+                score += 0.10
+
+            candidates.append((score, col_name, distinct_cnt, non_null, ratio))
+
+        if not candidates:
+            continue
+
+        candidates.sort(reverse=True)
+        top = candidates[:2]
+        col_bits = ", ".join(
+            f'{col} (distinct={distinct_cnt}/{non_null}, ratio={ratio:.2f})'
+            for _, col, distinct_cnt, non_null, ratio in top
+        )
+        hints.append(f'  "{table}" -> {col_bits}')
+
+    return hints
+
+
+def _detect_uniqueness_profile(conn, tables: list[str]) -> tuple[list[str], list[str]]:
+    """
+    Build a uniqueness profile and safe grouping-key hints.
+
+    Returns:
+      - profile_lines: human-readable uniqueness lines per table
+      - grouping_lines: preferred display->key mapping for collision-safe grouping
+    """
+    profile_lines: list[str] = []
+    grouping_lines: list[str] = []
+
+    for table in tables:
+        try:
+            cols = [(c[0], c[1].upper()) for c in conn.execute(f'DESCRIBE "{table}"').fetchall()]
+        except Exception:
+            continue
+
+        if not cols:
+            continue
+
+        col_stats: dict[str, tuple[int, int, float]] = {}
+        unique_like: list[str] = []
+        label_non_unique: list[str] = []
+
+        for col_name, dtype in cols:
+            # Keep cardinality checks focused on text/numeric columns.
+            if not (_is_text_type(dtype) or _is_numeric_type(dtype)):
+                continue
+            if _looks_like_date_column(col_name):
+                continue
+
+            try:
+                non_null, distinct_cnt = conn.execute(
+                    f'''
+                    SELECT
+                        COUNT("{col_name}") AS non_null_count,
+                        COUNT(DISTINCT "{col_name}") AS distinct_count
+                    FROM "{table}"
+                    '''
+                ).fetchone()
+            except Exception:
+                continue
+
+            non_null = int(non_null or 0)
+            distinct_cnt = int(distinct_cnt or 0)
+            if non_null == 0:
+                continue
+
+            ratio = distinct_cnt / non_null
+            col_stats[col_name.lower()] = (distinct_cnt, non_null, ratio)
+
+            n = col_name.lower()
+            id_like = (
+                n == "id" or n.endswith("_id") or n.endswith("_uuid") or n.endswith("_key")
+                or "email" in n or "phone" in n or "mobile" in n or n.endswith("_code")
+            )
+            if distinct_cnt >= 2 and ratio >= 0.98 and id_like:
+                unique_like.append(col_name)
+
+            if (n == "name" or n.endswith("_name") or "title" in n) and distinct_cnt >= 2 and ratio < 0.98:
+                label_non_unique.append(f"{col_name} ({distinct_cnt}/{non_null}, ratio={ratio:.2f})")
+
+        if unique_like:
+            profile_lines.append(f'  "{table}" unique-like identifiers: {", ".join(unique_like[:6])}')
+        if label_non_unique:
+            profile_lines.append(f'  "{table}" non-unique labels: {", ".join(label_non_unique[:4])}')
+
+        # Build safe grouping map: <base>_name -> <base>_id/<base>_code when key is unique-like.
+        for raw_col, _ in cols:
+            c = raw_col.lower()
+            if c == "name" or c.endswith("_name"):
+                base = c[:-5] if c.endswith("_name") else c
+                key_candidates = [f"{base}_id", f"{base}_code", f"{base}_key", f"{base}_uuid", "id"]
+                chosen = None
+                for k in key_candidates:
+                    stats = col_stats.get(k)
+                    if not stats:
+                        continue
+                    _, non_null, ratio = stats
+                    if non_null >= 2 and ratio >= 0.98:
+                        chosen = k
+                        break
+                if chosen:
+                    grouping_lines.append(f'  "{table}": display "{c}" -> group by "{chosen}" + "{c}"')
+
+    return profile_lines, grouping_lines
+
 
 def _detect_business_rules(conn, tables: list[str]) -> list[str]:
     """
@@ -183,6 +384,95 @@ def _detect_date_columns(conn, tables: list[str]) -> list[str]:
     return hints
 
 
+def _build_schema_examples(conn, tables: list[str]) -> list[str]:
+    """
+    Build dynamic few-shot SQL examples using detected columns from the live schema.
+    The examples are generated from actual table/column names so they stay domain-agnostic.
+    """
+    metric_keywords = (
+        "final", "total", "amount", "revenue", "sales", "price",
+        "fare", "earning", "commission", "quantity", "count",
+    )
+    date_keywords = ("date", "time", "created", "updated", "at")
+
+    best: tuple[int, str, str, str, str] | None = None
+    # score, table, entity_col, metric_col, date_col
+
+    for table in tables:
+        try:
+            cols = [(c[0], c[1].upper()) for c in conn.execute(f'DESCRIBE "{table}"').fetchall()]
+        except Exception:
+            continue
+
+        entity_cols = [
+            c for c, t in cols
+            if _is_text_type(t) and _looks_like_entity_column(c)
+        ]
+        if not entity_cols:
+            continue
+
+        metric_cols = [
+            c for c, t in cols
+            if any(x in t for x in ("INT", "BIGINT", "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC"))
+            and not c.lower().endswith("_id")
+        ]
+        if not metric_cols:
+            continue
+
+        date_cols = [
+            c for c, t in cols
+            if (any(k in c.lower() for k in date_keywords) or any(x in t for x in ("DATE", "TIMESTAMP")))
+        ]
+        if not date_cols:
+            continue
+
+        entity_col = next((c for c in entity_cols if "name" in c.lower()), entity_cols[0])
+        metric_col = next(
+            (c for c in metric_cols if any(k in c.lower() for k in metric_keywords)),
+            metric_cols[0],
+        )
+        date_col = date_cols[0]
+
+        score = 0
+        if "name" in entity_col.lower():
+            score += 3
+        if any(k in metric_col.lower() for k in ("revenue", "sales", "amount", "final", "total", "price")):
+            score += 3
+        if "date" in date_col.lower():
+            score += 2
+        score += min(len(metric_cols), 3)
+
+        if best is None or score > best[0]:
+            best = (score, table, entity_col, metric_col, date_col)
+
+    if best is None:
+        return []
+
+    _, table, entity_col, metric_col, date_col = best
+
+    return [
+        f"  Example 1 (Top-N by metric):",
+        f'    User: "Top 10 {entity_col} by {metric_col} in a time range"',
+        f'    SQL:  SELECT "{entity_col}" AS name, SUM("{metric_col}") AS value',
+        f'          FROM "{table}"',
+        f'          WHERE CAST("{date_col}" AS DATE) >= ? AND CAST("{date_col}" AS DATE) < ?',
+        f'          GROUP BY 1 ORDER BY value DESC LIMIT ?',
+        "",
+        f"  Example 2 (Aggregate total):",
+        f'    User: "Total {metric_col} in a time range"',
+        f'    SQL:  SELECT SUM("{metric_col}") AS value',
+        f'          FROM "{table}"',
+        f'          WHERE CAST("{date_col}" AS DATE) >= ? AND CAST("{date_col}" AS DATE) < ?',
+        "",
+        f"  Example 3 (Monthly trend):",
+        f'    User: "Monthly trend of {metric_col}"',
+        f"""    SQL:  SELECT DATE_TRUNC('month', CAST("{date_col}" AS DATE)) AS name, SUM("{metric_col}") AS value""",
+        f'          FROM "{table}"',
+        f'          WHERE CAST("{date_col}" AS DATE) >= ? AND CAST("{date_col}" AS DATE) < ?',
+        "          GROUP BY 1 ORDER BY 1",
+    ]
+
+
 def _live_schema_prompt() -> str:
     conn = get_read_connection()
     try:
@@ -206,6 +496,32 @@ def _live_schema_prompt() -> str:
             col_s = ", ".join(f"{c[0]} {c[1]}" for c in cols)
             lines.append(f"{t:<14}: {col_s}")
 
+        entity_hints = _detect_entities(conn, tables)
+        lines += ["", "Detected Entities", "-----------------"]
+        lines += [
+            "Use these as preferred grouping dimensions for entity questions.",
+            "Map user terms like Drivers/Warehouses/Stores to the closest column below.",
+        ]
+        if entity_hints:
+            lines += entity_hints
+        else:
+            lines += ["  (No high-cardinality entity-like text columns detected from current data.)"]
+
+        uniqueness_lines, grouping_lines = _detect_uniqueness_profile(conn, tables)
+        lines += ["", "Uniqueness Profile", "------------------"]
+        if uniqueness_lines:
+            lines += uniqueness_lines
+        else:
+            lines += ["  (No uniqueness signals detected.)"]
+        lines += ["", "Safe Grouping Keys", "------------------"]
+        if grouping_lines:
+            lines += [
+                "When display labels are not unique, group by stable key + label to avoid merged entities.",
+            ]
+            lines += grouping_lines
+        else:
+            lines += ["  (No explicit display->key pairing detected.)"]
+
         # ── Auto-detected metric mappings ──────────────────────────────────────
         metric_hints = _detect_metric_columns(conn, tables)
         if metric_hints:
@@ -218,6 +534,19 @@ def _live_schema_prompt() -> str:
         if date_hints:
             lines += ["", "Date filter columns", "--------------------"]
             lines += date_hints
+
+        examples = _build_schema_examples(conn, tables)
+        lines += ["", "Schema-Grounded Examples", "------------------------"]
+        if examples:
+            lines += [
+                "Use these examples as patterns. Replace table/column names only when needed.",
+                "Keep aliases exactly as: name, value.",
+            ]
+            lines += examples
+        else:
+            lines += [
+                "  (No complete table profile found with entity + metric + date columns.)",
+            ]
 
         # ── Auto-detected business / validity filters ──────────────────────────
         biz_rules = _detect_business_rules(conn, tables)

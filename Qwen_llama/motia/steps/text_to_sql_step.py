@@ -298,10 +298,11 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
     if entity:
         groupby_rule = (
             f"10. GROUPING (CRITICAL):\n"
-            f"    GROUP BY {entity}\n"
-            f"    Only use additional identifier columns (like id/phone) "
-            f"IF explicitly required.\n"
-            f"    Do NOT assume phone/email is unique identifier.\n"
+            f"    Start with display column: {entity}\n"
+            f"    Then check the schema sections 'Uniqueness Profile' and 'Safe Grouping Keys'.\n"
+            f"    If {entity} is non-unique or has a mapped key, GROUP BY stable_key + {entity}\n"
+            f"    (for example customer_id + customer_name) to avoid merging distinct entities.\n"
+            f"    Do NOT assume any *_name column is unique.\n"
         )
     else:
         groupby_rule = (
@@ -382,6 +383,10 @@ STRICT RULES:
 1. Use the EXACT column names from the schema above.
 2. Alias the display column as "name" in SELECT.
 3. Alias the aggregation as "value".
+3b. Use schema uniqueness guidance:
+   - Read "Uniqueness Profile" and "Safe Grouping Keys" first.
+   - If entity label is non-unique, group using stable key + label.
+   - Never collapse different IDs into one row only because names match.
 4. DATE FILTER — CRITICAL:
    Use the EXCLUSIVE-RANGE pattern for datetime/timestamp columns:
        col >= ?  AND  col < ?
