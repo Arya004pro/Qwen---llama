@@ -164,6 +164,7 @@ Ranking : {ranking}
 
 Requirements
 ------------
+- Read the "Semantic Layer" section first to map business terms to physical columns.
 - Alias the group-by column as  name  and the aggregation as  value
 - Use ? placeholders for every date and numeric limit (never hard-code values)
 - Read "Uniqueness Profile" and "Safe Grouping Keys" from schema first.

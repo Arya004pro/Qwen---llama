@@ -7,6 +7,7 @@ revenue / count calculations.
 """
 
 from db.duckdb_connection import get_read_connection
+from db.semantic_layer import render_semantic_layer_lines
 
 _STATIC_FALLBACK = """
 Tables
@@ -549,6 +550,9 @@ def _live_schema_prompt() -> str:
             ]
 
         # ── Auto-detected business / validity filters ──────────────────────────
+
+        lines += [""]
+        lines += render_semantic_layer_lines(conn, tables)
         biz_rules = _detect_business_rules(conn, tables)
         if biz_rules:
             lines += [

@@ -1,4 +1,4 @@
-"""Step 6: Format Result — formats any result shape into text + chart.
+"""Step 6: Format Result  formats any result shape into text + chart.
 
 Changes vs original:
   - Added time_series result handling:
@@ -20,18 +20,6 @@ config = {
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::format.result")],
     "enqueues": [],
-}
-
-ENTITY_LABELS: dict[str, str] = {
-    "product_name": "products", "customer_name": "customers",
-    "city_name": "cities",      "category_name": "categories",
-    "state_name": "states",     "product": "products",
-    "customer": "customers",    "city": "cities",
-    "category": "categories",   "state": "states",
-    "driver_name": "drivers",   "pickup_city": "pickup cities",
-    "drop_city": "drop cities", "vehicle_type": "vehicle types",
-    "vehicle_model": "vehicle models", "payment_method": "payment methods",
-    "ride_type": "ride types",
 }
 
 _PALETTE = [
@@ -57,7 +45,7 @@ def _format_bucket_label(raw_label: str, bucket: str) -> str:
         abbr = _MONTH_ABBR.get(month, month)
         return f"{abbr} {year}"
     if bucket == "quarter" and "Q" in raw_label:
-        # e.g. "2024-Q1" stays as is — already readable
+        # e.g. "2024-Q1" stays as is  already readable
         return raw_label
     if bucket == "week":
         return raw_label.replace("-W", " W")
@@ -67,30 +55,27 @@ def _format_bucket_label(raw_label: str, bucket: str) -> str:
 def _infer_currency(metric: str, hint: str = "") -> str:
     m = (metric or "").lower()
     h = (hint or "").lower()
+    if any(x in m or x in h for x in ["inr", "rupee", "rs "]):
+        return "Rs "
     if any(x in m or x in h for x in ["usd", "dollar", "$"]):
         return "$"
     if any(x in m for x in ["fare", "earnings", "commission", "revenue",
                               "amount", "price", "total", "salary", "sales", "profit"]):
-        return "₹"
+        return ""
     if any(x in m for x in ["count", "quantity", "units", "distance", "duration", "rides"]):
         return ""
-    return "₹"
+    return ""
 
 
 def _metric_label(metric: str, currency: str) -> str:
-    mapping = {
-        "total_fare": "Total Fare", "driver_earnings": "Driver Earnings",
-        "platform_commission": "Platform Commission", "revenue": "Revenue",
-        "total_amount": "Total Amount", "quantity": "Quantity Sold",
-        "order_count": "Order Count", "count": "Count",
-        "avg_final_price": "Avg Order Value",
-        "avg_total_fare": "Avg Fare",
-        "avg_driver_earnings": "Avg Driver Earnings",
-        "avg_unit_price": "Avg Unit Price",
-        "final_price": "Revenue (Final Price)",
-        "distance_km": "Distance (km)", "duration_min": "Duration (min)",
-    }
-    label = mapping.get(metric, metric.replace("_", " ").title())
+    if not metric:
+        return "Value"
+    base = metric.strip().lower()
+    if base.startswith("avg_"):
+        core = base[4:].replace("_", " ").strip().title()
+        label = f"Average {core}" if core else "Average"
+    else:
+        label = metric.replace("_", " ").strip().title()
     if currency:
         return f"{label} ({currency})"
     return label
@@ -99,10 +84,8 @@ def _metric_label(metric: str, currency: str) -> str:
 def _entity_label(entity: str) -> str:
     if not entity:
         return ""
-    if entity in ENTITY_LABELS:
-        return ENTITY_LABELS[entity]
     base = entity
-    for suffix in ("_name", "_id", "_type", "_code"):
+    for suffix in ("_name", "_id", "_type", "_code", "_key"):
         if base.endswith(suffix):
             base = base[: -len(suffix)]
             break
@@ -113,8 +96,8 @@ def _entity_label(entity: str) -> str:
 
 
 def _tick_fn(metric: str, currency: str) -> str:
-    pfx = currency.replace("₹", "\\u20b9").replace("$", "\\u0024")
-    if currency in ("₹", "$"):
+    pfx = "Rs " if currency == "Rs " else currency.replace("$", "\\u0024")
+    if currency in ("Rs ", "$"):
         return (
             f"function(v){{"
             f"if(typeof v!=='number')return v;"
@@ -138,7 +121,7 @@ def _tick_fn(metric: str, currency: str) -> str:
 
 
 def _tooltip_fn(metric: str, currency: str) -> str:
-    pfx = currency.replace("₹", "\\u20b9").replace("$", "\\u0024")
+    pfx = "Rs " if currency == "Rs " else currency.replace("$", "\\u0024")
     if currency:
         return (
             f"function(c){{"
@@ -163,7 +146,7 @@ def _tooltip_fn(metric: str, currency: str) -> str:
 
 def _cmp_tooltip_fn(metric: str, currency: str) -> str:
     dec = "{minimumFractionDigits:2,maximumFractionDigits:2}" if currency else "{maximumFractionDigits:0}"
-    pfx = currency.replace("₹", "\\u20b9").replace("$", "\\u0024")
+    pfx = "Rs " if currency == "Rs " else currency.replace("$", "\\u0024")
     return (
         f"function(c){{"
         f"var v=c.raw;"
@@ -325,7 +308,7 @@ def _bar(labels, values, metric, currency, entity, title, subtitle):
 def _token_summary(usage, totals):
     if not usage and not totals:
         return ""
-    lines = ["\n\n─── Token Usage ───────────────────────────────"]
+    lines = ["\n\n Token Usage "]
     for e in usage:
         short = e.get("model", "").split("/")[-1]
         lines.append(
@@ -335,7 +318,7 @@ def _token_summary(usage, totals):
             f"total={e.get('total_tokens',0):>5}"
         )
     if totals:
-        lines.append("  " + "─" * 70)
+        lines.append("  " + "" * 70)
         lines.append(
             f"  {'TOTAL':<20} {'':28} "
             f"prompt={totals.get('prompt_tokens',0):>5}  "
@@ -347,7 +330,7 @@ def _token_summary(usage, totals):
 
 def _fmt_indian(v: Any, currency: str, decimals: int = 2) -> str:
     if v is None:
-        return "—"
+        return ""
     try:
         val = float(v)
     except Exception:
@@ -395,6 +378,46 @@ def _delta_str(v1, v2, currency):
     return f"{sign}{_fmt_indian(abs(delta), currency)} ({pct_s})"
 
 
+def _insights_time_series(labels: list[str], values: list[float], currency: str) -> list[str]:
+    if not labels or not values:
+        return []
+    insights: list[str] = []
+    first, last = values[0], values[-1]
+    if first:
+        pct = ((last - first) / first) * 100
+        dir_word = "up" if pct >= 0 else "down"
+        insights.append(f"Overall trend: {dir_word} {abs(pct):.1f}% from {labels[0]} to {labels[-1]}.")
+    peak_idx = max(range(len(values)), key=lambda i: values[i])
+    low_idx  = min(range(len(values)), key=lambda i: values[i])
+    insights.append(
+        f"Peak period: {labels[peak_idx]} ({_fmt_indian(values[peak_idx], currency)}), "
+        f"lowest: {labels[low_idx]} ({_fmt_indian(values[low_idx], currency)})."
+    )
+    total = sum(values)
+    if total > 0:
+        top3 = sorted(values, reverse=True)[:3]
+        share = (sum(top3) / total) * 100
+        insights.append(f"Top 3 periods contribute {share:.1f}% of total.")
+    return insights
+
+
+def _insights_ranked(items: list[dict], currency: str) -> list[str]:
+    if not items:
+        return []
+    raw_vals = [float(r.get("raw_value", 0) or 0) for r in items]
+    total = sum(raw_vals)
+    if total <= 0:
+        return []
+    top = raw_vals[0]
+    top_share = (top / total) * 100
+    top3_share = (sum(raw_vals[:3]) / total) * 100 if len(raw_vals) >= 3 else 100.0
+    insights = [
+        f"Top contributor share: {top_share:.1f}% of listed total.",
+        f"Top 3 concentration: {top3_share:.1f}% of listed total.",
+    ]
+    return insights
+
+
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     import datetime as _dt
 
@@ -433,14 +456,14 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     token_totals = (qs or {}).get("token_totals", {})
     chart_config = None
 
-    ctx.logger.info("📝 Formatting", {"queryId": query_id, "query_type": qt, "rows": len(results)})
+    ctx.logger.info(" Formatting", {"queryId": query_id, "query_type": qt, "rows": len(results)})
 
     has_delta  = results and "delta"  in results[0]
     has_value2 = results and "value2" in results[0] and not has_delta
     is_scalar  = results and len(results) == 1 and "name" not in results[0]
     is_empty   = not results or (is_scalar and results[0].get("value") is None)
 
-    # ── EMPTY ──────────────────────────────────────────────────────────────────
+    #  EMPTY 
     if is_empty:
         if qt == "time_series":
             text = (f"No {mlabel} data found {_period_phrase}. "
@@ -460,38 +483,58 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         formatted_text = text + _token_summary(token_usage, token_totals)
         items = []
 
-    # ── TIME SERIES (trend) ────────────────────────────────────────────────────
+    #  TIME SERIES (trend) 
     elif qt == "time_series":
         period_str = _period_phrase if _period_phrase else f"between {start_date} and {end_date}"
         _bucket_map = {
             "year": "Yearly", "month": "Monthly", "quarter": "Quarterly",
             "week": "Weekly", "day": "Daily",
         }
-        bucket_label = _bucket_map.get(bucket, bucket.capitalize()) 
-        header = f"📈 {bucket_label} {mlabel} trend {period_str}:\n"
-        header += f"\n  {'Period':<14}  {'Value':>16}"
-        header += f"\n  {'─'*14}  {'─'*16}"
+        bucket_label = _bucket_map.get(bucket, bucket.capitalize())
+        header = f"{bucket_label} {mlabel} trend {period_str}:"
 
         raw_labels = [r.get("name", "?") for r in results]
-        values     = [r.get("value", 0) or 0 for r in results]
-        # Human-readable labels
-        labels     = [_format_bucket_label(lbl, bucket) for lbl in raw_labels]
+        values = [r.get("value", 0) or 0 for r in results]
+        labels = [_format_bucket_label(lbl, bucket) for lbl in raw_labels]
 
         items = []
-        for i, (lbl, val) in enumerate(zip(labels, values)):
-            val_s = _fmt_indian(val, p)
-            header += f"\n  {lbl:<14}  {val_s:>16}"
-            items.append({"period": lbl, "value": val_s, "raw_value": val})
+        for lbl, val in zip(labels, values):
+            items.append({"period": lbl, "value": _fmt_indian(val, p), "raw_value": val})
 
-        # Add a summary row
+        lines = [header]
         if values:
-            total   = sum(values)
+            total = sum(values)
             average = total / len(values)
-            header += f"\n  {'─'*14}  {'─'*16}"
-            header += f"\n  {'Total':<14}  {_fmt_indian(total, p):>16}"
-            header += f"\n  {'Average':<14}  {_fmt_indian(average, p):>16}"
+            lines.append(f"Points: {len(values)}")
+            lines.append(f"Total: {_fmt_indian(total, p)}")
+            lines.append(f"Average: {_fmt_indian(average, p)}")
 
-        formatted_text = header + _token_summary(token_usage, token_totals)
+            # Keep text concise for long series; full detail should be chart-first.
+            if len(values) <= 24:
+                lines.append("")
+                lines.append(f"{'Period':<14}  {'Value':>16}")
+                lines.append(f"{'-' * 14}  {'-' * 16}")
+                for lbl, val in zip(labels, values):
+                    lines.append(f"{lbl:<14}  {_fmt_indian(val, p):>16}")
+            elif len(values) <= 48:
+                preview = min(3, len(values))
+                lines.append("")
+                lines.append("Preview (first and last points):")
+                for lbl, val in zip(labels[:preview], values[:preview]):
+                    lines.append(f"- {lbl}: {_fmt_indian(val, p)}")
+                lines.append("- ...")
+                for lbl, val in zip(labels[-preview:], values[-preview:]):
+                    lines.append(f"- {lbl}: {_fmt_indian(val, p)}")
+            else:
+                lines.append("")
+                lines.append("Detailed monthly values are shown in the chart/export table.")
+
+        insights = _insights_time_series(labels, values, p)
+        if insights:
+            lines.append("")
+            lines.append("Insights:")
+            lines.extend([f"- {x}" for x in insights])
+        formatted_text = "\n".join(lines) + _token_summary(token_usage, token_totals)
 
         if labels and values:
             chart_config = _make_line_chart(
@@ -501,7 +544,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 bucket,
             )
 
-    # ── AGGREGATE scalar ────────────────────────────────────────────────────────
+    #  AGGREGATE scalar 
     elif is_scalar:
         v = results[0]["value"]
         period_str = _period_phrase if _period_phrase else f"between {start_date} and {end_date}"
@@ -509,12 +552,12 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         formatted_text = f"Total {mlabel} {period_str} is {val_s}"
         items = [{"label": f"Total {mlabel}", "value": val_s}]
 
-    # ── GROWTH RANKING ──────────────────────────────────────────────────────────
+    #  GROWTH RANKING 
     elif has_delta:
         p1 = period_labels[0] if len(period_labels) > 0 else "Period 1"
         p2 = period_labels[1] if len(period_labels) > 1 else "Period 2"
         direction = "highest" if qt != "bottom_n" else "lowest"
-        header = f"📈 {elabel.title()} with {direction} {metric} growth ({p1} → {p2}):"
+        header = f" {elabel.title()} with {direction} {metric} growth ({p1}  {p2}):"
         items = []
         for i, row in enumerate(results, 1):
             name = row.get("name", "?")
@@ -527,24 +570,28 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                        f"\n   {p2}: {_fmt_indian(v2, p)}"
                        f"\n   Growth: {sign}{_fmt_indian(abs(d), p)} ({pct_s})")
             items.append({"rank": i, "name": name, "delta": d})
-        formatted_text = header + _token_summary(token_usage, token_totals)
+        insights = _insights_ranked(items, p)
+        insight_txt = ""
+        if insights:
+            insight_txt = "\n\nInsights:\n" + "\n".join(f"- {x}" for x in insights)
+        formatted_text = header + insight_txt + _token_summary(token_usage, token_totals)
         names  = [r.get("name", "?") for r in results]
         deltas = [r.get("delta", 0)   for r in results]
         chart_config = _bar(
             names, deltas, metric, currency, entity,
-            user_query or f"{elabel.title()} by {metric} growth: {p1}→{p2}",
-            f"Delta in {metric} ({p1} → {p2})",
+            user_query or f"{elabel.title()} by {metric} growth: {p1}{p2}",
+            f"Delta in {metric} ({p1}  {p2})",
         )
 
-    # ── COMPARISON ──────────────────────────────────────────────────────────────
+    #  COMPARISON 
     elif has_value2:
         p1 = period_labels[0] if len(period_labels) > 0 else "Period 1"
         p2 = period_labels[1] if len(period_labels) > 1 else "Period 2"
-        header = f"📊 Top {top_n} {elabel} by {metric}: {p1} vs {p2}"
+        header = f" Top {top_n} {elabel} by {metric}: {p1} vs {p2}"
         col_w  = max((len(r.get("name", "")) for r in results), default=20)
         col_w  = max(col_w, 20)
-        sep    = "─" * (col_w + 44)
-        hdr    = f"  {'#':>3}  {'Name':<{col_w}}  {p1:>16}  {p2:>16}  {'Δ Change':>14}"
+        sep    = "" * (col_w + 44)
+        hdr    = f"  {'#':>3}  {'Name':<{col_w}}  {p1:>16}  {p2:>16}  {' Change':>14}"
         lines  = [header, sep, hdr, sep]
         items  = []
         for i, row in enumerate(results, 1):
@@ -579,7 +626,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             "config":   cmp_cfg,
         }
 
-    # ── RANKED / THRESHOLD / INTERSECTION / ZERO_FILTER ────────────────────────
+    #  RANKED / THRESHOLD / INTERSECTION / ZERO_FILTER 
     else:
         names, values = [], []
         if qt == "zero_filter":
@@ -603,7 +650,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             elif qt == "intersection":
                 p1 = period_labels[0] if len(period_labels) > 0 else "Period 1"
                 p2 = period_labels[1] if len(period_labels) > 1 else "Period 2"
-                header = f"🔀 {elabel.title()} present in BOTH {p1} AND {p2} (combined {metric}):"
+                header = f" {elabel.title()} present in BOTH {p1} AND {p2} (combined {metric}):"
             else:
                 rl = "Top" if qt == "top_n" else "Bottom"
                 period_str = _period_phrase if _period_phrase else f"between {start_date} and {end_date}"
@@ -613,13 +660,17 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 name  = row.get("name", "?")
                 value = row.get("value", 0) or 0
                 val_s = _fmt_indian(value, p)
-                header += f"\n{i}. {name} — {val_s}"
+                header += f"\n{i}. {name}  {val_s}"
                 items.append({"rank": i, "name": name,
                               "value": val_s, "raw_value": value})
                 names.append(name)
                 values.append(value)
 
-        formatted_text = header + _token_summary(token_usage, token_totals)
+        insights = _insights_ranked(items, p) if items else []
+        insight_txt = ""
+        if insights:
+            insight_txt = "\n\nInsights:\n" + "\n".join(f"- {x}" for x in insights)
+        formatted_text = header + insight_txt + _token_summary(token_usage, token_totals)
         if names:
             rl = "Top" if qt != "bottom_n" else "Bottom"
             chart_config = _bar(
@@ -628,7 +679,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 f"{start_date} to {end_date}",
             )
 
-    ctx.logger.info("✅ Formatted", {"queryId": query_id})
+    ctx.logger.info(" Formatted", {"queryId": query_id})
     if qs:
         now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
         prev_ts = qs.get("status_timestamps", {})
@@ -644,4 +695,4 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             "updatedAt":      now_iso,
             "status_timestamps": {**prev_ts, "completed": now_iso},
         })
-    ctx.logger.info("🏁 Pipeline complete!", {"queryId": query_id})
+    ctx.logger.info(" Pipeline complete!", {"queryId": query_id})

@@ -281,6 +281,8 @@ CRITICAL RULES for time_series (ALL MUST BE FOLLOWED):
 def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
     entity   = parsed.get("entity")
     metric   = parsed.get("metric", "count")
+    entity_key = parsed.get("_entity_group_key")
+    count_key  = parsed.get("_count_distinct_key")
     qt       = parsed.get("query_type", "top_n")
     top_n    = parsed.get("top_n", 5)
     thr      = parsed.get("threshold") or {}
@@ -302,6 +304,7 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
             f"    Then check the schema sections 'Uniqueness Profile' and 'Safe Grouping Keys'.\n"
             f"    If {entity} is non-unique or has a mapped key, GROUP BY stable_key + {entity}\n"
             f"    (for example customer_id + customer_name) to avoid merging distinct entities.\n"
+            f"    Semantic suggestion key: {entity_key or 'N/A'}\n"
             f"    Do NOT assume any *_name column is unique.\n"
         )
     else:
@@ -380,6 +383,7 @@ Parsed intent:
   filters    : {filter_desc}{date_hints}
 
 STRICT RULES:
+0. Read the "Semantic Layer" section first, then map semantic terms to physical columns.
 1. Use the EXACT column names from the schema above.
 2. Alias the display column as "name" in SELECT.
 3. Alias the aggregation as "value".
@@ -398,7 +402,7 @@ STRICT RULES:
    NEVER use EXTRACT(YEAR ...) = ? or EXTRACT(MONTH ...) = ?
 5. Use ? for ALL date/number placeholders — never hard-code values.
 6. No semicolons. No comments. SELECT only.
-7. For "count" metric: use COUNT(*) AS value
+7. For "count" metric: prefer COUNT(DISTINCT {count_key or '<primary_order_id_column>'}) AS value
 8. For metric columns:
    - Default: SUM(column_name) AS value
    - If metric starts with "avg_" (e.g. avg_final_price, avg_total_fare):
@@ -444,6 +448,118 @@ def _registry_fallback(parsed: dict) -> str | None:
         return None
 
 
+
+def _deterministic_time_series_fallback(parsed: dict) -> str | None:
+    """
+    Build a robust time-series SQL without LLM.
+    Used when query_type=time_series and model generation fails.
+    """
+    metric = (parsed.get("metric") or "count").lower()
+    bucket = (parsed.get("time_bucket") or "month").lower()
+    filters = parsed.get("filters", {}) or {}
+    count_key_hint = parsed.get("_count_distinct_key")
+
+    try:
+        conn = get_read_connection()
+        table_rows = conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='main' AND table_type='BASE TABLE' ORDER BY table_name"
+        ).fetchall()
+        tables = [r[0] for r in table_rows]
+    except Exception:
+        return None
+
+    def _bucket_expr(date_col: str) -> str:
+        if bucket == "year":
+            return f"CAST(YEAR({date_col}) AS VARCHAR)"
+        if bucket == "quarter":
+            return f"CONCAT(CAST(YEAR({date_col}) AS VARCHAR), '-Q', CAST(QUARTER({date_col}) AS VARCHAR))"
+        if bucket == "week":
+            return f"STRFTIME({date_col}, '%Y-W%W')"
+        if bucket == "day":
+            return f"STRFTIME({date_col}, '%Y-%m-%d')"
+        return f"STRFTIME({date_col}, '%Y-%m')"
+
+    def _choose_plan() -> tuple[str, str, str] | None:
+        best = None  # (score, table, date_col, agg_expr)
+        for t in tables:
+            try:
+                cols = [(c[0], str(c[1]).upper()) for c in conn.execute(f'DESCRIBE "{t}"').fetchall()]
+            except Exception:
+                continue
+            col_names = [c[0].lower() for c in cols]
+            date_cols = [
+                c for c, typ in cols
+                if ("DATE" in typ or "TIMESTAMP" in typ or any(k in c.lower() for k in ("date", "time", "created", "updated", "at")))
+            ]
+            if not date_cols:
+                continue
+            date_col = next((c for c in date_cols if "date" in c.lower()), date_cols[0])
+
+            agg_expr = None
+            score = 0
+            if metric == "count":
+                count_key = count_key_hint
+                if not count_key or count_key.lower() not in col_names:
+                    count_key = next((c for c in col_names if any(k in c for k in ("order_id", "ride_id", "trip_id", "booking_id"))), None)
+                if count_key:
+                    agg_expr = f'COUNT(DISTINCT "{count_key}")'
+                    score += 6
+                else:
+                    agg_expr = "COUNT(*)"
+                    score += 2
+            elif metric.startswith("avg_"):
+                mcol = metric[4:]
+                if mcol in col_names:
+                    agg_expr = f'AVG("{mcol}")'
+                    score += 6
+            else:
+                if metric in col_names:
+                    agg_expr = f'SUM("{metric}")'
+                    score += 7
+                else:
+                    candidates = [c for c in col_names if any(k in c for k in ("final_price", "total_amount", "total_fare", "revenue", "sales", "earning", "amount"))]
+                    if candidates:
+                        chosen = candidates[0]
+                        agg_expr = f'SUM("{chosen}")'
+                        score += 4
+            if not agg_expr:
+                continue
+
+            if any(k in date_col.lower() for k in ("order_date", "created_at", "date")):
+                score += 2
+            if metric in col_names:
+                score += 2
+            if best is None or score > best[0]:
+                best = (score, t, date_col, agg_expr)
+        if best is None:
+            return None
+        return best[1], best[2], best[3]
+
+    try:
+        plan = _choose_plan()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if not plan:
+        return None
+
+    table, date_col, agg_expr = plan
+    b_expr = _bucket_expr(f'CAST("{date_col}" AS DATE)')
+    filter_clause = _render_filter_clause(filters)
+    where_extra = f"\n{filter_clause}" if filter_clause else ""
+
+    return (
+        f'SELECT {b_expr} AS name, {agg_expr} AS value\n'
+        f'FROM "{table}"\n'
+        f'WHERE CAST("{date_col}" AS DATE) >= ? AND CAST("{date_col}" AS DATE) < ?'
+        f'{where_extra}\n'
+        f'GROUP BY {b_expr}\n'
+        f'ORDER BY name ASC'
+    )
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     query_id   = input_data.get("queryId")
     user_query = input_data.get("query", "")
@@ -540,6 +656,14 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             fallback_used = True
             sql_source    = "registry_fallback"
             ctx.logger.warn("⚠️ Registry fallback used", {"queryId": query_id})
+
+    if generated_sql is None and qt == "time_series":
+        fb = _deterministic_time_series_fallback(parsed)
+        if fb:
+            generated_sql = fb
+            fallback_used = True
+            sql_source = "deterministic_time_series_fallback"
+            ctx.logger.warn("Deterministic time_series fallback used", {"queryId": query_id})
 
     if generated_sql is None:
         msg = (

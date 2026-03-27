@@ -28,6 +28,7 @@ for _p in [_STEPS_DIR, _MOTIA_DIR, _PROJECT_ROOT]:
 
 from motia import FlowContext, queue
 from db.duckdb_connection import run_query as _run_sql_raw, get_read_connection
+from db.query_validator import validate_query
 
 config = {
     "name": "ExecuteQuery",
@@ -461,6 +462,16 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
 
     params = _build_params(generated_sql, parsed)
     ctx.logger.info("SQL params", {"queryId": query_id, "params": str(params)})
+
+    # ── Validator layer: safety + schema checks before execution ─────────────
+    ok, errors, warnings = validate_query(generated_sql, params)
+    if warnings:
+        ctx.logger.warn("SQL validation warnings", {"queryId": query_id, "warnings": warnings})
+    if not ok:
+        qs = await ctx.state.get("queries", query_id)
+        msg = "SQL validation failed: " + " | ".join(errors)
+        await _error(ctx, qs, query_id, msg)
+        return
 
     try:
         rows    = _run_sql(generated_sql, params)

@@ -1,4 +1,4 @@
-"""streamlit_app.py — Sales Analytics Pipeline Dashboard
+"""streamlit_app.py  Sales Analytics Pipeline Dashboard
 
 Layout changes:
   - Data source (file upload) stays in left panel, top position.
@@ -13,6 +13,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import requests
 import time
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -32,12 +33,12 @@ SHARED_UPLOAD_DIR    = Path("Qwen_llama/motia/data/uploads")
 CONTAINER_UPLOAD_DIR = "/app/motia/data/uploads"
 
 STEPS = [
-    {"label": "Receive",      "sub": "REST entry point",    "icon": "⤵"},
-    {"label": "Parse intent", "sub": "Qwen 3-32B",          "icon": "◈"},
+    {"label": "Receive",      "sub": "REST entry point",    "icon": "R"},
+    {"label": "Parse intent", "sub": "Qwen 3-32B",          "icon": "P"},
     {"label": "Ambiguity",    "sub": "Clarification check", "icon": "?"},
-    {"label": "Text → SQL",   "sub": "Builder / LLaMA",     "icon": "{}"},
-    {"label": "Execute SQL",  "sub": "DuckDB",               "icon": "▶"},
-    {"label": "Format",       "sub": "Result + chart",      "icon": "✦"},
+    {"label": "Text to SQL",  "sub": "Builder / LLaMA",     "icon": "SQL"},
+    {"label": "Execute SQL",  "sub": "DuckDB",               "icon": "DB"},
+    {"label": "Format",       "sub": "Result + chart",      "icon": "F"},
 ]
 
 STATUS_MAP = {
@@ -97,7 +98,6 @@ def _on_enter():
 
 st.set_page_config(
     page_title="Sales Analytics Pipeline",
-    page_icon="📊",
     layout="wide",
 )
 
@@ -165,11 +165,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── PDF export ────────────────────────────────────────────────────────────────
+#  PDF export 
 
 def _safe_text(v) -> str:
     s = "" if v is None else str(v)
-    return s.replace("₹", "Rs ").replace("—", "-")
+    return s
 
 
 def _pretty_col(k: str) -> str:
@@ -224,19 +224,26 @@ def _build_pdf_chart(chart_config):
     from reportlab.lib import colors
     from reportlab.graphics.shapes import Drawing
     from reportlab.graphics.charts.barcharts import HorizontalBarChart
+    from reportlab.graphics.charts.linecharts import HorizontalLineChart
     max_label = max((len(str(x)) for x in labels), default=10)
     left_pad  = 120 if max_label <= 14 else min(210, 120 + (max_label - 14) * 4)
     chart_h   = max(180, min(380, 15 * len(labels) + 45))
     drawing   = Drawing(500, chart_h + 35)
-    chart     = HorizontalBarChart()
+    chart_type = str((cfg.get("type") or "")).lower()
+    is_line = ("line" in chart_type) or ("trend" in str((chart_config or {}).get("title", "")).lower())
+
+    chart = HorizontalLineChart() if is_line else HorizontalBarChart()
     chart.x   = left_pad
     chart.y   = 18
     chart.width  = 480 - left_pad
     chart.height = chart_h
     chart.data   = tuple(tuple(row) for row in series)
-    chart.categoryAxis.categoryNames = [
-        str(x) if len(str(x)) <= 28 else f"{str(x)[:25]}..." for x in labels
-    ]
+    display_labels = [str(x) if len(str(x)) <= 28 else f"{str(x)[:25]}..." for x in labels]
+    # Reduce axis clutter for long time series by showing only periodic ticks.
+    if len(display_labels) > 24:
+        step = max(2, len(display_labels) // 12)
+        display_labels = [lab if i % step == 0 else "" for i, lab in enumerate(display_labels)]
+    chart.categoryAxis.categoryNames = display_labels
     chart.categoryAxis.labels.boxAnchor  = "e"
     chart.categoryAxis.labels.fontSize   = 7 if len(labels) > 12 else 8
     chart.categoryAxis.labels.dx         = -6
@@ -245,19 +252,114 @@ def _build_pdf_chart(chart_config):
     chart.valueAxis.labels.fillColor     = colors.HexColor("#94a3b8")
     chart.valueAxis.strokeColor          = colors.HexColor("#334155")
     chart.categoryAxis.strokeColor       = colors.HexColor("#334155")
-    chart.groupSpacing  = 5
-    chart.barSpacing    = 2
-    chart.valueAxis.visibleGrid      = True
-    chart.valueAxis.gridStrokeColor  = colors.HexColor("#1f2937")
-    for i, ds in enumerate(datasets):
-        c = ds.get("backgroundColor")
-        if isinstance(c, list) and c:
-            c = c[0]
-        fill = _to_rl_color(c, colors.HexColor("#60a5fa"))
-        chart.bars[i].fillColor  = fill
-        chart.bars[i].strokeColor = fill
+    chart.valueAxis.visibleGrid = True
+    chart.valueAxis.gridStrokeColor = colors.HexColor("#1f2937")
+
+    if is_line:
+        chart.joinedLines = 1
+        for i, ds in enumerate(datasets):
+            c = ds.get("borderColor") or ds.get("backgroundColor")
+            if isinstance(c, list) and c:
+                c = c[0]
+            line_c = _to_rl_color(c, colors.HexColor("#60a5fa"))
+            chart.lines[i].strokeColor = line_c
+            chart.lines[i].strokeWidth = 1.7
+            # Keep tiny markers only when the series is short.
+            chart.lines[i].symbol = None if len(labels) > 36 else chart.lines[i].symbol
+    else:
+        chart.groupSpacing = 5
+        chart.barSpacing = 2
+        for i, ds in enumerate(datasets):
+            c = ds.get("backgroundColor")
+            if isinstance(c, list) and c:
+                c = c[0]
+            fill = _to_rl_color(c, colors.HexColor("#60a5fa"))
+            chart.bars[i].fillColor = fill
+            chart.bars[i].strokeColor = fill
     drawing.add(chart)
     return drawing
+
+
+def _build_pdf_chart_image(chart_config, max_width_pts):
+    if not chart_config:
+        return None
+    cfg = (chart_config.get("config") or {})
+    data = (cfg.get("data") or {})
+    labels = list(data.get("labels", []) or [])
+    datasets = list(data.get("datasets", []) or [])
+    if not labels or not datasets:
+        return None
+
+    try:
+        import matplotlib.pyplot as plt
+        from io import BytesIO
+        from reportlab.platypus import Image as RLImage
+    except Exception:
+        return None
+
+    series = []
+    names = []
+    colors = []
+    for ds in datasets:
+        vals = ds.get("data", []) or []
+        vals = [float(v) if v is not None else 0.0 for v in vals[: len(labels)]]
+        if len(vals) < len(labels):
+            vals += [0.0] * (len(labels) - len(vals))
+        series.append(vals)
+        names.append(str(ds.get("label") or "Series"))
+        c = ds.get("borderColor") or ds.get("backgroundColor") or "#60a5fa"
+        if isinstance(c, list):
+            c = c[0] if c else "#60a5fa"
+        colors.append(str(c))
+
+    chart_type = str((cfg.get("type") or "")).lower()
+    is_line = ("line" in chart_type) or ("trend" in str((chart_config or {}).get("title", "")).lower())
+
+    fig_w = max(6.4, min(8.8, float(max_width_pts) / 72.0))
+    fig_h = 3.8 if len(labels) <= 36 else 4.4
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=170)
+    fig.patch.set_facecolor("#020817")
+    ax.set_facecolor("#0b1220")
+
+    x = list(range(len(labels)))
+    if is_line:
+        for i, vals in enumerate(series):
+            ax.plot(
+                x,
+                vals,
+                color=colors[i % len(colors)],
+                linewidth=1.4,
+                marker="o" if len(labels) <= 36 else None,
+                markersize=2.6,
+                label=names[i],
+            )
+    else:
+        base = series[0]
+        ax.bar(x, base, color=colors[0], width=0.78, label=names[0])
+
+    tick_step = max(1, len(labels) // 12) if len(labels) > 12 else 1
+    tick_idx = x[::tick_step]
+    tick_lbl = [str(labels[i]) for i in tick_idx]
+    ax.set_xticks(tick_idx)
+    ax.set_xticklabels(tick_lbl, rotation=45, ha="right", fontsize=7, color="#94a3b8")
+    ax.tick_params(axis="y", labelsize=8, colors="#94a3b8")
+    ax.grid(axis="y", color="#1f2937", linewidth=0.7, alpha=0.85)
+    for spine in ax.spines.values():
+        spine.set_color("#334155")
+    if len(series) > 1:
+        leg = ax.legend(loc="upper left", fontsize=7, frameon=False)
+        for t in leg.get_texts():
+            t.set_color("#cbd5e1")
+
+    plt.tight_layout()
+    img_buf = BytesIO()
+    fig.savefig(img_buf, format="png", dpi=170, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    img_buf.seek(0)
+
+    width_pts = float(max_width_pts)
+    height_pts = width_pts * (fig_h / max(0.1, fig_w))
+    return RLImage(img_buf, width=width_pts, height=height_pts)
 
 
 def _is_number_like(value) -> bool:
@@ -285,8 +387,8 @@ def _build_export_pdf(state: dict, user_query: str) -> bytes:
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
     from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-        KeepTogether, HRFlowable, CondPageBreak,
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, LongTable,
+        KeepTogether, HRFlowable, CondPageBreak, ListFlowable, ListItem,
     )
 
     chart_config = state.get("chart_config")
@@ -294,7 +396,7 @@ def _build_export_pdf(state: dict, user_query: str) -> bytes:
     text_answer  = state.get("formattedText", "") or ""
     token_totals = state.get("token_totals", {}) or {}
     generated_at = datetime.now().strftime("%d %B %Y, %H:%M")
-    summary      = _safe_text(text_answer.split("─── Token Usage")[0].strip())
+    summary      = _safe_text(text_answer.split(" Token Usage")[0].strip())
     query        = _safe_text(user_query)
 
     styles  = getSampleStyleSheet()
@@ -319,21 +421,45 @@ def _build_export_pdf(state: dict, user_query: str) -> bytes:
     story.append(HRFlowable(width="100%", thickness=0.6, color=colors.HexColor("#1e293b")))
     story.append(Spacer(1, 10))
 
-    summary_html = "<br/>".join(escape(x) for x in summary.splitlines()) if summary else "-"
-    answer_card  = Table([[Paragraph(summary_html, body_s)]], colWidths=[doc.width])
-    answer_card.setStyle(TableStyle([
-        ("BACKGROUND",   (0,0),(-1,-1), colors.HexColor("#0b1220")),
-        ("BOX",          (0,0),(-1,-1), 0.6, colors.HexColor("#374151")),
-        ("LINEBEFORE",   (0,0),(0,-1),  2.0, colors.HexColor("#60a5fa")),
-        ("LEFTPADDING",  (0,0),(-1,-1), 10),
-        ("RIGHTPADDING", (0,0),(-1,-1), 10),
-        ("TOPPADDING",   (0,0),(-1,-1), 8),
-        ("BOTTOMPADDING",(0,0),(-1,-1), 8),
-    ]))
-    story.append(KeepTogether([Paragraph("Answer", h2_s), answer_card]))
+    summary_lines = summary.splitlines() if summary else ["-"]
+    # Collapse repeated blank lines to keep PDF narrative compact.
+    compact_lines = []
+    prev_blank = False
+    for ln in summary_lines:
+        ln = ln.rstrip()
+        blank = not ln.strip()
+        if blank and prev_blank:
+            continue
+        compact_lines.append(ln)
+        prev_blank = blank
+    summary_lines = compact_lines
+    summary_lower = summary.lower() if summary else ""
+    summary_looks_structured = (
+        ("period" in summary_lower and "value" in summary_lower and len(summary_lines) > 20) or
+        ("insights:" in summary_lower) or
+        (summary.count("\n") > 40 and (" - " in summary or "\n- " in summary))
+    )
+    # Avoid ReportLab LayoutError for very long single-cell answer tables.
+    if len(summary_lines) > 80:
+        summary_lines = summary_lines[:80] + [
+            "",
+            f"... output truncated in PDF ({len(summary.splitlines()) - 80} more lines).",
+        ]
+    if summary_looks_structured and items:
+        summary_lines = summary_lines[:6] + ["", "Detailed rows moved to chart/table to avoid repetition in PDF."]
+    story.append(Paragraph("Answer", h2_s))
+    bullets = [ln.strip()[2:].strip() for ln in summary_lines if ln.strip().startswith("- ")]
+    body_lines = [ln for ln in summary_lines if ln.strip() and not ln.strip().startswith("- ")]
+    summary_html = "<br/>".join(escape(x) for x in body_lines) if body_lines else "-"
+    story.append(Paragraph(summary_html, body_s))
+    if bullets:
+        bullet_items = [ListItem(Paragraph(escape(b), body_s), leftIndent=10) for b in bullets]
+        story.append(Spacer(1, 4))
+        story.append(ListFlowable(bullet_items, bulletType="bullet", leftIndent=12))
     story.append(Spacer(1, 8))
 
-    chart = _build_pdf_chart(chart_config)
+    chart_img = _build_pdf_chart_image(chart_config, doc.width)
+    chart = chart_img or _build_pdf_chart(chart_config)
     if chart is not None:
         chart_title = (chart_config or {}).get("title")
         chart_nodes = [Paragraph("Chart", h2_s)]
@@ -344,11 +470,35 @@ def _build_export_pdf(state: dict, user_query: str) -> bytes:
         story.append(KeepTogether(chart_nodes))
         story.append(Spacer(1, 10))
 
-    if items:
+    include_table = bool(items)
+    cfg = (chart_config or {}).get("config", {}) or {}
+    chart_type = str(cfg.get("type", "")).lower()
+    is_time_series_pdf = (
+        ("line" in chart_type)
+        or ("trend" in str((chart_config or {}).get("title", "")).lower())
+        or (items and "period" in items[0] and "value" in items[0])
+    )
+    if summary_looks_structured and items:
+        # Keep table for time-series so exact values are available after the chart.
+        if is_time_series_pdf:
+            include_table = len(items) <= 500
+        else:
+            include_table = len(items) <= 25
+
+    if include_table:
         skip_keys = {"raw_value", "raw_delta"}
         cols = [k for k in items[0].keys() if k not in skip_keys]
+        # Keep PDF tables readable for very large result sets.
+        table_items = items
+        trimmed_note = None
+        if len(items) > 240:
+            head = items[:120]
+            tail = items[-120:]
+            table_items = head + tail
+            trimmed_note = f"Showing first 120 and last 120 rows out of {len(items)} rows."
+
         table_data = [[_pretty_col(c) for c in cols]]
-        for row in items:
+        for row in table_items:
             table_data.append([_safe_text(row.get(c, "")) for c in cols])
 
         avail_w = doc.width
@@ -359,7 +509,7 @@ def _build_export_pdf(state: dict, user_query: str) -> bytes:
             rest_w    = (avail_w - first_w) / (len(cols) - 1)
             col_widths = [first_w] + [rest_w] * (len(cols) - 1)
 
-        tbl = Table(table_data, repeatRows=1, hAlign="LEFT", colWidths=col_widths)
+        tbl = LongTable(table_data, repeatRows=1, hAlign="LEFT", colWidths=col_widths)
         align_cmds = [("ALIGN", (0,0),(-1,0),"LEFT"), ("ALIGN", (0,1),(0,-1),"LEFT")]
         for ci, col_name in enumerate(cols[1:], start=1):
             numeric_col = ("rank" in col_name.lower()) or all(
@@ -387,12 +537,15 @@ def _build_export_pdf(state: dict, user_query: str) -> bytes:
         ] + align_cmds))
         story.append(CondPageBreak(1.6 * inch))
         story.append(Paragraph("Data Table", h2_s))
+        if trimmed_note:
+            story.append(Paragraph(escape(trimmed_note), meta_s))
+            story.append(Spacer(1, 3))
         story.append(tbl)
         story.append(Spacer(1, 8))
 
     if token_totals.get("total_tokens"):
         token_txt = (
-            f"Token usage — prompt: {token_totals.get('prompt_tokens', 0)} | "
+            f"Token usage - prompt: {token_totals.get('prompt_tokens', 0)} | "
             f"completion: {token_totals.get('completion_tokens', 0)} | "
             f"total: {token_totals.get('total_tokens', 0)}"
         )
@@ -412,7 +565,7 @@ def _build_export_pdf(state: dict, user_query: str) -> bytes:
     return buf.getvalue()
 
 
-# ── API helpers ───────────────────────────────────────────────────────────────
+#  API helpers 
 
 def api_ok():
     try:
@@ -551,9 +704,9 @@ def render_steps(completed_idx, is_error, step_times):
     parts = []
     for i, s in enumerate(STEPS):
         if is_error and i == completed_idx:
-            cls, icon = "error", "✕"
+            cls, icon = "error", ""
         elif i <= completed_idx:
-            cls, icon = "done", "✓"
+            cls, icon = "done", ""
         elif i == completed_idx + 1:
             cls, icon = "active", s["icon"]
         else:
@@ -564,7 +717,7 @@ def render_steps(completed_idx, is_error, step_times):
             t_label   = f"{t:.2f}s" if t < 1 else f"{t:.1f}s"
             time_html = f'<div class="step-time">{t_label}</div>'
         elif cls == "active":
-            time_html = '<div class="step-time">…</div>'
+            time_html = '<div class="step-time"></div>'
         else:
             time_html = '<div class="step-time"></div>'
 
@@ -596,7 +749,7 @@ def render_tokens(usage, totals):
 
 
 def render_schema_section():
-    """Render the schema viewer — called at the bottom of the page."""
+    """Render the schema viewer  called at the bottom of the page."""
     schema_data = fetch_schema()
     if not schema_data or not schema_data.get("tables"):
         st.caption("No data loaded yet.")
@@ -615,7 +768,7 @@ def render_schema_section():
         cols  = tbl.get("columns", [])
         target = col_a if i % 2 == 0 else col_b
         with target:
-            with st.expander(f"📋 {tname}  ({len(cols)} columns)", expanded=False):
+            with st.expander(f" {tname}  ({len(cols)} columns)", expanded=False):
                 if cols:
                     st.dataframe(
                         [{"Column": c["name"], "Type": c["type"]} for c in cols],
@@ -625,27 +778,27 @@ def render_schema_section():
                     st.caption("No column info available.")
 
     if rels:
-        with st.expander(f"🔗 Relationships detected ({len(rels)})", expanded=False):
+        with st.expander(f" Relationships detected ({len(rels)})", expanded=False):
             for r in rels:
-                badge = "🟢" if r.get("confidence") == "HIGH" else "🟡"
+                badge = "" if r.get("confidence") == "HIGH" else ""
                 st.markdown(
                     f"{badge} `{r.get('from_table')}.{r.get('from_column')}` "
-                    f"→ `{r.get('to_table')}.{r.get('to_column')}`  "
+                    f" `{r.get('to_table')}.{r.get('to_column')}`  "
                     f"*({r.get('type', 'FK')})*"
                 )
 
-    if st.button("↻ Refresh schema", key="refresh_schema_bottom", type="secondary"):
+    if st.button("Refresh schema", key="refresh_schema_bottom", type="secondary"):
         st.rerun()
 
 
-# ── Page layout ───────────────────────────────────────────────────────────────
+#  Page layout 
 
-st.markdown("## 📊 Sales Analytics — Live Pipeline")
+st.markdown("## Sales Analytics - Live Pipeline")
 
 if api_ok():
-    st.success("Motia API connected (localhost:3121)", icon="🟢")
+    st.success("Motia API connected (localhost:3121)")
 else:
-    st.error("Motia API not reachable — run `npm run dev` first", icon="🔴")
+    st.error("Motia API not reachable - run `npm run dev` first")
     st.stop()
 
 st.divider()
@@ -653,7 +806,7 @@ st.divider()
 left, right = st.columns([3, 2], gap="large")
 
 with left:
-    # ── Pipeline steps ────────────────────────────────────────────────────────
+    #  Pipeline steps 
     st.markdown('<div class="section-lbl">Pipeline steps</div>', unsafe_allow_html=True)
     steps_placeholder = st.empty()
     with steps_placeholder.container():
@@ -661,7 +814,7 @@ with left:
 
     st.divider()
 
-    # ── Data source (file upload) — stays here ─────────────────────────────────
+    #  Data source (file upload)  stays here 
     st.markdown('<div class="section-lbl">Data source</div>', unsafe_allow_html=True)
     with st.expander("Upload dataset files (CSV / JSON / Parquet)", expanded=False):
         upload_files = st.file_uploader(
@@ -680,19 +833,19 @@ with left:
                     try:
                         result = ingest_uploaded_files(upload_files, reset_db=reset_db)
                         tnames = ", ".join(result.get("tables_created", []))
-                        st.success(f"✅ Ingested: {tnames}" if tnames else "Ingestion completed.")
+                        st.success(f" Ingested: {tnames}" if tnames else "Ingestion completed.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Ingestion failed: {e}")
 
     st.divider()
 
-    # ── Query input ───────────────────────────────────────────────────────────
+    #  Query input 
     st.markdown('<div class="section-lbl">Ask a question</div>', unsafe_allow_html=True)
 
     query_input = st.text_input(
         "query", label_visibility="collapsed",
-        placeholder="e.g. Top 5 drivers by earnings in 2024",
+        placeholder="e.g. Top 5 entities by total value in last year",
         disabled=st.session_state.polling,
         on_change=_on_enter,
         key="query_input_field",
@@ -713,32 +866,32 @@ with right:
     st.markdown('<div class="section-lbl">Token usage</div>', unsafe_allow_html=True)
     token_placeholder = st.empty()
     with token_placeholder.container():
-        st.caption("No data yet — submit a query to begin.")
+        st.caption("No data yet  submit a query to begin.")
 
     st.divider()
     st.markdown('<div class="section-lbl">Generated SQL</div>', unsafe_allow_html=True)
     sql_placeholder = st.empty()
     with sql_placeholder.container():
-        st.markdown('<div class="sql-box">Waiting for SQL generation…</div>',
+        st.markdown('<div class="sql-box">Waiting for SQL generation</div>',
                     unsafe_allow_html=True)
 
-# ── History (above schema) ─────────────────────────────────────────────────────
+#  History (above schema) 
 if st.session_state.history:
-    with st.expander(f"History — {len(st.session_state.history)} queries", expanded=False):
+    with st.expander(f"History  {len(st.session_state.history)} queries", expanded=False):
         for item in reversed(st.session_state.history):
             st.markdown(f"""
             <div class="hist-item">
-                <div class="hist-q">🔹 {item['query']}</div>
-                <div class="hist-a">{item['result'][:300]}{'…' if len(item['result'])>300 else ''}</div>
+                <div class="hist-q"> {item['query']}</div>
+                <div class="hist-a">{item['result'][:300]}{'' if len(item['result'])>300 else ''}</div>
             </div>""", unsafe_allow_html=True)
 
-# ── Schema section — MOVED TO BOTTOM ──────────────────────────────────────────
+#  Schema section  MOVED TO BOTTOM 
 st.divider()
 st.markdown('<div class="section-lbl">Loaded dataset schema</div>', unsafe_allow_html=True)
 render_schema_section()
 
 
-# ── Polling / final state ─────────────────────────────────────────────────────
+#  Polling / final state 
 state = None
 if st.session_state.polling and st.session_state.query_id:
     try:
@@ -767,9 +920,9 @@ if state:
     if st.session_state.polling:
         status_placeholder.caption(f"Status: `{status}`")
     elif is_error:
-        status_placeholder.caption("Pipeline error — check Motia logs")
+        status_placeholder.caption("Pipeline error  check Motia logs")
     else:
-        status_placeholder.caption("Done ✓ — ask another question")
+        status_placeholder.caption("Done   ask another question")
 
     if state.get("generated_sql"):
         with sql_placeholder.container():
@@ -780,7 +933,7 @@ if state:
         with token_placeholder.container():
             render_tokens(state.get("token_usage"), state.get("token_totals"))
 
-    # ── Terminal states ───────────────────────────────────────────────────────
+    #  Terminal states 
     if status == "needs_clarification":
         if st.session_state.polling:
             st.session_state.polling         = False
@@ -790,7 +943,7 @@ if state:
 
         q = state.get("clarification", "Please clarify your query.")
         with clarify_placeholder.container():
-            st.markdown(f'<div class="clarify-box">💬 {q}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="clarify-box"> {q}</div>', unsafe_allow_html=True)
             answer = st.text_input("Your answer",
                                    key=f"clarify_{st.session_state.query_id}",
                                    placeholder="Type your answer and press Enter")
@@ -824,7 +977,7 @@ if state:
 
             if state.get("chart_config"):
                 st.markdown("<br>", unsafe_allow_html=True)
-                with st.expander("📈 Interactive chart", expanded=True):
+                with st.expander("Interactive chart", expanded=True):
                     chart_html = fetch_chart_html(st.session_state.query_id)
                     components.html(chart_html, height=520, scrolling=False)
 
@@ -846,6 +999,23 @@ if state:
                 )
             except ImportError:
                 st.error("PDF export requires `reportlab`. Run: pip install reportlab")
+            except Exception as e:
+                st.warning(f"PDF export failed, using TXT fallback. ({e})")
+                fallback_payload = {
+                    "query": last_query,
+                    "generated_at": datetime.now().isoformat(),
+                    "formatted_text": state.get("formattedText", ""),
+                    "formatted_items": state.get("formattedItems", []),
+                    "generated_sql": state.get("generated_sql", ""),
+                    "token_totals": state.get("token_totals", {}),
+                }
+                st.download_button(
+                    label="Download TXT (fallback)",
+                    data=json.dumps(fallback_payload, ensure_ascii=False, indent=2),
+                    file_name=f"{safe_name}_{datetime.now().strftime('%Y-%m-%d')}.txt",
+                    mime="text/plain",
+                    use_container_width=False,
+                )
 
     elif status == "error":
         if st.session_state.polling:
@@ -856,7 +1026,7 @@ if state:
         err = state.get("error", "Unknown error.")
         with result_placeholder.container():
             st.markdown('<div class="section-lbl">Result</div>', unsafe_allow_html=True)
-            st.markdown(f'<div class="result-box result-error">⚠ {err}</div>',
+            st.markdown(f'<div class="result-box result-error"> {err}</div>',
                         unsafe_allow_html=True)
 
     else:

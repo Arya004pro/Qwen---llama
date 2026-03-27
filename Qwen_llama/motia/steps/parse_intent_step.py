@@ -31,8 +31,10 @@ import requests
 from motia import FlowContext, queue
 from shared_config import GROQ_API_TOKEN, QWEN_MODEL, GROQ_URL
 from utils.token_logger import log_tokens, add_tokens_to_state
+from utils.time_parser import parse_time_ranges_from_query
 from db.schema_context import get_schema_prompt
 from db.duckdb_connection import get_read_connection
+from db.semantic_layer import resolve_intent_with_semantic_layer
 
 config = {
     "name": "ParseIntent",
@@ -58,7 +60,7 @@ Your job: extract the user's query intent and return ONLY valid JSON — no pros
 JSON schema (all fields required):
 {{
   "entity":       string or null,
-  "metric":       string (the EXACT column name to aggregate, or "count" for row counts),
+  "metric":       string (semantic metric or physical column; resolver will map to real column),
   "query_type":   one of [top_n, bottom_n, aggregate, threshold, comparison, growth_ranking, intersection, zero_filter, time_series],
   "time_bucket":  one of [month, week, quarter, day] or null  (ONLY for time_series queries),
   "top_n":        integer (default 5; use 1 for "highest/best/worst/which single entity"),
@@ -68,6 +70,14 @@ JSON schema (all fields required):
   "is_complete":  true or false,
   "clarification_question": null or a single short question string
 }}
+
+SEMANTIC LAYER RULES (FOUNDATION):
+- The schema includes a Semantic Layer section with:
+    - Dimensions (business name -> physical label/key columns)
+    - Metrics (business metric -> SQL aggregation on physical columns)
+- Prefer semantic business terms first (e.g. "revenue", "customers", "warehouses").
+- You may output semantic entity/metric names; post-processing will resolve them.
+- If both semantic and physical names are available, prefer semantic meaning that best matches user intent.
 
 TIME SERIES RULES (CRITICAL):
 - Use query_type=time_series when the user asks for a TREND or TIME-BUCKETED breakdown:
@@ -145,6 +155,8 @@ TIME RANGES:
 - Year-only (e.g. "in 2024"): start=2024-01-01, end=2024-12-31
 - Quarter (e.g. "Q1 2024"):   start=2024-01-01, end=2024-03-31
 - Month (e.g. "March 2024"):  start=2024-03-01, end=2024-03-31
+- Relative periods supported: "this month", "last month", "this year", "last year", "last 30 days"
+- YoY queries ("yoy", "year over year", "year-on-year") should produce two time ranges.
 
 clarification_question: ask ONLY the single most critical missing field.
 For aggregate and time_series queries, NEVER ask about entity.
@@ -161,6 +173,9 @@ _TREND_KEYWORDS = {
     "revenue trend", "fare trend", "earnings trend", "how did", "how has",
     "yearly", "year-wise", "per year", "annual", "annually", "by year",
     "year over year", "yoy", "each year", "every year", "year-on-year",
+}
+_ALL_TIME_YEARLY_HINTS = {
+    "each year", "every year", "yearly", "annual", "annually", "by year", "per year"
 }
 
 # ── Auto-detect mandatory filters from live schema ────────────────────────────
@@ -194,6 +209,60 @@ def _get_mandatory_filters() -> dict:
     except Exception:
         pass
     return mandatory
+
+
+def _looks_like_all_time_trend(query: str) -> bool:
+    q = (query or "").lower()
+    return any(k in q for k in _ALL_TIME_YEARLY_HINTS)
+
+
+def _infer_dataset_time_range() -> list[dict]:
+    """
+    Infer a default time range from dataset min/max date values.
+    Used for trend queries like 'monthly revenue trend for each year'.
+    """
+    try:
+        conn = get_read_connection()
+        rows = conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='main' ORDER BY table_name"
+        ).fetchall()
+        best = None  # (start_date, end_date)
+        for (table,) in rows:
+            cols = conn.execute(f'DESCRIBE "{table}"').fetchall()
+            for c in cols:
+                col = c[0]
+                typ = str(c[1]).upper()
+                low = col.lower()
+                if not (
+                    "DATE" in typ or "TIMESTAMP" in typ or
+                    any(k in low for k in ("date", "time", "created", "updated", "at"))
+                ):
+                    continue
+                try:
+                    r = conn.execute(
+                        f'SELECT MIN(CAST("{col}" AS DATE)), MAX(CAST("{col}" AS DATE)) '
+                        f'FROM "{table}" WHERE "{col}" IS NOT NULL'
+                    ).fetchone()
+                    if not r or not r[0] or not r[1]:
+                        continue
+                    s, e = r[0], r[1]
+                    if best is None or (s < best[0] or e > best[1]):
+                        best = (s, e)
+                except Exception:
+                    continue
+        conn.close()
+        if best:
+            s, e = best
+            label = (
+                f"All data ({s.year})"
+                if s.year == e.year
+                else f"All data ({s.year}-{e.year})"
+            )
+            return [{"start": s.isoformat(), "end": e.isoformat(), "label": label}]
+    except Exception:
+        pass
+    return []
 
 
 def _extract_json_object(text: str) -> str:
@@ -232,12 +301,10 @@ def _default_clarification(parsed: dict) -> str:
 
 def _detect_time_bucket(query: str) -> str:
     q = query.lower()
-    # Year bucket — check FIRST before "per" could match "per month"
-    if any(x in q for x in ["per year", "by year", "each year", "yearly",
-                              "year-wise", "annual", "annually",
-                              "year over year", "yoy", "every year",
-                              "year-on-year", "per annum"]):
-        return "year"
+    # Prefer finer granularity if explicitly requested.
+    # Example: "monthly revenue trend for each year" should stay monthly, not yearly.
+    if any(x in q for x in ["month", "monthly", "month-wise", "by month", "per month"]):
+        return "month"
     if any(x in q for x in ["quarter", "q1", "q2", "q3", "q4", "quarterly",
                               "per quarter", "quarter-wise"]):
         return "quarter"
@@ -245,8 +312,12 @@ def _detect_time_bucket(query: str) -> str:
         return "week"
     if any(x in q for x in ["day", "daily", "day-wise", "per day"]):
         return "day"
+    if any(x in q for x in ["per year", "by year", "each year", "yearly",
+                              "year-wise", "annual", "annually",
+                              "year over year", "yoy", "every year",
+                              "year-on-year", "per annum"]):
+        return "year"
     return "month"
-
 
 def _is_trend_query(query: str) -> bool:
     q = query.lower()
@@ -330,44 +401,9 @@ def _fallback_parse(user_query: str) -> dict:
     return parsed
 
 
-_YEAR_RE    = re.compile(r"\b(20\d{2})\b")
-_QUARTER_RE = re.compile(r"\bQ([1-4])\s+(20\d{2})\b", re.IGNORECASE)
-_MONTH_RE   = re.compile(
-    r"\b(January|February|March|April|May|June|July|August|"
-    r"September|October|November|December)\s+(20\d{2})\b",
-    re.IGNORECASE,
-)
-_MONTH_MAP = {
-    m.lower(): i for i, m in enumerate(
-        ["january","february","march","april","may","june",
-         "july","august","september","october","november","december"], 1
-    )
-}
-_QUARTER_MONTHS = {1: (1, 3), 2: (4, 6), 3: (7, 9), 4: (10, 12)}
-
-
 def _extract_time_ranges_from_text(text: str) -> list[dict]:
-    m = _MONTH_RE.search(text)
-    if m:
-        month_name, year = m.group(1).lower(), int(m.group(2))
-        mo = _MONTH_MAP[month_name]
-        last_day = calendar.monthrange(year, mo)[1]
-        return [{"start": f"{year}-{mo:02d}-01",
-                 "end":   f"{year}-{mo:02d}-{last_day:02d}",
-                 "label": f"{m.group(1)} {year}"}]
-    q = _QUARTER_RE.search(text)
-    if q:
-        qnum, year = int(q.group(1)), int(q.group(2))
-        sm, em = _QUARTER_MONTHS[qnum]
-        last_day = calendar.monthrange(year, em)[1]
-        return [{"start": f"{year}-{sm:02d}-01",
-                 "end":   f"{year}-{em:02d}-{last_day:02d}",
-                 "label": f"Q{qnum} {year}"}]
-    y = _YEAR_RE.search(text)
-    if y:
-        year = int(y.group(1))
-        return [{"start": f"{year}-01-01", "end": f"{year}-12-31", "label": str(year)}]
-    return []
+    ranges, _ = parse_time_ranges_from_query(text)
+    return ranges
 
 
 def _post_process(parsed: dict, user_query: str = "",
@@ -392,15 +428,27 @@ def _post_process(parsed: dict, user_query: str = "",
 
     # ── Extract missing time ranges from raw text ─────────────────────────────
     if not tr and user_query:
-        extracted = _extract_time_ranges_from_text(user_query)
+        extracted, suggested_qt = parse_time_ranges_from_query(user_query)
         if extracted:
             parsed["time_ranges"] = extracted
             tr = extracted
+            if (suggested_qt == "comparison" and
+                    parsed.get("query_type") not in ("comparison", "growth_ranking", "intersection")):
+                parsed["query_type"] = "comparison"
+                qt = "comparison"
+        elif qt == "time_series" and _looks_like_all_time_trend(user_query):
+            inferred = _infer_dataset_time_range()
+            if inferred:
+                parsed["time_ranges"] = inferred
+                tr = inferred
 
     # ── Guard: swap ID columns → name columns ─────────────────────────────────
     entity = parsed.get("entity", "") or ""
     if entity.endswith("_id"):
         parsed["entity"] = entity[:-3] + "_name"
+
+    # Resolve semantic aliases to concrete schema columns.
+    parsed = resolve_intent_with_semantic_layer(parsed, user_query)
 
     # ── Inject mandatory business filters ─────────────────────────────────────
     if mandatory_filters:
@@ -412,6 +460,10 @@ def _post_process(parsed: dict, user_query: str = "",
 
     # ── Completeness guards ───────────────────────────────────────────────────
     if qt in ("aggregate", "time_series") and m and tr:
+        parsed["is_complete"]            = True
+        parsed["clarification_question"] = None
+
+    if qt == "comparison" and m and len(tr) >= 2:
         parsed["is_complete"]            = True
         parsed["clarification_question"] = None
 
