@@ -72,6 +72,8 @@ for key, default in {
     "step_times":      {},
     "poll_start":      None,
     "last_completed":  -1,
+    "bookmarks":       [],       # list of {query_id, query, text, timestamp}
+    "bm_loaded":       False,    # have we loaded bookmarks from localStorage yet?
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -161,6 +163,19 @@ st.markdown("""
     background:#1a1d27; border:1px solid #2d3148; border-radius:10px;
     padding:16px 18px; margin-top:8px;
 }
+/* bookmarks */
+.bm-item {
+    background:#1a1d27; border:1px solid #2d3148; border-radius:8px;
+    padding:12px 14px; margin-bottom:8px;
+}
+.bm-query { font-size:12px; font-weight:600; color:#818cf8; margin-bottom:5px;
+            white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.bm-text  { font-size:12px; color:#e2e8f0; line-height:1.6; white-space:pre-wrap;
+            max-height:80px; overflow:hidden; }
+.bm-ts    { font-size:10px; color:#475569; margin-top:5px; }
+.bm-count { display:inline-block; background:rgba(245,158,11,.18); color:#f59e0b;
+            border:1px solid rgba(245,158,11,.35); border-radius:10px;
+            font-size:10px; font-weight:700; padding:1px 8px; margin-left:6px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -876,10 +891,194 @@ with right:
         st.markdown('<div class="sql-box">Waiting for SQL generation</div>',
                     unsafe_allow_html=True)
 
+# ── Bookmark localStorage bridge (hidden) ─────────────────────────
+BM_JS = """
+<script>
+(function() {
+  const KEY = 'sales_analytics_bookmarks';
+  // Send stored bookmarks to Streamlit once via a hidden input trick.
+  // We store them in sessionStorage so the Streamlit component rerenders trigger a check.
+  const stored = localStorage.getItem(KEY);
+  const bms = stored ? JSON.parse(stored) : [];
+  // Write to a hidden textarea that Streamlit can read via query params
+  // Alternative: use window.postMessage hack — here we inject as a div text for scraping
+  const tag = document.getElementById('bm-data-bridge');
+  if (tag) tag.textContent = JSON.stringify(bms);
+
+  window._bmSave = function(bms) {
+    localStorage.setItem(KEY, JSON.stringify(bms));
+  };
+  window._bmLoad = function() {
+    const s = localStorage.getItem(KEY);
+    return s ? JSON.parse(s) : [];
+  };
+})();
+</script>
+<div id="bm-data-bridge" style="display:none"></div>
+"""
+
+def _bm_ls_read_component():
+    """Inject JS that reads localStorage and stores result in a hidden element.
+       We use st.components to get bidirectional data via Streamlit component value."""
+    return components.html(
+        """
+        <script>
+        const KEY = 'sales_analytics_bookmarks';
+        const bms = JSON.parse(localStorage.getItem(KEY) || '[]');
+        // communicate back to python via Streamlit component return value trick
+        window.parent.postMessage({type:'bm_data', bookmarks: bms}, '*');
+        </script>
+        """,
+        height=0,
+    )
+
+def bm_save_to_ls(bookmarks):
+    """Inject JS snippet to write current bookmarks list to localStorage."""
+    import json as _json
+    safe = _json.dumps(bookmarks, ensure_ascii=False)
+    components.html(
+        f"""
+        <script>
+        try {{
+          localStorage.setItem('sales_analytics_bookmarks', {repr(safe)});
+        }} catch(e) {{}}
+        </script>
+        """,
+        height=0,
+    )
+
+def bm_load_from_ls():
+    """Render a hidden component that reads localStorage and returns bookmarks via query param hack."""
+    # We use a Streamlit-native trick: inject a form that auto-submits with the LS value
+    # Actually the simplest working method: render a component whose return value IS the data
+    val = components.html(
+        """
+        <!DOCTYPE html><html><body>
+        <script>
+        const bms = JSON.parse(localStorage.getItem('sales_analytics_bookmarks') || '[]');
+        // Write into a textarea so the parent iframe can read via MutationObserver (not reliable)
+        // Simplest: set document title and poll  but that won't work cross-origin.
+        // FINAL approach: use Streamlit's component bidirectional API via window.parent.Streamlit
+        window.parent.postMessage({isStreamlitMessage:true, type:'streamlit:componentReady'}, '*');
+        window.parent.postMessage({isStreamlitMessage:true, type:'streamlit:setComponentValue',
+          args: {value: JSON.stringify(bms)}}, '*');
+        </script>
+        </body></html>
+        """,
+        height=0,
+    )
+    return val  # will be the JSON string if component framework works, else None
+
+
+def _star_button_key(qid):
+    return f"star_{qid}"
+
+
+def _render_bookmarks_panel():
+    bms = st.session_state.bookmarks
+    label = f"⭐ Pinned Results"
+    count_html = f'<span class="bm-count">{len(bms)}</span>' if bms else '<span class="bm-count">0</span>'
+    st.markdown(
+        f'<div class="section-lbl">{label} {count_html}</div>',
+        unsafe_allow_html=True,
+    )
+    if not bms:
+        st.caption("No pinned results yet — star a result to save it here.")
+        return
+
+    with st.expander(f"Show {len(bms)} pinned result{'s' if len(bms)!=1 else ''}", expanded=True):
+        for i, bm in enumerate(bms):
+            ts = bm.get("timestamp", "")
+            q  = bm.get("query", "")
+            txt= bm.get("text", "")[:300]
+            col_meta, col_del = st.columns([9, 1])
+            with col_meta:
+                st.markdown(
+                    f'<div class="bm-item">'
+                    f'<div class="bm-query">\u201c{q}\u201d</div>'
+                    f'<div class="bm-text">{txt}</div>'
+                    f'<div class="bm-ts">{ts}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            with col_del:
+                st.write("")
+                if st.button("🗑", key=f"del_bm_{bm['query_id']}_{i}", help="Unpin"):
+                    st.session_state.bookmarks = [
+                        b for b in st.session_state.bookmarks
+                        if b["query_id"] != bm["query_id"]
+                    ]
+                    bm_save_to_ls(st.session_state.bookmarks)
+                    st.rerun()
+
+
+# ── Load bookmarks from localStorage on first render ──────────────
+if not st.session_state.bm_loaded:
+    # Use a query-param trick: store bookmarks in the URL, or simply inject JS
+    # that writes to a st.query_params on load (Streamlit 1.30+)
+    components.html(
+        """
+        <script>
+        (function() {
+          const bms = JSON.parse(localStorage.getItem('sales_analytics_bookmarks') || '[]');
+          if (bms.length === 0) return;
+          // encode and write to URL so Streamlit can read via st.query_params
+          const encoded = encodeURIComponent(JSON.stringify(bms));
+          const url = new URL(window.parent.location.href);
+          if (!url.searchParams.has('_bm_init')) {
+            url.searchParams.set('_bm_init', encoded);
+            window.parent.history.replaceState({}, '', url.toString());
+            window.parent.location.reload();
+          }
+        })();
+        </script>
+        """,
+        height=0,
+    )
+    # Try reading from query params (set by the JS above on previous load)
+    try:
+        import urllib.parse as _ul
+        raw = st.query_params.get("_bm_init", "")
+        if raw:
+            loaded = json.loads(_ul.unquote(raw))
+            if isinstance(loaded, list):
+                st.session_state.bookmarks = loaded
+            # Remove from URL so it doesn't accumulate
+            st.query_params.pop("_bm_init", None)
+    except Exception:
+        pass
+    st.session_state.bm_loaded = True
+
+
+# ── Pinned Results panel ───────────────────────────────────────────
+_render_bookmarks_panel()
+
+st.divider()
+
 #  History (above schema) 
 if st.session_state.history:
-    with st.expander(f"History  {len(st.session_state.history)} queries", expanded=False):
-        for item in reversed(st.session_state.history):
+    hist_search = st.text_input(
+        "🔍 Filter history",
+        placeholder="Type a keyword to search past queries…",
+        key="hist_search_input",
+        label_visibility="collapsed",
+    )
+    filtered_hist = [
+        item for item in st.session_state.history
+        if hist_search.lower() in item["query"].lower()
+    ] if hist_search.strip() else st.session_state.history
+
+    total = len(st.session_state.history)
+    shown = len(filtered_hist)
+    label = (
+        f"History — {shown} of {total} match" + ("es" if shown != 1 else "")
+        if hist_search.strip()
+        else f"History — {total} quer" + ("ies" if total != 1 else "y")
+    )
+    with st.expander(label, expanded=bool(hist_search.strip())):
+        if not filtered_hist:
+            st.caption("No queries match that keyword.")
+        for item in reversed(filtered_hist):
             st.markdown(f"""
             <div class="hist-item">
                 <div class="hist-q"> {item['query']}</div>
@@ -975,6 +1174,30 @@ if state:
         with result_placeholder.container():
             st.markdown('<div class="section-lbl">Result</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="result-box">{text}</div>', unsafe_allow_html=True)
+
+            # ── Star / bookmark button ──────────────────────────────
+            qid = st.session_state.query_id
+            already_starred = any(b["query_id"] == qid for b in st.session_state.bookmarks)
+            last_q = (st.session_state.history[-1]["query"]
+                      if st.session_state.history else "query")
+
+            star_col, chart_col, _ = st.columns([1, 1, 4])
+            with star_col:
+                star_label = "⭐ Pinned" if already_starred else "☆ Pin result"
+                if st.button(star_label, key=_star_button_key(qid), use_container_width=True):
+                    if already_starred:
+                        st.session_state.bookmarks = [
+                            b for b in st.session_state.bookmarks if b["query_id"] != qid
+                        ]
+                    else:
+                        st.session_state.bookmarks.insert(0, {
+                            "query_id":  qid,
+                            "query":     last_q,
+                            "text":      text,
+                            "timestamp": datetime.now().strftime("%d %b %Y, %H:%M"),
+                        })
+                    bm_save_to_ls(st.session_state.bookmarks)
+                    st.rerun()
 
             if state.get("chart_config"):
                 st.markdown("<br>", unsafe_allow_html=True)
