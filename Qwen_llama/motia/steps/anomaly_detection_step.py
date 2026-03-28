@@ -21,7 +21,7 @@ config = {
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::detect.anomalies")],
-    "enqueues": ["query::format.result"],
+    "enqueues": ["query::generate.insights"],
 }
 
 
@@ -134,11 +134,10 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
 
     await ctx.enqueue(
         {
-            "topic": "query::format.result",
+            "topic": "query::generate.insights",
             "data": {
                 **input_data,
                 "anomalies": anomalies,
             },
         }
     )
-

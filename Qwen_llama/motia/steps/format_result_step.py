@@ -449,6 +449,18 @@ def _inject_insight_block(formatted_text: str, lines: list[str]) -> str:
     return formatted_text + block
 
 
+def _inject_ai_insights(formatted_text: str, insights: list[str]) -> str:
+    lines = [str(x).strip() for x in (insights or []) if str(x).strip()]
+    if not lines:
+        return formatted_text
+    block = "\n\nBusiness Insights:\n" + "\n".join(f"- {x}" for x in lines[:3])
+    marker = "\n\n Token Usage "
+    if marker in formatted_text:
+        head, tail = formatted_text.split(marker, 1)
+        return head + block + marker + tail
+    return formatted_text + block
+
+
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     import datetime as _dt
 
@@ -457,6 +469,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     parsed        = input_data.get("parsed", {})
     results       = input_data.get("results", [])
     anomalies     = input_data.get("anomalies", {})
+    auto_insights = input_data.get("auto_insights", [])
     period_labels = input_data.get("period_labels", [])
     start_date    = input_data.get("startDate", "")
     end_date      = input_data.get("endDate", "")
@@ -484,6 +497,8 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     qs           = await ctx.state.get("queries", query_id)
     if not user_query and qs:
         user_query = qs.get("query", "")
+    if not auto_insights and qs:
+        auto_insights = qs.get("auto_insights", []) or []
     token_usage  = (qs or {}).get("token_usage", [])
     token_totals = (qs or {}).get("token_totals", {})
     chart_config = None
@@ -714,6 +729,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     anomaly_lines = _anomaly_insights(anomalies, p)
     if anomaly_lines:
         formatted_text = _inject_insight_block(formatted_text, anomaly_lines)
+    formatted_text = _inject_ai_insights(formatted_text, auto_insights)
 
     ctx.logger.info(" Formatted", {"queryId": query_id})
     if qs:
@@ -726,6 +742,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             "formattedItems": items,
             "chart_config":   chart_config,
             "anomalies":      anomalies,
+            "auto_insights":  auto_insights,
             "token_usage":    token_usage,
             "token_totals":   token_totals,
             "completedAt":    now_iso,
