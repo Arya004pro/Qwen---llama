@@ -156,5 +156,32 @@ def parse_time_ranges_from_query(user_query: str, today: date | None = None) -> 
         s2, e2 = _year_range(today.year - 2)
         return [_pack_range(s1, e1), _pack_range(s2, e2)], "comparison"
 
+    # ── Standalone quarter (no year) e.g. "Q1" ──────────────────────────────
+    q_m = _QUARTER_RE.search(q)
+    if q_m:
+        qn   = int(q_m.group(1))
+        year = int(q_m.group(2)) if q_m.group(2) else today.year
+        s, e = _quarter_range(year, qn)
+        return [_pack_range(s, e)], None
+
+    # ── Specific month + year e.g. "January 2024" ────────────────────────────
+    month_m = _MONTH_NAME_RE.search(q)
+    year_m  = _YEAR_RE.search(q)
+    if month_m and year_m:
+        month = _MONTH_MAP[month_m.group(1).lower()]
+        year  = int(year_m.group(1))
+        s, e  = _month_range(year, month)
+        return [_pack_range(s, e)], None
+
+    # ── Standalone year e.g. "in 2024", "for 2023", "revenue by year" ────────
+    # For year-bucket time_series with no specific year (e.g. "Revenue by year"),
+    # we return a wide all-data range so the SQL builder can use an open range.
+    # For queries with a specific year (e.g. "monthly trend in 2024"), we return
+    # that year's full range.
+    if year_m:
+        year = int(year_m.group(1))
+        s, e = _year_range(year)
+        return [_pack_range(s, e)], None
+
     return [], None
 

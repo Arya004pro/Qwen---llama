@@ -1,15 +1,11 @@
 ﻿"""Step 5: Execute Query — runs SQL against DuckDB.
 
-DATE FIX: end_date is now passed as (end_date + 1 day) so that the SQL
-generated with '>= start AND < end_exclusive' captures the full last day
-including all timestamps (23:59:59, milliseconds, etc.).
-
-Includes runtime repairs:
-1) EXTRACT(YEAR FROM date_col)=? -> col >= ? AND col < ?
-2) BETWEEN ? AND ?  -> >= ? AND < ?  (for datetime-hinted column names)
-3) GROUP BY mismatch repair
-4) Missing GROUP BY entirely for EXTRACT/STRFTIME/YEAR() in SELECT
-5) [NEW] GROUP BY name-only -> GROUP BY id, name  (de-duplicate same-name entities)
+Changes vs original:
+  - _DATETIME_COL_HINTS: removed domain-specific names "order_date",
+    "order_datetime", "ride_date" — these are already matched by the
+    generic "date" substring, so they were redundant and misleading when
+    working with other dataset schemas.
+  - All execution, rewrite, and repair logic unchanged.
 """
 
 import os
@@ -34,18 +30,31 @@ config = {
     "name": "ExecuteQuery",
     "description": (
         "Executes LLM-generated SQL against DuckDB. "
-        "Uses exclusive end-date (>= start AND < end+1day) to avoid missing "
-        "the last day when filtering datetime columns. "
-        "Auto-repairs missing GROUP BY for time-series EXTRACT/STRFTIME queries. "
-        "Auto-adds ID column to GROUP BY when only a *_name column is present "
-        "to avoid merging rows for entities that share the same display name."
+        "Uses exclusive end-date (>= start AND < end+1day). "
+        "Auto-repairs missing GROUP BY for time-series queries. "
+        "Auto-adds ID column to GROUP BY when only a *_name column is present."
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::execute")],
     "enqueues": ["query::detect.anomalies"],
 }
 
-# ── SQL rewrite patterns ─────────────────────────────────────────────────────
+# ── Datetime column hints ──────────────────────────────────────────────────────
+# Generic substrings only — no domain-specific column names.
+# Any column whose name contains one of these tokens is treated as a
+# datetime column and gets the BETWEEN → ">= AND <" rewrite applied.
+_DATETIME_COL_HINTS = {
+    "date",       # matches order_date, ride_date, created_date, etc.
+    "time",       # matches datetime, timestamp, order_time, etc.
+    "timestamp",
+    "created",
+    "updated",
+    "at",         # matches created_at, updated_at, etc.
+    "on",         # matches ordered_on, etc.
+    "when",
+}
+
+# ── SQL rewrite patterns ──────────────────────────────────────────────────────
 
 _EXTRACT_YEAR_PAT = re.compile(
     r"EXTRACT\s*\(\s*YEAR\s+FROM\s+(\w+)\s*\)\s*=\s*\?", re.IGNORECASE)
@@ -62,41 +71,12 @@ _MISSING_GB_COL_RE = re.compile(
     r'column\s+"([^"]+)"\s+must appear in the GROUP BY', re.IGNORECASE)
 _HAS_GROUP_BY_RE = re.compile(r"\bGROUP\s+BY\b", re.IGNORECASE)
 
-# Column name substrings that hint at a datetime column
-_DATETIME_COL_HINTS = {
-    "date", "time", "datetime", "timestamp", "created", "updated",
-    "at", "on", "when", "order_date", "order_datetime", "ride_date",
-}
 
-
-# ── Schema helpers ────────────────────────────────────────────────────────────
+# ── Schema helpers ─────────────────────────────────────────────────────────────
 
 def _get_id_name_pairs() -> dict[str, str]:
-    """
-    Scan the live schema and return {name_col: best_discriminator_col}.
-
-    A discriminator is the column that uniquely identifies an entity so that
-    two rows with the SAME display name (e.g. two customers named "Priya Jain")
-    are never collapsed into one GROUP BY bucket.
-
-    Detection priority per *_name column (generalised, zero hardcoding):
-      1. <base>_id / <base>_code / <base>_key / <base>_uuid  (true surrogate key)
-      2. phone / phone_number / mobile / mobile_number        (common contact ID)
-      3. email / email_address                                (common contact ID)
-      4. <base>_no / <base>_number                           (alternate IDs)
-
-    If none of the above exist in the same table as the name column, the
-    name_col is NOT added to the result — GROUP BY name only is unavoidable.
-
-    Also handles plain 'name' columns via the table_id / id fallback.
-
-    Example results:
-      Zomato (no customer_id):  {"customer_name": "phone"}
-      Uber   (has driver_id):   {"driver_name": "driver_id"}
-      E-comm (has customer_id): {"customer_name": "customer_id"}
-    """
+    """Return {name_col: best_discriminator_col} for deduplication."""
     from collections import defaultdict
-
     try:
         conn = get_read_connection()
         rows = conn.execute(
@@ -107,85 +87,45 @@ def _get_id_name_pairs() -> dict[str, str]:
     except Exception:
         return {}
 
-    # Per-table column sets (lowercased)
-    table_cols: dict[str, list[str]] = defaultdict(list)
+    table_cols: dict = defaultdict(list)
     for table, col in rows:
         table_cols[table].append(col.lower())
 
-    # Flat set for cross-table checks
-    all_cols: set[str] = {col for cols in table_cols.values() for col in cols}
-
-    # Common non-ID discriminator columns, ordered by preference
     _CONTACT_DISCRIMINATORS = (
         "phone", "phone_number", "mobile", "mobile_number",
         "email", "email_address", "contact",
     )
 
-    def _best_discriminator(name_col: str, table_col_set: set[str]) -> str | None:
+    def _best_disc(name_col: str, col_set: set) -> str | None:
         base = name_col[:-5] if name_col.endswith("_name") else name_col
-
-        # 1. Surrogate key variants
         for suffix in ("_id", "_code", "_key", "_uuid", "_no", "_number"):
-            candidate = base + suffix
-            if candidate in table_col_set:
-                return candidate
-
-        # 2. Contact discriminators (phone/email)
-        for candidate in _CONTACT_DISCRIMINATORS:
-            if candidate in table_col_set:
-                return candidate
-
+            if (base + suffix) in col_set:
+                return base + suffix
+        for c in _CONTACT_DISCRIMINATORS:
+            if c in col_set:
+                return c
         return None
 
     pairs: dict[str, str] = {}
-
     for table, cols in table_cols.items():
         col_set = set(cols)
-
         for col in cols:
             if col.endswith("_name"):
-                disc = _best_discriminator(col, col_set)
+                disc = _best_disc(col, col_set)
                 if disc and col not in pairs:
                     pairs[col] = disc
-
-        # Plain 'name' column fallback
         if "name" in col_set and "name" not in pairs:
-            for candidate in (f"{table}_id", "id", f"{table}_code"):
-                if candidate in col_set:
-                    pairs["name"] = candidate
+            for c in (f"{table}_id", "id", f"{table}_code"):
+                if c in col_set:
+                    pairs["name"] = c
                     break
-
     return pairs
 
 
 # ── Rewrite: add ID to GROUP BY ────────────────────────────────────────────────
 
 def _repair_group_by_add_id(sql: str) -> tuple[str, bool]:
-    """
-    Generalised repair: when GROUP BY contains a *_name column (or 'name')
-    that has a corresponding discriminator column in the live schema, prepend
-    the discriminator to GROUP BY so that two entities sharing the same
-    display name are never merged into a single bucket.
-
-    The discriminator is chosen automatically (priority):
-      1. *_id / *_code / *_key / *_uuid  (true surrogate key)
-      2. phone / phone_number / email    (contact-based unique identifier)
-
-    Examples:
-      Zomato (no customer_id, has phone):
-          GROUP BY customer_name
-          → GROUP BY phone, customer_name
-
-      Uber (has driver_id):
-          GROUP BY driver_name
-          → GROUP BY driver_id, driver_name
-
-    The SELECT list is intentionally left unchanged — results still show
-    the human-readable name column aliased as 'name'.
-
-    Returns (possibly_rewritten_sql, was_changed).
-    """
-    # Fast pre-check: if there's no GROUP BY, nothing to do.
+    """Prepend discriminator key to GROUP BY to prevent same-name entity merging."""
     if not _HAS_GROUP_BY_RE.search(sql):
         return sql, False
 
@@ -199,15 +139,13 @@ def _repair_group_by_add_id(sql: str) -> tuple[str, bool]:
 
     gb_raw = gb_match.group("group_by").strip()
 
-    # Tokenise: split on comma, strip table-prefix aliases and whitespace.
-    # e.g. "t.customer_name, t.city" → ["customer_name", "city"]
     def _strip_alias(token: str) -> str:
         t = token.strip().strip('"').strip('`')
         if "." in t:
             t = t.split(".")[-1]
         return t.lower()
 
-    gb_tokens_raw = [t.strip() for t in gb_raw.split(",") if t.strip()]
+    gb_tokens_raw  = [t.strip() for t in gb_raw.split(",") if t.strip()]
     gb_tokens_bare = [_strip_alias(t) for t in gb_tokens_raw]
 
     changed = False
@@ -215,10 +153,9 @@ def _repair_group_by_add_id(sql: str) -> tuple[str, bool]:
 
     for name_col, id_col in id_name_pairs.items():
         if name_col in gb_tokens_bare and id_col not in gb_tokens_bare:
-            # Insert id_col immediately before the name_col token
             idx = gb_tokens_bare.index(name_col)
             new_tokens_raw.insert(idx, id_col)
-            gb_tokens_bare.insert(idx, id_col)   # keep in sync
+            gb_tokens_bare.insert(idx, id_col)
             changed = True
 
     if not changed:
@@ -226,11 +163,10 @@ def _repair_group_by_add_id(sql: str) -> tuple[str, bool]:
 
     new_gb_str = ", ".join(new_tokens_raw)
     start, end = gb_match.span("group_by")
-    new_sql = sql[:start] + " " + new_gb_str + " " + sql[end:]
-    return new_sql, True
+    return sql[:start] + " " + new_gb_str + " " + sql[end:], True
 
 
-# ── Existing helpers (unchanged) ──────────────────────────────────────────────
+# ── Existing helpers ──────────────────────────────────────────────────────────
 
 def _exclusive_end(d: date) -> date:
     return d + timedelta(days=1)
@@ -293,7 +229,7 @@ def _repair_add_missing_group_by(sql: str, error_text: str) -> str | None:
     name_m = _NAME_EXPR_RE.search(sql or "")
     if not name_m:
         return None
-    name_expr = name_m.group("expr").strip()
+    name_expr  = name_m.group("expr").strip()
     expr_upper = name_expr.upper()
     is_time_bucket = any(kw in expr_upper for kw in [
         "EXTRACT(", "STRFTIME(", "DATE_TRUNC(", "YEAR(", "MONTH(",
@@ -456,14 +392,12 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             ctx.logger.info("Auto-added missing GROUP BY for time_series", {"queryId": query_id})
             generated_sql = repaired
 
-
     ctx.logger.info("Executing SQL", {"queryId": query_id, "query_type": qt})
-    ctx.logger.info("Final SQL + params", {"queryId": query_id, "sql": generated_sql})
 
     params = _build_params(generated_sql, parsed)
     ctx.logger.info("SQL params", {"queryId": query_id, "params": str(params)})
 
-    # ── Validator layer: safety + schema checks before execution ─────────────
+    # ── Validator layer ────────────────────────────────────────────────────────
     ok, errors, warnings = validate_query(generated_sql, params)
     if warnings:
         ctx.logger.warn("SQL validation warnings", {"queryId": query_id, "warnings": warnings})
@@ -478,10 +412,8 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         results = _rows_to_dicts(rows)
     except Exception as exc:
         err_str = str(exc)
-        # Repair attempt 1: add missing GROUP BY (EXTRACT in SELECT without GROUP BY)
         repaired_sql = _repair_add_missing_group_by(generated_sql, err_str)
         if not repaired_sql:
-            # Repair attempt 2: fix existing GROUP BY missing the name expression
             repaired_sql = _repair_group_by_missing_name(generated_sql, err_str)
         if not repaired_sql:
             qs = await ctx.state.get("queries", query_id)

@@ -1,9 +1,10 @@
 """Step 3: Ambiguity Check — generalised for any dataset.
 
 Changes vs original:
+  - Clarification questions now pull dimension/metric examples from the live
+    DuckDB schema instead of hardcoding Uber/Zomato column names.
   - time_series query type is handled: only metric + time_ranges needed.
-    Entity is NEVER required for time_series — asking for a dimension like
-    "driver/city" would be wrong for a trend query.
+    Entity is NEVER required for time_series.
   - All other routing logic unchanged.
 """
 
@@ -25,8 +26,8 @@ config = {
     "name": "AmbiguityCheck",
     "description": (
         "Routes to SQL generation or saves clarification. "
-        "Handles time_series (trend) queries — never asks for a business dimension "
-        "when the user wants a month/week/quarter breakdown."
+        "Clarification examples are drawn from the live schema — no hardcoded "
+        "column/domain names. Handles time_series (trend) queries."
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::ambiguity.check")],
@@ -34,10 +35,152 @@ config = {
 }
 
 
+# ── Live-schema helpers ────────────────────────────────────────────────────────
+
+def _live_entity_examples(max_items: int = 5) -> str:
+    """
+    Return a comma-separated list of actual entity (grouping) column names
+    from the live DuckDB schema.  Falls back to a generic example if the
+    schema cannot be read.
+    """
+    try:
+        from db.duckdb_connection import get_read_connection
+
+        conn = get_read_connection()
+        try:
+            tables = [
+                r[0] for r in conn.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema='main' ORDER BY table_name"
+                ).fetchall()
+            ]
+
+            _TEXT_TYPES   = ("VARCHAR", "CHAR", "TEXT", "STRING")
+            _DATE_HINTS   = ("date", "time", "created", "updated", "timestamp")
+            _ENTITY_HINTS = ("name", "id", "city", "state", "type", "code",
+                             "driver", "customer", "category", "product",
+                             "location", "store", "region", "brand")
+
+            candidates = []
+            seen: set[str] = set()
+
+            for table in tables:
+                cols = conn.execute(f'DESCRIBE "{table}"').fetchall()
+                for col, dtype, *_ in cols:
+                    col_l = col.lower()
+                    dtype_u = dtype.upper()
+
+                    # Skip non-text, date-like, and already-seen columns
+                    if not any(t in dtype_u for t in _TEXT_TYPES):
+                        continue
+                    if any(k in col_l for k in _DATE_HINTS):
+                        continue
+                    if col_l in seen:
+                        continue
+                    if not any(k in col_l for k in _ENTITY_HINTS):
+                        continue
+
+                    # Prefer *_name columns; deprioritise raw id columns
+                    priority = 0
+                    if col_l.endswith("_name") or col_l == "name":
+                        priority = 3
+                    elif any(k in col_l for k in ("city", "state", "type", "category")):
+                        priority = 2
+                    elif col_l.endswith("_id") or col_l == "id":
+                        priority = 0
+                    else:
+                        priority = 1
+
+                    candidates.append((priority, col))
+                    seen.add(col_l)
+
+        finally:
+            conn.close()
+
+        if not candidates:
+            return "e.g. product, customer, city, category, driver"
+
+        candidates.sort(key=lambda x: -x[0])
+        # Format: strip _name suffix for readability
+        formatted = [
+            c.replace("_name", "").replace("_", " ")
+            for _, c in candidates[:max_items]
+        ]
+        return ", ".join(formatted)
+
+    except Exception:
+        return "e.g. product, customer, city, category, driver"
+
+
+def _live_metric_examples(max_items: int = 5) -> str:
+    """
+    Return a comma-separated list of actual numeric metric column names
+    from the live DuckDB schema.  Falls back to a generic example.
+    """
+    try:
+        from db.duckdb_connection import get_read_connection
+
+        conn = get_read_connection()
+        try:
+            tables = [
+                r[0] for r in conn.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema='main' ORDER BY table_name"
+                ).fetchall()
+            ]
+
+            _NUM_TYPES  = ("INT", "BIGINT", "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC", "REAL")
+            _SKIP_HINTS = ("_id", "_key", "_code", "year", "month", "day",
+                           "week", "quarter", "flag", "bool", "is_")
+            _METRIC_HINTS = ("price", "fare", "amount", "earning", "revenue",
+                             "commission", "quantity", "qty", "count",
+                             "total", "fee", "cost", "distance", "duration",
+                             "discount", "sales", "profit", "margin")
+
+            candidates = []
+            seen: set[str] = set()
+
+            for table in tables:
+                cols = conn.execute(f'DESCRIBE "{table}"').fetchall()
+                for col, dtype, *_ in cols:
+                    col_l = col.lower()
+                    dtype_u = dtype.upper()
+
+                    if not any(t in dtype_u for t in _NUM_TYPES):
+                        continue
+                    if any(k in col_l for k in _SKIP_HINTS):
+                        continue
+                    if col_l in seen:
+                        continue
+                    if not any(k in col_l for k in _METRIC_HINTS):
+                        continue
+
+                    # Score by specificity
+                    score = sum(1 for k in _METRIC_HINTS if k in col_l)
+                    candidates.append((score, col))
+                    seen.add(col_l)
+
+        finally:
+            conn.close()
+
+        if not candidates:
+            return "e.g. revenue, fare, quantity, earnings, number of orders"
+
+        candidates.sort(key=lambda x: -x[0])
+        formatted = [c.replace("_", " ") for _, c in candidates[:max_items]]
+        # Always add "number of orders/rides" as a count option if not already there
+        if not any("count" in f or "number" in f for f in formatted):
+            formatted.append("number of orders")
+        return ", ".join(formatted[:max_items])
+
+    except Exception:
+        return "e.g. revenue, fare, quantity, earnings, number of orders"
+
+
+# ── Completeness check ─────────────────────────────────────────────────────────
+
 def _is_actually_complete(parsed: dict) -> tuple[bool, str | None]:
-    """
-    Determine true completeness. Returns (complete, clarification_question_or_None).
-    """
+    """Returns (complete, clarification_question_or_None)."""
     qt  = parsed.get("query_type", "top_n")
     tr  = parsed.get("time_ranges", [])
     m   = parsed.get("metric")
@@ -45,8 +188,6 @@ def _is_actually_complete(parsed: dict) -> tuple[bool, str | None]:
     cq  = parsed.get("clarification_question")
 
     # ── time_series (trend) ────────────────────────────────────────────────────
-    # Month-wise / weekly / quarterly trend — entity is a time bucket, not a
-    # business dimension.  Only metric + time_ranges are required.
     if qt == "time_series":
         if m and tr:
             return True, None
@@ -58,7 +199,7 @@ def _is_actually_complete(parsed: dict) -> tuple[bool, str | None]:
         if not m:
             return False, (
                 "What metric should I measure? "
-                "(e.g. total fare, driver earnings, number of rides, revenue)"
+                f"({_live_metric_examples()})"
             )
         return True, None
 
@@ -69,7 +210,9 @@ def _is_actually_complete(parsed: dict) -> tuple[bool, str | None]:
         if not tr:
             return False, "What time period should I use? (e.g. 2024, Q1 2024, March 2024)"
         if not m:
-            return False, "What metric should I measure? (e.g. total fare, driver earnings, revenue, number of rides)"
+            return False, (
+                f"What metric should I measure? ({_live_metric_examples()})"
+            )
         return True, None
 
     # ── ranked queries ────────────────────────────────────────────────────────
@@ -77,8 +220,7 @@ def _is_actually_complete(parsed: dict) -> tuple[bool, str | None]:
         if not ent:
             return False, (
                 cq or
-                "Which dimension should I group by? "
-                "(e.g. driver, city, state, vehicle type, customer, product, category)"
+                f"Which dimension should I group by? ({_live_entity_examples()})"
             )
         if not tr:
             return False, "What time period should I use? (e.g. 2024, Q1 2024, March 2024)"
@@ -100,6 +242,8 @@ def _is_actually_complete(parsed: dict) -> tuple[bool, str | None]:
     return is_complete, clarification
 
 
+# ── Handler ───────────────────────────────────────────────────────────────────
+
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     query_id   = input_data.get("queryId")
     user_query = input_data.get("query", "")
@@ -108,11 +252,11 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     is_complete, clarification = _is_actually_complete(parsed)
 
     ctx.logger.info("🔎 Ambiguity check", {
-        "queryId":        query_id,
-        "is_complete":    is_complete,
-        "clarification":  clarification,
-        "query_type":     parsed.get("query_type"),
-        "time_bucket":    parsed.get("time_bucket"),
+        "queryId":       query_id,
+        "is_complete":   is_complete,
+        "clarification": clarification,
+        "query_type":    parsed.get("query_type"),
+        "time_bucket":   parsed.get("time_bucket"),
     })
 
     qs = await ctx.state.get("queries", query_id)

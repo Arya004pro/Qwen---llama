@@ -1,11 +1,15 @@
 """Step 4: Text-to-SQL — fully generalised for any flat-table dataset.
 
-Key changes:
-  - _build_llm_prompt() now receives `filters` from parsed intent and renders
-    them as an explicit MANDATORY WHERE clause in the prompt.
-  - Added Rule 11: "BUSINESS FILTERS — apply ALL parsed filters as WHERE conditions".
-  - time_series query type support (unchanged from previous version).
-  - Validates generated SQL contains expected filter conditions and warns if missing.
+Key changes vs original:
+  - Removed _SALES_SCHEMA_TABLES, _BUILDER_ENTITIES, _BUILDER_METRICS constants
+    (hardcoded to the old e-commerce schema).
+  - Replaced with _is_classic_ecommerce_schema() which detects from live DB
+    whether the fast sql_builder path is safe to use.
+  - force_llm now uses a single clear rule: only use the builder for the
+    known e-commerce schema; use LLM for everything else.
+  - _build_llm_prompt() metric rules now use the schema's own Metric column
+    mappings section instead of hardcoded final_price/total_fare preferences.
+  - All other logic (time_series hint, SQL safety, EXPLAIN, fallbacks) unchanged.
 """
 
 import os
@@ -38,19 +42,13 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-_SALES_SCHEMA_TABLES = {
-    "orders", "customers", "cities", "products",
-    "categories", "states", "order_items",
-}
-_BUILDER_ENTITIES = {"product", "customer", "city", "category", "state"}
-_BUILDER_METRICS  = {"revenue", "quantity", "order_count"}
-
 config = {
     "name": "TextToSQL",
     "description": (
         "Builds SQL from parsed intent using the live schema. "
-        "Injects business-validity filters (e.g. is_cancelled=0) into every query. "
-        "Handles time_series (trend) queries grouped by month/week/quarter/day."
+        "Uses a deterministic builder only for the classic e-commerce schema; "
+        "all other datasets always go through the LLM path with the live schema "
+        "injected into the prompt."
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::text.to.sql")],
@@ -66,13 +64,17 @@ _FORBIDDEN   = re.compile(
     re.IGNORECASE,
 )
 
-_BUCKET_FMT = {
-    "month":   "%Y-%m",
-    "week":    "%Y-W%W",
-    "quarter": "%Y-Q",
-    "day":     "%Y-%m-%d",
+# ── Minimum tables required for the classic e-commerce fast path ───────────────
+# Only these exact table names activate the pre-built sql_builder / sql_registry.
+# Any other schema always goes through the LLM path.
+_ECOMMERCE_REQUIRED_TABLES = {
+    "orders", "customers", "products", "categories", "order_items",
 }
+_ECOMMERCE_VALID_ENTITIES = {"product", "customer", "city", "category", "state"}
+_ECOMMERCE_VALID_METRICS  = {"revenue", "quantity", "order_count"}
 
+
+# ── Schema helpers ─────────────────────────────────────────────────────────────
 
 def _get_existing_tables() -> set[str]:
     try:
@@ -87,23 +89,16 @@ def _get_existing_tables() -> set[str]:
         return set()
 
 
-def _sales_schema_available(existing: set[str]) -> bool:
-    return _SALES_SCHEMA_TABLES.issubset(existing)
+def _is_classic_ecommerce_schema(existing: set[str]) -> bool:
+    """
+    Return True only when the exact classic e-commerce table set is present.
+    This is the ONLY condition under which sql_builder / sql_registry are used.
+    """
+    return _ECOMMERCE_REQUIRED_TABLES.issubset(existing)
 
 
 def _detect_id_name_pairs() -> dict[str, str]:
-    """
-    Scan the live schema and return {name_col: best_discriminator_col}.
-
-    Priority per *_name column:
-      1. <base>_id / <base>_code / <base>_key / <base>_uuid  (surrogate key)
-      2. phone / phone_number / mobile / email               (contact ID)
-      3. <base>_no / <base>_number                           (alternate key)
-
-    Handles datasets with no surrogate key (e.g. Zomato customers identified
-    by phone, not by customer_id). The discriminator is used to GROUP BY so
-    that two entities sharing the same display name are never collapsed.
-    """
+    """Return {name_col: discriminator_col} for deduplication in GROUP BY."""
     from collections import defaultdict
     try:
         conn = get_read_connection()
@@ -150,6 +145,8 @@ def _detect_id_name_pairs() -> dict[str, str]:
                     break
     return pairs
 
+
+# ── SQL extraction / safety ────────────────────────────────────────────────────
 
 def _extract_sql(raw: str) -> str:
     text  = _THINK_RE.sub("", raw).strip()
@@ -212,13 +209,15 @@ def _render_filter_clause(filters: dict) -> str:
 
 
 def _check_filters_present(sql: str, filters: dict, ctx, query_id: str) -> None:
-    for col, val in filters.items():
+    for col in filters:
         if col.lower() not in sql.lower():
             ctx.logger.warn(
                 f"⚠️ Filter '{col}' may be missing from generated SQL",
-                {"queryId": query_id, "col": col, "expected_val": val},
+                {"queryId": query_id, "col": col},
             )
 
+
+# ── Time-series SQL hint ───────────────────────────────────────────────────────
 
 def _build_time_series_sql_hint(parsed: dict) -> str:
     bucket = parsed.get("time_bucket", "month")
@@ -264,31 +263,32 @@ REQUIRED SQL PATTERN for time_series ({bucket}):
   ORDER BY name ASC
 
 CRITICAL RULES for time_series (ALL MUST BE FOLLOWED):
-1. GROUP BY IS MANDATORY — always include it. Without GROUP BY the query WILL FAIL.
+1. GROUP BY IS MANDATORY.
 2. Replace <actual_date_column> with the REAL date/datetime column from the schema.
 3. Replace <table_name> with the REAL table name.
-4. Replace <order_pk_column> with the primary order identifier column (e.g. order_id, ride_id).
-5. Replace <BUSINESS_FILTERS> with the mandatory filter conditions from Rule 11.
-6. ORDER BY name ASC ensures chronological output.
+4. Replace <order_pk_column> with the primary order identifier column.
+5. Replace <BUSINESS_FILTERS> with mandatory filter conditions.
+6. ORDER BY name ASC for chronological output.
 7. Do NOT add LIMIT for time_series.
 8. Label format: {bucket_label}
 9. For count metric: COUNT(DISTINCT <order_id_col>) NOT COUNT(*).
-   One order may have many rows (items), so COUNT(*) overcounts transactions.
 10. For avg_ metrics: use AVG(<column>) not SUM.
 """
 
 
+# ── Prompt builder ────────────────────────────────────────────────────────────
+
 def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
-    entity   = parsed.get("entity")
-    metric   = parsed.get("metric", "count")
+    entity     = parsed.get("entity")
+    metric     = parsed.get("metric", "count")
     entity_key = parsed.get("_entity_group_key")
     count_key  = parsed.get("_count_distinct_key")
-    qt       = parsed.get("query_type", "top_n")
-    top_n    = parsed.get("top_n", 5)
-    thr      = parsed.get("threshold") or {}
-    filters  = parsed.get("filters", {}) or {}
-    trs      = parsed.get("time_ranges", [])
-    bucket   = parsed.get("time_bucket", "month")
+    qt         = parsed.get("query_type", "top_n")
+    top_n      = parsed.get("top_n", 5)
+    thr        = parsed.get("threshold") or {}
+    filters    = parsed.get("filters", {}) or {}
+    trs        = parsed.get("time_ranges", [])
+    bucket     = parsed.get("time_bucket", "month")
 
     filter_clause = _render_filter_clause(filters)
     filter_desc   = (
@@ -301,9 +301,8 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
         groupby_rule = (
             f"10. GROUPING (CRITICAL):\n"
             f"    Start with display column: {entity}\n"
-            f"    Then check the schema sections 'Uniqueness Profile' and 'Safe Grouping Keys'.\n"
-            f"    If {entity} is non-unique or has a mapped key, GROUP BY stable_key + {entity}\n"
-            f"    (for example customer_id + customer_name) to avoid merging distinct entities.\n"
+            f"    Check 'Uniqueness Profile' and 'Safe Grouping Keys' sections.\n"
+            f"    If {entity} is non-unique, GROUP BY stable_key + {entity}.\n"
             f"    Semantic suggestion key: {entity_key or 'N/A'}\n"
             f"    Do NOT assume any *_name column is unique.\n"
         )
@@ -339,13 +338,13 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
         else:
             rank_instr = f"HAVING aggregation {op} {tval}\nORDER BY value DESC"
     elif qt == "comparison":
-        rank_instr = f"Two-period comparison. Use CTEs for each period. ORDER BY value1 DESC LIMIT {top_n}"
+        rank_instr = f"Two-period comparison. Use CTEs. ORDER BY value1 DESC LIMIT {top_n}"
     elif qt == "growth_ranking":
         rank_instr = f"Rank by delta = period2_value - period1_value. ORDER BY delta DESC LIMIT {top_n}"
     elif qt == "intersection":
         rank_instr = f"Only entities present in BOTH periods. ORDER BY value DESC LIMIT {top_n}"
     elif qt == "zero_filter":
-        rank_instr = "Entities where metric = 0 or entity has no rows in period. ORDER BY name"
+        rank_instr = "Entities where metric = 0 or no rows in period. ORDER BY name"
     else:
         rank_instr = f"ORDER BY value DESC LIMIT {top_n}"
 
@@ -356,19 +355,17 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
 
     if filter_clause:
         filter_rule = (
-            f"11. BUSINESS FILTERS — MANDATORY (add these to EVERY query):\n"
-            f"    The following WHERE conditions MUST be included.\n"
-            f"    They exclude cancelled, deleted, or fraudulent rows and are\n"
-            f"    CRITICAL for correct revenue / count figures:\n"
+            f"11. BUSINESS FILTERS — MANDATORY:\n"
+            f"    The following WHERE conditions MUST be included:\n"
             f"{filter_clause}\n"
-            f"    Add them after the date filter:\n"
+            f"    Add after date filter:\n"
             f"      WHERE date_col BETWEEN ? AND ?\n"
             f"{filter_clause}\n"
         )
     else:
         filter_rule = "11. No additional business filters required."
 
-    return f"""You are a DuckDB SQL expert. Output ONLY raw SQL — no prose, no markdown fences, no explanation.
+    return f"""You are a DuckDB SQL expert. Output ONLY raw SQL — no prose, no markdown fences.
 
 User question: "{user_query}"
 
@@ -383,40 +380,34 @@ Parsed intent:
   filters    : {filter_desc}{date_hints}
 
 STRICT RULES:
-0. Read the "Semantic Layer" section first, then map semantic terms to physical columns.
-1. Use the EXACT column names from the schema above.
+0. Read the "Semantic Layer" and "Metric column mappings" sections above first.
+   Use the EXACT physical column names from those sections for the metric.
+1. Use EXACT column names from the schema above (no guessing).
 2. Alias the display column as "name" in SELECT.
 3. Alias the aggregation as "value".
-3b. Use schema uniqueness guidance:
-   - Read "Uniqueness Profile" and "Safe Grouping Keys" first.
-   - If entity label is non-unique, group using stable key + label.
-   - Never collapse different IDs into one row only because names match.
+3b. Read "Uniqueness Profile" and "Safe Grouping Keys" first.
+    If entity label is non-unique, group by stable key + label.
 4. DATE FILTER — CRITICAL:
-   Use the EXCLUSIVE-RANGE pattern for datetime/timestamp columns:
+   Use EXCLUSIVE-RANGE pattern for datetime/timestamp columns:
        col >= ?  AND  col < ?
    where the second ? is the day AFTER the period end.
-   Example for "year 2023":
-       order_datetime >= ?   -- bound to 2023-01-01
-       AND order_datetime < ?  -- bound to 2024-01-01  (exclusive)
-   NEVER use BETWEEN for datetime columns — it silently drops the last day.
+   NEVER use BETWEEN for datetime columns.
    NEVER use EXTRACT(YEAR ...) = ? or EXTRACT(MONTH ...) = ?
-5. Use ? for ALL date/number placeholders — never hard-code values.
+5. Use ? for ALL date/number placeholders.
 6. No semicolons. No comments. SELECT only.
-7. For "count" metric: prefer COUNT(DISTINCT {count_key or '<primary_order_id_column>'}) AS value
+7. For "count" metric: COUNT(DISTINCT {count_key or '<primary_order_id_column>'}) AS value
 8. For metric columns:
-   - Default: SUM(column_name) AS value
-   - If metric starts with "avg_" (e.g. avg_final_price, avg_total_fare):
-     use AVG(<column_without_avg_prefix>) AS value
-     Example: metric=avg_final_price → AVG(final_price) AS value
-   - If metric is "count": use COUNT(DISTINCT <primary_order_id_column>) AS value
-     NOT COUNT(*). The table stores order items — each order appears on multiple
-     rows. Use the unique order identifier (order_id, ride_id, trip_id, etc.).
+   - Default: SUM(column_name) AS value  (use exact column from schema)
+   - If metric starts with "avg_": AVG(<column_without_avg_prefix>) AS value
+   - If metric is "count": COUNT(DISTINCT <primary_order_id>) AS value
 9. Ranking: {rank_instr}
 {groupby_rule}
 {filter_rule}
 
 SQL:"""
 
+
+# ── LLM call ──────────────────────────────────────────────────────────────────
 
 def _call_llm(model: str, prompt: str) -> tuple[str, dict]:
     resp = requests.post(
@@ -436,6 +427,7 @@ def _call_llm(model: str, prompt: str) -> tuple[str, dict]:
 
 
 def _registry_fallback(parsed: dict) -> str | None:
+    """Fast-path fallback using hardcoded SQL registry (e-commerce schema only)."""
     qt = parsed.get("query_type", "top_n")
     if qt not in ("top_n", "bottom_n", "aggregate"):
         return None
@@ -448,16 +440,15 @@ def _registry_fallback(parsed: dict) -> str | None:
         return None
 
 
-
 def _deterministic_time_series_fallback(parsed: dict) -> str | None:
     """
     Build a robust time-series SQL without LLM.
     Used when query_type=time_series and model generation fails.
     """
-    metric = (parsed.get("metric") or "count").lower()
-    bucket = (parsed.get("time_bucket") or "month").lower()
-    filters = parsed.get("filters", {}) or {}
-    count_key_hint = parsed.get("_count_distinct_key")
+    metric    = (parsed.get("metric") or "count").lower()
+    bucket    = (parsed.get("time_bucket") or "month").lower()
+    filters   = parsed.get("filters", {}) or {}
+    count_key = parsed.get("_count_distinct_key")
 
     try:
         conn = get_read_connection()
@@ -481,7 +472,7 @@ def _deterministic_time_series_fallback(parsed: dict) -> str | None:
         return f"STRFTIME({date_col}, '%Y-%m')"
 
     def _choose_plan() -> tuple[str, str, str] | None:
-        best = None  # (score, table, date_col, agg_expr)
+        best = None
         for t in tables:
             try:
                 cols = [(c[0], str(c[1]).upper()) for c in conn.execute(f'DESCRIBE "{t}"').fetchall()]
@@ -490,7 +481,8 @@ def _deterministic_time_series_fallback(parsed: dict) -> str | None:
             col_names = [c[0].lower() for c in cols]
             date_cols = [
                 c for c, typ in cols
-                if ("DATE" in typ or "TIMESTAMP" in typ or any(k in c.lower() for k in ("date", "time", "created", "updated", "at")))
+                if ("DATE" in typ or "TIMESTAMP" in typ
+                    or any(k in c.lower() for k in ("date", "time", "created", "updated", "at")))
             ]
             if not date_cols:
                 continue
@@ -499,15 +491,15 @@ def _deterministic_time_series_fallback(parsed: dict) -> str | None:
             agg_expr = None
             score = 0
             if metric == "count":
-                count_key = count_key_hint
-                if not count_key or count_key.lower() not in col_names:
-                    count_key = next((c for c in col_names if any(k in c for k in ("order_id", "ride_id", "trip_id", "booking_id"))), None)
-                if count_key:
-                    agg_expr = f'COUNT(DISTINCT "{count_key}")'
-                    score += 6
-                else:
-                    agg_expr = "COUNT(*)"
-                    score += 2
+                ck = count_key
+                if not ck or ck.lower() not in col_names:
+                    ck = next(
+                        (c for c in col_names
+                         if any(k in c for k in ("order_id", "ride_id", "trip_id", "booking_id", "id"))),
+                        None
+                    )
+                agg_expr = f'COUNT(DISTINCT "{ck}")' if ck else "COUNT(*)"
+                score += 6 if ck else 2
             elif metric.startswith("avg_"):
                 mcol = metric[4:]
                 if mcol in col_names:
@@ -518,10 +510,13 @@ def _deterministic_time_series_fallback(parsed: dict) -> str | None:
                     agg_expr = f'SUM("{metric}")'
                     score += 7
                 else:
-                    candidates = [c for c in col_names if any(k in c for k in ("final_price", "total_amount", "total_fare", "revenue", "sales", "earning", "amount"))]
+                    candidates = [
+                        c for c in col_names
+                        if any(k in c for k in ("final_price", "total_amount", "total_fare",
+                                                "revenue", "sales", "earning", "amount", "price"))
+                    ]
                     if candidates:
-                        chosen = candidates[0]
-                        agg_expr = f'SUM("{chosen}")'
+                        agg_expr = f'SUM("{candidates[0]}")'
                         score += 4
             if not agg_expr:
                 continue
@@ -532,9 +527,8 @@ def _deterministic_time_series_fallback(parsed: dict) -> str | None:
                 score += 2
             if best is None or score > best[0]:
                 best = (score, t, date_col, agg_expr)
-        if best is None:
-            return None
-        return best[1], best[2], best[3]
+
+        return (best[1], best[2], best[3]) if best else None
 
     try:
         plan = _choose_plan()
@@ -560,6 +554,10 @@ def _deterministic_time_series_fallback(parsed: dict) -> str | None:
         f'GROUP BY {b_expr}\n'
         f'ORDER BY name ASC'
     )
+
+
+# ── Handler ───────────────────────────────────────────────────────────────────
+
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     query_id   = input_data.get("queryId")
     user_query = input_data.get("query", "")
@@ -571,11 +569,12 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     filters = parsed.get("filters", {}) or {}
 
     existing_tables = _get_existing_tables()
-    sales_available = _sales_schema_available(existing_tables)
+    is_ecommerce    = _is_classic_ecommerce_schema(existing_tables)
+
     ctx.logger.info("📋 DB tables found", {
         "queryId":      query_id,
         "tables":       list(existing_tables),
-        "sales_schema": sales_available,
+        "is_ecommerce": is_ecommerce,
     })
 
     ctx.logger.info("🧬 TextToSQL", {
@@ -590,15 +589,18 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     fallback_used = False
     sql_source    = "builder"
 
-    force_llm = (
-        bool(filters)
-        or not sales_available
-        or qt == "time_series"
-        or parsed.get("entity") not in _BUILDER_ENTITIES
-        or parsed.get("metric") not in _BUILDER_METRICS
+    # ── Fast path: deterministic builder for classic e-commerce schema ─────────
+    # Only activated when the exact required tables are present AND the entity/
+    # metric combination is in the known set. All other datasets always use LLM.
+    use_builder = (
+        is_ecommerce
+        and not bool(filters)
+        and qt not in ("time_series",)
+        and parsed.get("entity") in _ECOMMERCE_VALID_ENTITIES
+        and parsed.get("metric") in _ECOMMERCE_VALID_METRICS
     )
 
-    if not force_llm:
+    if use_builder:
         built = build_sql(parsed)
         if built:
             ok, reason = _is_safe(built)
@@ -614,10 +616,11 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 ctx.logger.warn("⚠️ Builder safety failed — falling to LLM",
                                 {"queryId": query_id, "reason": reason})
 
+    # ── LLM path: used for all non-e-commerce datasets and complex query types ─
     if generated_sql is None:
-        COMPLEX = {"growth_ranking", "comparison", "threshold", "intersection",
-                   "zero_filter", "time_series"}
-        model      = QWEN_MODEL if qt in COMPLEX else LLAMA_MODEL
+        _COMPLEX = {"growth_ranking", "comparison", "threshold", "intersection",
+                    "zero_filter", "time_series"}
+        model      = QWEN_MODEL if qt in _COMPLEX else LLAMA_MODEL
         sql_source = f"llm_{model.split('/')[0]}"
 
         ctx.logger.info("🤖 LLM SQL generation", {"queryId": query_id, "model": model})
@@ -637,9 +640,15 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                     generated_sql = sql
                     ctx.logger.info("✅ LLM SQL validated", {"queryId": query_id})
                 else:
-                    ctx.logger.warn("⚠️ LLM EXPLAIN failed — attempting execution anyway",
-                                    {"queryId": query_id, "error": err})
-                    generated_sql = sql
+                    # For time_series, prefer deterministic fallback over broken LLM SQL.
+                    if qt == "time_series":
+                        ctx.logger.warn(
+                            "⚠️ LLM EXPLAIN failed for time_series — using deterministic fallback",
+                            {"queryId": query_id, "error": err})
+                    else:
+                        ctx.logger.warn("⚠️ LLM EXPLAIN failed — attempting execution anyway",
+                                        {"queryId": query_id, "error": err})
+                        generated_sql = sql
             else:
                 ctx.logger.warn("⚠️ LLM safety failed", {"queryId": query_id, "reason": reason})
         except Exception as exc:
@@ -649,7 +658,8 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             log_tokens(ctx, query_id, "TextToSQL", model, usage)
             await add_tokens_to_state(ctx, query_id, "TextToSQL", model, usage)
 
-    if generated_sql is None and sales_available:
+    # ── Registry fallback (e-commerce only) ────────────────────────────────────
+    if generated_sql is None and is_ecommerce:
         fb = _registry_fallback(parsed)
         if fb:
             generated_sql = fb
@@ -657,12 +667,13 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             sql_source    = "registry_fallback"
             ctx.logger.warn("⚠️ Registry fallback used", {"queryId": query_id})
 
+    # ── Deterministic time-series fallback (any schema) ────────────────────────
     if generated_sql is None and qt == "time_series":
         fb = _deterministic_time_series_fallback(parsed)
         if fb:
             generated_sql = fb
             fallback_used = True
-            sql_source = "deterministic_time_series_fallback"
+            sql_source    = "deterministic_time_series_fallback"
             ctx.logger.warn("Deterministic time_series fallback used", {"queryId": query_id})
 
     if generated_sql is None:

@@ -3,6 +3,13 @@
 Returns a self-contained HTML page with a Chart.js visualisation of the
 query results. Reads chart_config saved by format_result_step.
 
+Changes vs original:
+  - Removed hardcoded ₹ prefix for "revenue" metric.
+  - Currency prefix is now inferred from the metric column name using the
+    same _infer_currency() logic as format_result_step, so charts and text
+    results always use the same currency symbol.
+  - The JS tooltip formatter and axis tick formatter use the computed prefix.
+
 Trigger: HTTP GET /query/:queryId/chart
 """
 
@@ -96,15 +103,42 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 </html>"""
 
 
+def _infer_currency(metric: str) -> str:
+    """
+    Infer a currency/unit prefix from the metric column name.
+
+    This matches the logic in format_result_step._infer_currency() so that
+    chart axis ticks and tooltips use the same symbol as the formatted text.
+
+    Returns an empty string for non-monetary metrics (count, quantity, distance, etc.).
+    """
+    m = (metric or "").lower()
+    # Explicit currency signals
+    if any(x in m for x in ["inr", "rupee", "rs "]):
+        return "Rs "
+    if any(x in m for x in ["usd", "dollar", "$"]):
+        return "$"
+    if any(x in m for x in ["eur", "euro", "£", "gbp"]):
+        return "€"
+    # Monetary column name patterns → no prefix (let numbers speak)
+    # Count, quantity, distance, duration → no prefix
+    if any(x in m for x in ["count", "quantity", "units", "distance", "duration",
+                              "rides", "trips", "orders", "km", "miles", "minutes"]):
+        return ""
+    # Everything else gets no prefix — safe default
+    return ""
+
+
 def _build_html(query_state: dict) -> str:
     chart_config = query_state.get("chart_config")
     token_totals = query_state.get("token_totals", {})
     parsed       = query_state.get("parsed", {})
-    metric       = parsed.get("metric", "revenue")
-    entity       = parsed.get("entity", "product")
-    ranking      = query_state.get("schema", {}).get("ranking") or parsed.get("ranking", "top")
+    metric       = parsed.get("metric", "")
 
-    # Build subtitle from token totals
+    # Compute currency prefix from actual metric column name — no hardcoding
+    currency_prefix = _infer_currency(metric)
+
+    # Token usage box
     token_html = ""
     if token_totals.get("total_tokens"):
         token_html = (
@@ -132,8 +166,11 @@ def _build_html(query_state: dict) -> str:
     body = f'<div class="chart-wrap"><canvas id="myChart"></canvas></div>{token_html}'
 
     import json
-    cfg = chart_config.get("config", {})
+    cfg      = chart_config.get("config", {})
     json_str = json.dumps(cfg, indent=2)
+
+    # Inject the dynamically-computed prefix into JS (safe: only "", "Rs ", "$", "€")
+    safe_prefix = currency_prefix.replace("'", "\\'")
 
     script = f"""
 const ctx = document.getElementById('myChart');
@@ -172,10 +209,10 @@ const chartConfig = reviveFunctions(rawConfig);
 chartConfig.options = chartConfig.options || {{}};
 chartConfig.options.plugins = chartConfig.options.plugins || {{}};
 chartConfig.options.plugins.tooltip = chartConfig.options.plugins.tooltip || {{}};
-chartConfig.options.plugins.tooltip.enabled = true;
 chartConfig.options.interaction = chartConfig.options.interaction || {{ mode: 'nearest', intersect: false }};
 
-const prefix = {("'₹'" if metric == "revenue" else "''")};
+// Currency prefix — computed server-side from metric column name
+const prefix = '{safe_prefix}';
 const tooltip = chartConfig.options.plugins.tooltip;
 tooltip.callbacks = tooltip.callbacks || {{}};
 if (typeof tooltip.callbacks.label !== 'function') {{
@@ -184,8 +221,8 @@ if (typeof tooltip.callbacks.label !== 'function') {{
     const n = (typeof v === 'number')
       ? v.toLocaleString('en-IN', {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})
       : String(v ?? '');
-    const ds = c.dataset && c.dataset.label ? `${{c.dataset.label}}: ` : '';
-    return ` ${{ds}}${{prefix}}${{n}}`;
+    const ds = c.dataset && c.dataset.label ? c.dataset.label + ': ' : '';
+    return ' ' + ds + prefix + n;
   }};
 }}
 
@@ -209,13 +246,12 @@ async def handler(request: ApiRequest[Any], ctx: FlowContext[Any]) -> ApiRespons
 
     if query_state.get("status") != "completed":
         return ApiResponse(status=202, body={
-            "error": "Query not yet completed",
+            "error":  "Query not yet completed",
             "status": query_state.get("status"),
         })
 
     html = _build_html(query_state)
 
-    # Return raw HTML — Motia will pass through the Content-Type header
     return ApiResponse(
         status=200,
         body=html,
