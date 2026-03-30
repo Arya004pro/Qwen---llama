@@ -720,6 +720,56 @@ def _has_metric_cue(query: str) -> bool:
     return any(c in q for c in metric_cues)
 
 
+def _infer_entity_from_grouping_cue(
+    user_query: str,
+    entity_map: list[tuple[str, str]],
+) -> str | None:
+    q = f" {(user_query or '').lower()} "
+    targets = []
+    for m in re.finditer(r"\b(?:per|by|for each|each)\s+([a-z][a-z0-9]*(?:\s+[a-z][a-z0-9]*){0,2})", q):
+        phrase = (m.group(1) or "").strip()
+        if not phrase:
+            continue
+        first = phrase.split()[0]
+        if first in {"year", "month", "week", "day", "quarter", "date", "time"}:
+            continue
+        targets.append(phrase)
+
+    best: tuple[int, str] | None = None
+
+    for kw, col in entity_map:
+        k = (kw or "").lower().strip()
+        c = (col or "").lower().replace("_", " ").strip()
+        if not k:
+            continue
+        variants = {k, k.rstrip("s"), c, c.rstrip("s")}
+        k_tokens = [t for t in re.split(r"\s+", k.replace("_", " ")) if t]
+        c_tokens = [t for t in re.split(r"\s+", c) if t]
+        for t in k_tokens + c_tokens:
+            if len(t) >= 3 and t not in {"name", "type", "status", "code", "id"}:
+                variants.add(t)
+
+        score = 0
+        for v in variants:
+            if len(v) < 3:
+                continue
+            if f" per {v} " in q:
+                score += 12
+            if f" by {v} " in q:
+                score += 10
+            if f" each {v} " in q or f" for each {v} " in q:
+                score += 10
+            for tgt in targets:
+                if tgt == v:
+                    score += 10
+                elif tgt in v or v in tgt:
+                    score += 6
+        if score > 0 and (best is None or score > best[0]):
+            best = (score, col)
+
+    return best[1] if best else None
+
+
 # ── Schema-aware fallback parser ──────────────────────────────────────────────
 
 def _fallback_parse(user_query: str) -> dict:
@@ -868,6 +918,7 @@ def _post_process(
     )
     growth_cues = ("growth", "grew", "increase", "decrease", "delta", "change")
     split_cue = any(x in ql for x in (" vs ", " versus ", " compared to ", " against "))
+    grouping_cue = bool(re.search(r"\b(per|by|for each|each)\b", ql))
 
     if _is_aov_intent(user_query):
         parsed["metric"] = "aov"
@@ -882,6 +933,12 @@ def _post_process(
             m = parsed["metric"]
 
     ranking_cue = _has_ranking_cue(user_query)
+
+    if not parsed.get("entity") and grouping_cue:
+        entity_map_for_grouping, _ = _build_schema_keyword_maps()
+        inferred_entity = _infer_entity_from_grouping_cue(user_query, entity_map_for_grouping)
+        if inferred_entity:
+            parsed["entity"] = inferred_entity
 
     if split_cue and any(c in ql for c in count_cues):
         split_entity = _find_split_dimension_for_query(user_query)
@@ -925,13 +982,26 @@ def _post_process(
             parsed["query_type"] = "growth_ranking"
             qt = "growth_ranking"
 
-    if qt in ("top_n", "bottom_n") and not ranking_cue and not split_cue and any(c in ql for c in aggregate_cues):
+    if qt in ("top_n", "bottom_n") and not ranking_cue and not split_cue and any(c in ql for c in aggregate_cues) and not (grouping_cue and parsed.get("entity")):
         parsed["query_type"] = "aggregate"
         parsed["entity"] = None
         qt = "aggregate"
 
+    if qt == "aggregate" and grouping_cue and parsed.get("entity") and any(c in ql for c in aggregate_cues):
+        parsed["query_type"] = "top_n"
+        parsed["_disable_limit"] = True
+        qt = "top_n"
+
+    if qt in ("top_n", "bottom_n") and grouping_cue and parsed.get("entity") and not ranking_cue:
+        parsed["query_type"] = "top_n"
+        parsed["_disable_limit"] = True
+        qt = "top_n"
+
     if qt in ("top_n", "bottom_n") and not parsed.get("entity"):
         entity_map, _ = _build_schema_keyword_maps()
+        inferred_entity = _infer_entity_from_grouping_cue(user_query, entity_map)
+        if inferred_entity:
+            parsed["entity"] = inferred_entity
         preferred_tokens = {
             "product": "product",
             "customer": "customer",
@@ -946,13 +1016,14 @@ def _post_process(
             "coupon": "coupon",
             "payment": "payment",
         }
-        for tok, needle in preferred_tokens.items():
-            if tok not in ql:
-                continue
-            match_col = next((col for _, col in entity_map if needle in col.lower()), None)
-            if match_col:
-                parsed["entity"] = match_col
-                break
+        if not parsed.get("entity"):
+            for tok, needle in preferred_tokens.items():
+                if tok not in ql:
+                    continue
+                match_col = next((col for _, col in entity_map if needle in col.lower()), None)
+                if match_col:
+                    parsed["entity"] = match_col
+                    break
 
     if (
         _is_trend_query(user_query)

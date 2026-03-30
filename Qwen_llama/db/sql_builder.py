@@ -276,6 +276,7 @@ def build_sql(parsed: dict) -> str | None:
     entity_raw = parsed.get("entity")
     metric_raw = parsed.get("metric", "revenue")
     qt         = parsed.get("query_type", "top_n")
+    disable_limit = bool(parsed.get("_disable_limit"))
     filters    = parsed.get("filters", {})
     aov_revenue_raw = parsed.get("_aov_revenue_col")
     aov_count_key_raw = parsed.get("_count_distinct_key")
@@ -402,6 +403,7 @@ def build_sql(parsed: dict) -> str | None:
     if qt in ("top_n", "bottom_n"):
         if not e_col:
             return None
+        limit_clause = "" if disable_limit else "\nLIMIT ?"
         return (
             f'SELECT "{e_col}" AS name,\n'
             f'       {agg_expr} AS value\n'
@@ -409,7 +411,7 @@ def build_sql(parsed: dict) -> str | None:
             f'WHERE {date_filter}\n'
             f'GROUP BY "{e_col}"\n'
             f'ORDER BY value {direction}\n'
-            f'LIMIT ?'
+            f'{limit_clause}'
         )
 
     return None

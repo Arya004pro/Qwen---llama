@@ -357,6 +357,7 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
     aov_revenue_col = parsed.get("_aov_revenue_col")
     qt         = parsed.get("query_type", "top_n")
     top_n      = parsed.get("top_n", 5)
+    disable_limit = bool(parsed.get("_disable_limit"))
     thr        = parsed.get("threshold") or {}
     filters    = parsed.get("filters", {}) or {}
     trs        = parsed.get("time_ranges", [])
@@ -393,9 +394,9 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
             f"\n{ts_hint}"
         )
     elif qt == "top_n":
-        rank_instr = f"ORDER BY value DESC\nLIMIT {top_n}"
+        rank_instr = "ORDER BY value DESC\nNO LIMIT" if disable_limit else f"ORDER BY value DESC\nLIMIT {top_n}"
     elif qt == "bottom_n":
-        rank_instr = f"ORDER BY value ASC\nLIMIT {top_n}"
+        rank_instr = "ORDER BY value ASC\nNO LIMIT" if disable_limit else f"ORDER BY value ASC\nLIMIT {top_n}"
     elif qt == "aggregate":
         rank_instr = "No GROUP BY, no ORDER BY, no LIMIT. Return single scalar aliased 'value'."
     elif qt == "threshold":
@@ -451,6 +452,7 @@ Parsed intent:
     count_distinct_key: {count_key or 'N/A'}
   time_bucket: {bucket if qt == 'time_series' else 'N/A'}
   top_n      : {top_n}
+    disable_limit: {disable_limit}
   filters    : {filter_desc}{date_hints}
 
 STRICT RULES:

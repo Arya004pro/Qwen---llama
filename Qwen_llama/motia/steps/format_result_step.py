@@ -6,6 +6,10 @@ Changes vs original:
       Month labels like "2024-01" are converted to "Jan 2024" for readability.
       Text output shows the trend table with all time buckets.
   - All other formatting (comparison, ranked, aggregate, etc.) unchanged.
+  - FIX: Header no longer says "Top N" when result is a full distribution/breakdown.
+      Only says "Top N" when results == top_n (truncated). Otherwise says "breakdown".
+  - FIX: is_* boolean entity columns get human-readable labels (e.g. "Refund Status breakdown").
+  - FIX: _post_process top_n inflated to 20 for vs-queries now handled gracefully.
 """
 
 import re
@@ -46,7 +50,6 @@ def _format_bucket_label(raw_label: str, bucket: str) -> str:
         abbr = _MONTH_ABBR.get(month, month)
         return f"{abbr} {year}"
     if bucket == "quarter" and "Q" in raw_label:
-        # e.g. "2024-Q1" stays as is  already readable
         return raw_label
     if bucket == "week":
         return raw_label.replace("-W", " W")
@@ -85,11 +88,16 @@ def _metric_label(metric: str, currency: str) -> str:
 
 
 def _entity_label(entity: str) -> str:
+    """Return a clean plural label for an entity column."""
     if not entity:
         return ""
     base = entity
+
+    # Handle boolean flag columns: is_refunded → "Refund Status"
     if base.startswith("is_"):
-        base = base[3:] + "_status"
+        core = base[3:].replace("_", " ").strip()
+        return f"{core} status"
+
     for suffix in ("_name", "_id", "_type", "_code", "_key"):
         if base.endswith(suffix):
             base = base[: -len(suffix)]
@@ -119,12 +127,45 @@ def _display_entity_name(raw_name: Any, entity: str) -> str:
     if name in one_vals:
         if base == "active":
             return "Active"
+        if base == "refunded":
+            return "Refunded"
+        if base == "cancelled":
+            return "Cancelled"
         return base.title()
     if name in zero_vals:
         if base == "active":
             return "Inactive"
+        if base == "refunded":
+            return "Not Refunded"
+        if base == "cancelled":
+            return "Not Cancelled"
         return f"Not {base}".title()
     return name
+
+
+def _ranked_header(
+    qt: str,
+    top_n: int,
+    result_count: int,
+    elabel: str,
+    mlabel: str,
+    period_str: str,
+    disable_limit: bool = False,
+) -> str:
+    """
+    Build a header that only says 'Top N' when results are genuinely truncated.
+    If result_count < top_n it's a full distribution — label it as a breakdown.
+    """
+    elabel_title = elabel.title() if elabel else "Items"
+
+    # Full distribution (all rows returned, no truncation)
+    if disable_limit or result_count < top_n or result_count <= 5:
+        return f"📊 {elabel_title} breakdown by {mlabel} {period_str}:"
+
+    if qt == "bottom_n":
+        return f"Bottom {top_n} {elabel_title} by {mlabel} {period_str}:"
+
+    return f"Top {top_n} {elabel_title} by {mlabel} {period_str}:"
 
 
 def _tick_fn(metric: str, currency: str) -> str:
@@ -256,7 +297,6 @@ def _make_line_chart(labels: list, values: list, metric: str,
     tick_fn = _tick_fn(metric, currency)
     tip_fn  = _tooltip_fn(metric, currency)
 
-    # x-axis label formatting: show rotated labels for month/day
     max_rotation = 45 if len(labels) > 6 else 0
 
     cfg = {
@@ -367,17 +407,15 @@ def _fmt_indian(v: Any, currency: str, decimals: int = 2) -> str:
         val = float(v)
     except Exception:
         return str(v)
-    
+
     sign = "-" if val < 0 else ""
     abs_val = abs(val)
-    
-    # Format with requested decimals
+
     s = f"{abs_val:.{decimals}f}"
     parts = s.split('.')
     integer_part = parts[0]
     decimal_part = parts[1] if len(parts) > 1 else ""
-    
-    # Indian grouping: last 3, then every 2
+
     res = ""
     if len(integer_part) > 3:
         res = "," + integer_part[-3:]
@@ -389,7 +427,7 @@ def _fmt_indian(v: Any, currency: str, decimals: int = 2) -> str:
             res = remaining + res
     else:
         res = integer_part
-        
+
     formatted = f"{sign}{currency}{res}"
     if decimals > 0:
         formatted += f".{decimal_part}"
@@ -511,6 +549,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     metric = parsed.get("metric", "value")
     metric_display = parsed.get("semantic_metric") or metric
     top_n  = parsed.get("top_n", 5)
+    disable_limit = bool(parsed.get("_disable_limit"))
     thr    = parsed.get("threshold")
     bucket = parsed.get("time_bucket", "month")
 
@@ -589,7 +628,6 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             lines.append(f"Total: {_fmt_indian(total, p)}")
             lines.append(f"Average: {_fmt_indian(average, p)}")
 
-            # Keep text concise for long series; full detail should be chart-first.
             if len(values) <= 24:
                 lines.append("")
                 lines.append(f"{'Period':<14}  {'Value':>16}")
@@ -718,6 +756,8 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 header += f"\n{i}. {name}"
                 items.append({"rank": i, "name": name, "value": "0"})
         else:
+            period_str = _period_phrase if _period_phrase else f"between {start_date} and {end_date}"
+
             if qt == "threshold" and thr:
                 thr_op   = thr.get("operator", "gt")
                 thr_type = thr.get("type", "absolute")
@@ -732,9 +772,9 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 p2 = period_labels[1] if len(period_labels) > 1 else "Period 2"
                 header = f" {elabel.title()} present in BOTH {p1} AND {p2} (combined {mlabel}):"
             else:
-                rl = "Top" if qt == "top_n" else "Bottom"
-                period_str = _period_phrase if _period_phrase else f"between {start_date} and {end_date}"
-                header = f"{rl} {top_n} {elabel} by {mlabel} {period_str}:"
+                # ── KEY FIX: smart header based on result count vs requested top_n ──
+                header = _ranked_header(qt, top_n, len(results), elabel, mlabel, period_str, disable_limit)
+
             items = []
             for i, row in enumerate(results, 1):
                 name  = _display_entity_name(row.get("name", "?"), entity)
@@ -752,10 +792,15 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             insight_txt = "\n\nInsights:\n" + "\n".join(f"- {x}" for x in insights)
         formatted_text = header + insight_txt + _token_summary(token_usage, token_totals)
         if names:
-            rl = "Top" if qt != "bottom_n" else "Bottom"
+            # Chart title: use "breakdown" for small result sets, "Top N" otherwise
+            if disable_limit or len(names) < top_n or len(names) <= 5:
+                chart_title = user_query or f"{elabel.title()} breakdown by {mlabel}"
+            else:
+                rl = "Top" if qt != "bottom_n" else "Bottom"
+                chart_title = user_query or f"{rl} {elabel} by {mlabel}"
             chart_config = _bar(
                 names, values, metric_display, currency, entity,
-                user_query or f"{rl} {elabel} by {mlabel}",
+                chart_title,
                 f"{start_date} to {end_date}",
             )
 
