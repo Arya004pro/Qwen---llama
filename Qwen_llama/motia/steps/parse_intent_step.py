@@ -26,7 +26,13 @@ for _p in [_STEPS_DIR, _MOTIA_DIR, _PROJECT_ROOT]:
 
 import requests
 from motia import FlowContext, queue
-from shared_config import GROQ_API_TOKEN, QWEN_MODEL, GROQ_URL
+from shared_config import (
+    GROQ_API_TOKEN,
+    QWEN_MODEL,
+    GROQ_URL,
+    QWEN_ENABLE_REASONING,
+    QWEN_REASONING_EFFORT,
+)
 from utils.token_logger import log_tokens, add_tokens_to_state
 from utils.time_parser import parse_time_ranges_from_query
 from db.schema_context import get_schema_prompt
@@ -88,8 +94,8 @@ TIME SERIES RULES (CRITICAL):
 ENTITY RULES:
 - entity = the DISPLAY column to show in results — ALWAYS use the human-readable
   NAME column, NEVER a raw ID column.
-  Good: driver_name, customer_name, product_name, pickup_city, vehicle_type, restaurant_name
-  Bad:  driver_id, customer_id, product_id, order_id
+    Good: customer_name, product_name, category_name, city, segment_name
+    Bad:  customer_id, product_id, record_id, transaction_id
 - For query_type=aggregate or time_series: entity MUST be null.
 - If the user names a specific filter value (e.g. "in Mumbai"), put it in
   filters: {{column_name: value}} — do NOT use it as entity.
@@ -98,6 +104,8 @@ METRIC RULES — read the "Metric column mappings" section from the schema above
 - Use those exact physical column names for metric selection.
 - For "revenue", "sales", "earnings": prefer the post-discount / final amount column
   (highest specificity — read the schema to find it).
+- For "average order value" / "AOV": set metric="aov".
+    SQL generation will compute: SUM(revenue_column) / COUNT(DISTINCT order_identifier).
 - For "average order value", "average fare", "avg X": metric = "avg_<column>"
   (signals SQL generation to use AVG not SUM).
 - For "rides", "trips", "bookings", "orders", "count of", "number of", "how many":
@@ -159,6 +167,27 @@ _ALL_TIME_YEARLY_HINTS = {
     "by year", "per year",
 }
 
+_REVENUE_QUERY_HINTS = (
+    "revenue", "sales", "earning", "earnings", "income",
+    "turnover", "gmv", "gross merchandise", "net sales",
+)
+
+_REVENUE_STRONG_COL_HINTS = (
+    "revenue", "sales", "earning", "amount", "total",
+    "final", "net", "paid", "gmv",
+)
+
+_REVENUE_WEAK_COL_HINTS = (
+    "unit", "base", "list", "mrp", "msrp", "catalog", "original",
+    "cost", "tax", "discount", "coupon", "shipping", "commission",
+    "refund", "refunded", "before_",
+)
+
+_AOV_QUERY_HINTS = (
+    "aov", "average order value", "avg order value",
+    "average basket value", "average transaction value", "average ticket size",
+)
+
 _MANDATORY_FILTER_COLS: dict[str, dict] = {
     "is_cancelled":  {"is_cancelled": 0},
     "is_deleted":    {"is_deleted":   0},
@@ -186,7 +215,7 @@ def _build_schema_keyword_maps() -> tuple[list[tuple[str, str]], list[tuple[str,
 
     _TEXT_TYPES   = ("VARCHAR", "CHAR", "TEXT", "STRING")
     _NUM_TYPES    = ("INT", "BIGINT", "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC", "REAL")
-    _DATE_HINTS   = ("date", "time", "created", "updated", "timestamp", "at", "on")
+    _DATE_HINTS   = ("date", "time", "created", "updated", "timestamp")
     _ID_HINTS     = ("_id", "_key", "_uuid")
 
     _MONETARY = ("price", "fare", "amount", "earning", "revenue",
@@ -250,8 +279,8 @@ def _build_schema_keyword_maps() -> tuple[list[tuple[str, str]], list[tuple[str,
                         # Monetary column → revenue/earnings/sales all map here
                         if any(k in cname for k in _MONETARY):
                             metric_map.append((base_words, col))
-                            # Add generic aliases for revenue-like columns
-                            if any(k in cname for k in ("price", "fare", "amount", "total", "final", "revenue")):
+                            # Add revenue aliases only for strong revenue columns.
+                            if any(k in cname for k in ("revenue", "sales", "amount", "earning", "total", "final", "net", "paid")):
                                 for alias in ("revenue", "sales", "income", "earnings", "money"):
                                     metric_map.append((alias, col))
 
@@ -309,6 +338,154 @@ def _get_mandatory_filters() -> dict:
     except Exception:
         pass
     return mandatory
+
+
+def _should_skip_mandatory_filter(col_name: str, user_query: str, chosen_entity: str | None = None) -> bool:
+    ql = (user_query or "").lower()
+    c = (col_name or "").lower().strip()
+    if not c:
+        return False
+    if chosen_entity and c == str(chosen_entity).lower():
+        return True
+
+    normalized = c.replace("is_", "")
+    tokens = [t for t in normalized.split("_") if len(t) >= 3]
+    if any(tok in ql for tok in tokens):
+        return True
+    return False
+
+
+def _find_split_dimension_for_query(user_query: str) -> str | None:
+    ql = (user_query or "").lower()
+    split_cue = any(x in ql for x in (" vs ", " versus ", " compared to ", " against "))
+    if not split_cue:
+        return None
+
+    # Keep this generic: identify low-cardinality columns likely used for categorical splits.
+    try:
+        conn = get_read_connection()
+        rows = conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='main' ORDER BY table_name"
+        ).fetchall()
+
+        best: tuple[int, str] | None = None
+        for (table,) in rows:
+            cols = conn.execute(f'DESCRIBE "{table}"').fetchall()
+            for col, dtype, *_ in cols:
+                c = col.lower()
+                d = str(dtype).upper()
+
+                if any(k in c for k in ("date", "time", "created", "updated", "timestamp")):
+                    continue
+                if c.endswith("_id"):
+                    continue
+                if any(k in c for k in (
+                    "price", "amount", "revenue", "sales", "earning", "total",
+                    "cost", "discount", "qty", "quantity", "distance", "duration",
+                    "score", "rate", "percent", "ratio",
+                )):
+                    continue
+                is_text = any(t in d for t in ("VARCHAR", "CHAR", "TEXT", "STRING"))
+                is_numeric = any(t in d for t in ("INT", "BIGINT", "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC", "REAL"))
+                if not (is_text or is_numeric):
+                    continue
+
+                try:
+                    distinct_cnt, non_null = conn.execute(
+                        f'SELECT COUNT(DISTINCT "{col}"), COUNT("{col}") FROM "{table}"'
+                    ).fetchone()
+                    distinct_cnt = int(distinct_cnt or 0)
+                    non_null = int(non_null or 0)
+                except Exception:
+                    continue
+
+                if non_null == 0 or distinct_cnt < 2 or distinct_cnt > 12:
+                    continue
+
+                score = 0
+                name_tokens = [t for t in c.replace("is_", "").split("_") if len(t) >= 3]
+                if any(tok in ql for tok in name_tokens):
+                    score += 10
+                if c.startswith("is_"):
+                    score += 4
+                if distinct_cnt <= 6:
+                    score += 3
+                if any(w in ql for w in ("count", "number of", "how many", "total")):
+                    score += 2
+
+                if score > 0 and (best is None or score > best[0]):
+                    best = (score, col)
+
+        conn.close()
+        return best[1] if best else None
+    except Exception:
+        return None
+
+
+def _infer_boolean_flag_filters(user_query: str, split_cue: bool) -> dict[str, int]:
+    if split_cue:
+        return {}
+
+    ql = (user_query or "").lower()
+
+    def _word(term: str) -> bool:
+        return bool(re.search(rf"\b{re.escape(term)}\b", ql))
+
+    inferred: dict[str, int] = {}
+    try:
+        conn = get_read_connection()
+        rows = conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='main' ORDER BY table_name"
+        ).fetchall()
+        for (table,) in rows:
+            cols = conn.execute(f'DESCRIBE "{table}"').fetchall()
+            for col, dtype, *_ in cols:
+                c = str(col).lower()
+                d = str(dtype).upper()
+                if not any(t in d for t in ("INT", "BIGINT", "SMALLINT", "TINYINT", "BOOLEAN")):
+                    continue
+
+                try:
+                    vals = conn.execute(
+                        f'SELECT DISTINCT "{col}" FROM "{table}" '
+                        f'WHERE "{col}" IS NOT NULL LIMIT 3'
+                    ).fetchall()
+                except Exception:
+                    continue
+                norm_vals = {str(v[0]).strip() for v in vals}
+                if not norm_vals.issubset({"0", "1", "0.0", "1.0", "False", "True", "false", "true"}):
+                    continue
+
+                base = c[3:] if c.startswith("is_") else c
+                base_words = base.replace("_", " ")
+
+                positive_hit = _word(base) or _word(base_words) or _word(c)
+                negative_hit = any(
+                    phrase in ql for phrase in (
+                        f"not {base_words}",
+                        f"non {base_words}",
+                        f"non-{base_words}",
+                        f"without {base_words}",
+                        f"no {base_words}",
+                    )
+                )
+                if base == "active" and _word("inactive"):
+                    negative_hit = True
+                if base.endswith("ed") and _word(f"un{base}"):
+                    negative_hit = True
+
+                if negative_hit:
+                    inferred[c] = 0
+                elif positive_hit:
+                    inferred[c] = 1
+
+        conn.close()
+    except Exception:
+        return inferred
+
+    return inferred
 
 
 # ── Time-range helpers ────────────────────────────────────────────────────────
@@ -386,16 +563,118 @@ def _extract_json_object(text: str) -> str:
     return ""
 
 
+def _is_revenue_intent(query: str) -> bool:
+    q = (query or "").lower()
+    return any(k in q for k in _REVENUE_QUERY_HINTS)
+
+
+def _revenue_col_score(col_name: str) -> int:
+    c = (col_name or "").lower()
+    score = 0
+
+    if any(k in c for k in _REVENUE_STRONG_COL_HINTS):
+        score += 10
+    if "final" in c or "net" in c or "paid" in c:
+        score += 8
+    if "total" in c:
+        score += 6
+    if "price" in c or "fare" in c:
+        score += 3
+    if any(k in c for k in _REVENUE_WEAK_COL_HINTS):
+        score -= 7
+
+    return score
+
+
+def _select_primary_revenue_column(metric_map: list[tuple[str, str]]) -> str | None:
+    candidates: dict[str, int] = {}
+    for _, col in metric_map:
+        c = (col or "").lower().strip()
+        if not c or c == "count" or c.startswith("avg_"):
+            continue
+        score = _revenue_col_score(c)
+        prev = candidates.get(c)
+        if prev is None or score > prev:
+            candidates[c] = score
+
+    if not candidates:
+        return None
+
+    ranked = sorted(
+        candidates.items(),
+        key=lambda kv: (
+            kv[1],
+            1 if "final" in kv[0] else 0,
+            1 if "total" in kv[0] else 0,
+            1 if "amount" in kv[0] else 0,
+            -len(kv[0]),
+        ),
+        reverse=True,
+    )
+    return ranked[0][0]
+
+
+def _select_primary_count_key() -> str | None:
+    try:
+        conn = get_read_connection()
+        table_rows = conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='main' ORDER BY table_name"
+        ).fetchall()
+        best: tuple[int, str] | None = None
+        for (table,) in table_rows:
+            cols = conn.execute(f'DESCRIBE "{table}"').fetchall()
+            id_cols = [c[0].lower() for c in cols if c[0].lower().endswith("_id") or c[0].lower() == "id"]
+            for col in id_cols:
+                score = 0
+                if any(k in col for k in ("order", "transaction", "invoice", "booking", "trip", "ride",
+                                          "ticket", "request", "visit", "session", "sale", "payment")):
+                    score += 10
+                if any(k in col for k in ("row", "line", "item", "detail", "record", "event", "log")):
+                    score -= 10
+                if col == "id":
+                    score -= 2
+
+                try:
+                    non_null, distinct_cnt = conn.execute(
+                        f'SELECT COUNT("{col}"), COUNT(DISTINCT "{col}") FROM "{table}"'
+                    ).fetchone()
+                    non_null = int(non_null or 0)
+                    distinct_cnt = int(distinct_cnt or 0)
+                    if non_null > 0:
+                        ratio = distinct_cnt / non_null
+                        if 0.4 <= ratio < 0.995:
+                            score += 6
+                        elif ratio >= 0.995:
+                            score -= 6
+                        elif ratio < 0.05:
+                            score -= 4
+                except Exception:
+                    pass
+
+                if best is None or score > best[0]:
+                    best = (score, col)
+        conn.close()
+        return best[1] if best else None
+    except Exception:
+        return None
+
+
+def _is_aov_intent(query: str) -> bool:
+    q = (query or "").lower()
+    return any(k in q for k in _AOV_QUERY_HINTS)
+
+
 def _default_clarification(parsed: dict) -> str:
     qt = parsed.get("query_type", "top_n")
     if qt in ("aggregate", "time_series"):
         return "What time period should I use? (e.g. 2024, Q1 2024, March 2024)"
     if not parsed.get("entity"):
-        return "Which dimension should I group by? (e.g. course, student, platform, category, city)"
+        return "Which dimension should I group by? (e.g. customer, product, region, channel, category)"
     if not parsed.get("time_ranges"):
         return "What time period should I use? (e.g. 2024, Q1 2024, March 2024)"
     if not parsed.get("metric"):
-        return "What metric should I measure? (e.g. revenue, quantity, count of orders)"
+        return "What metric should I measure? (e.g. revenue, quantity, record count)"
     return "Please clarify: which dimension, metric, and time period do you want?"
 
 
@@ -430,6 +709,17 @@ def _has_ranking_cue(query: str) -> bool:
     ])
 
 
+def _has_metric_cue(query: str) -> bool:
+    q = (query or "").lower()
+    metric_cues = (
+        "revenue", "sales", "earning", "income", "turnover", "gmv",
+        "count", "how many", "number of", "quantity", "units",
+        "average", "avg", "price", "amount", "fare", "cost",
+        "discount", "profit", "margin", "rate", "score",
+    )
+    return any(c in q for c in metric_cues)
+
+
 # ── Schema-aware fallback parser ──────────────────────────────────────────────
 
 def _fallback_parse(user_query: str) -> dict:
@@ -442,13 +732,41 @@ def _fallback_parse(user_query: str) -> dict:
 
     # ── Time series ───────────────────────────────────────────────────────────
     if _is_trend_query(user_query):
+        if _is_aov_intent(user_query):
+            return {
+                "entity": None,
+                "metric": "aov",
+                "semantic_metric": "aov",
+                "_aov_revenue_col": _select_primary_revenue_column(_build_schema_keyword_maps()[1]),
+                "_count_distinct_key": _select_primary_count_key(),
+                "query_type": "time_series",
+                "time_bucket": _detect_time_bucket(user_query),
+                "top_n": 5,
+                "time_ranges": [],
+                "threshold": None,
+                "filters": {},
+                "is_complete": False,
+                "clarification_question": "What time period should I use? (e.g. 2024, Q1 2024)",
+            }
+
         # Try to identify the metric from live schema
         _, metric_map = _build_schema_keyword_maps()
-        metric = "count"  # default
+        metric = None
         for kw, col in metric_map:
             if kw in q:
                 metric = col
                 break
+
+        if _is_revenue_intent(user_query):
+            revenue_col = _select_primary_revenue_column(metric_map)
+            if revenue_col and (
+                metric is None or _revenue_col_score(metric) < _revenue_col_score(revenue_col)
+            ):
+                metric = revenue_col
+
+        if metric is None:
+            metric = "count"
+
         bucket = _detect_time_bucket(user_query)
         return {
             "entity": None, "metric": metric, "query_type": "time_series",
@@ -476,10 +794,23 @@ def _fallback_parse(user_query: str) -> dict:
 
     # Detect metric from live schema keyword map
     metric = None
-    for kw, col in metric_map:
-        if kw in q:
-            metric = col
-            break
+    is_aov = _is_aov_intent(user_query)
+    if is_aov:
+        metric = "aov"
+
+    if not is_aov:
+        for kw, col in metric_map:
+            if kw in q:
+                metric = col
+                break
+
+    if not is_aov and _is_revenue_intent(user_query):
+        revenue_col = _select_primary_revenue_column(metric_map)
+        if revenue_col and (
+            metric is None or _revenue_col_score(metric) < _revenue_col_score(revenue_col)
+        ):
+            metric = revenue_col
+
     if metric is None:
         # Default to first monetary column found, or "count"
         for kw, col in metric_map:
@@ -523,16 +854,26 @@ def _post_process(
     tr = parsed.get("time_ranges", [])
     m  = parsed.get("metric")
 
+    def _period_key(period: dict | None) -> tuple[str, str]:
+        period = period or {}
+        return (str(period.get("start") or ""), str(period.get("end") or ""))
+
     count_cues = (
-        "how many", "number of", "count", "enrollments", "orders",
-        "buyers", "students who", "percentage of orders",
+        "how many", "number of", "count", "orders", "records",
+        "transactions", "number of records",
     )
     avg_cues = ("average", "avg ", "aov", "average order value")
     aggregate_cues = (
         "total", "overall", "sum", "average", "avg", "how many", "number of",
     )
+    growth_cues = ("growth", "grew", "increase", "decrease", "delta", "change")
+    split_cue = any(x in ql for x in (" vs ", " versus ", " compared to ", " against "))
 
-    if any(c in ql for c in count_cues):
+    if _is_aov_intent(user_query):
+        parsed["metric"] = "aov"
+        parsed["semantic_metric"] = "aov"
+        m = "aov"
+    elif any(c in ql for c in count_cues):
         parsed["metric"] = "count"
         m = "count"
     elif m and isinstance(m, str) and not m.startswith("avg_") and any(c in ql for c in avg_cues):
@@ -541,7 +882,50 @@ def _post_process(
             m = parsed["metric"]
 
     ranking_cue = _has_ranking_cue(user_query)
-    if qt in ("top_n", "bottom_n") and not ranking_cue and any(c in ql for c in aggregate_cues):
+
+    if split_cue and any(c in ql for c in count_cues):
+        split_entity = _find_split_dimension_for_query(user_query)
+        if split_entity:
+            parsed["query_type"] = "top_n"
+            parsed["entity"] = split_entity
+            parsed["metric"] = "count"
+            parsed["semantic_metric"] = "count"
+            parsed["top_n"] = max(int(parsed.get("top_n") or 5), 20)
+            current_filters = dict(parsed.get("filters") or {})
+            current_filters.pop(split_entity, None)
+            parsed["filters"] = current_filters
+            qt = "top_n"
+            m = "count"
+
+            if _is_trend_query(user_query):
+                parsed["is_complete"] = False
+                parsed["_force_clarification"] = True
+                parsed["clarification_question"] = (
+                    "Do you want a year-wise trend for one status, or an overall paid vs refunded split?"
+                )
+
+    inferred_flag_filters = _infer_boolean_flag_filters(user_query, split_cue)
+    if inferred_flag_filters:
+        current_filters = dict(parsed.get("filters") or {})
+        for fk, fv in inferred_flag_filters.items():
+            current_filters[fk] = fv
+        parsed["filters"] = current_filters
+
+    if (parsed.get("metric") == "aov"
+            and qt in ("top_n", "bottom_n")
+            and not ranking_cue
+            and not parsed.get("entity")):
+        parsed["query_type"] = "aggregate"
+        parsed["entity"] = None
+        qt = "aggregate"
+
+    if any(c in ql for c in growth_cues) and not _is_trend_query(user_query):
+        entity_growth_phrase = bool(parsed.get("entity")) or " by " in f" {ql} "
+        if entity_growth_phrase and qt != "intersection":
+            parsed["query_type"] = "growth_ranking"
+            qt = "growth_ranking"
+
+    if qt in ("top_n", "bottom_n") and not ranking_cue and not split_cue and any(c in ql for c in aggregate_cues):
         parsed["query_type"] = "aggregate"
         parsed["entity"] = None
         qt = "aggregate"
@@ -549,6 +933,11 @@ def _post_process(
     if qt in ("top_n", "bottom_n") and not parsed.get("entity"):
         entity_map, _ = _build_schema_keyword_maps()
         preferred_tokens = {
+            "product": "product",
+            "customer": "customer",
+            "region": "region",
+            "segment": "segment",
+            "channel": "channel",
             "course": "course",
             "student": "student",
             "platform": "platform",
@@ -565,7 +954,12 @@ def _post_process(
                 parsed["entity"] = match_col
                 break
 
-    if _is_trend_query(user_query) and not ranking_cue and qt not in ("time_series",):
+    if (
+        _is_trend_query(user_query)
+        and not ranking_cue
+        and qt not in ("time_series",)
+        and not (split_cue and parsed.get("entity"))
+    ):
         parsed["query_type"] = "time_series"
         parsed["entity"]     = None
         qt = "time_series"
@@ -615,24 +1009,127 @@ def _post_process(
     # Resolve semantic aliases to concrete schema columns
     parsed = resolve_intent_with_semantic_layer(parsed, user_query)
 
+    if (parsed.get("metric") or "").lower() == "aov":
+        _, metric_map = _build_schema_keyword_maps()
+        parsed.setdefault("_aov_revenue_col", _select_primary_revenue_column(metric_map))
+        parsed.setdefault("_count_distinct_key", _select_primary_count_key())
+        parsed["semantic_metric"] = "aov"
+
+    # Revenue safety: if user asked for revenue-like metrics, prefer the
+    # strongest net/final monetary column from live schema over list/base price.
+    if _is_revenue_intent(user_query):
+        _, metric_map = _build_schema_keyword_maps()
+        preferred_revenue = _select_primary_revenue_column(metric_map)
+        if preferred_revenue:
+            current_metric = (parsed.get("metric") or "").lower().strip()
+            avg_mode = bool(current_metric.startswith("avg_"))
+            current_base = current_metric[4:] if avg_mode else current_metric
+            preferred_metric = f"avg_{preferred_revenue}" if avg_mode else preferred_revenue
+            if (
+                not current_metric
+                or current_metric == "count"
+                or _revenue_col_score(current_base) < _revenue_col_score(preferred_revenue)
+            ):
+                parsed["metric"] = preferred_metric
+            parsed["semantic_metric"] = "avg_revenue" if avg_mode else "revenue"
+
     # Inject mandatory business filters
     if mandatory_filters:
         existing = dict(parsed.get("filters") or {})
         for k, v in mandatory_filters.items():
+            if _should_skip_mandatory_filter(k, user_query, parsed.get("entity")):
+                continue
             existing.setdefault(k, v)
         parsed["filters"] = existing
 
+    # Late guard: if ranking-style query still has no entity, infer one from
+    # user phrasing + live schema column names.
+    if parsed.get("query_type") in ("top_n", "bottom_n", "threshold", "growth_ranking", "zero_filter") and not parsed.get("entity"):
+        entity_map, _ = _build_schema_keyword_maps()
+        hint_groups = [
+            (("product", "products", "item", "items"), ("product", "item")),
+            (("customer", "customers", "client", "clients", "user", "users"), ("customer", "client", "user")),
+            (("region", "regions", "state", "states"), ("region", "state")),
+            (("segment", "segments"), ("segment",)),
+            (("channel", "channels"), ("channel",)),
+            (("platform", "platforms", "channel", "channels"), ("platform", "channel")),
+            (("city", "cities", "town", "towns"), ("city",)),
+            (("course", "courses"), ("course",)),
+            (("student", "students", "learner", "learners"), ("student", "learner")),
+            (("category", "categories"), ("category",)),
+            (("coupon", "coupons", "promo", "promocode", "coupon code"), ("coupon", "promo")),
+            (("payment", "payment mode", "payment method"), ("payment",)),
+        ]
+        for terms, needles in hint_groups:
+            if not any(t in ql for t in terms):
+                continue
+            match_col = next(
+                (
+                    col for _, col in entity_map
+                    if any(n in col.lower() for n in needles)
+                ),
+                None,
+            )
+            if match_col:
+                parsed["entity"] = match_col
+                break
+
+    # Refresh derived fields in case semantic resolution or previous guards updated intent.
+    qt = parsed.get("query_type", qt)
+    tr = parsed.get("time_ranges", tr)
+    m = parsed.get("metric", m)
+
+    if parsed.get("_force_clarification"):
+        parsed["is_complete"] = False
+        parsed.setdefault(
+            "clarification_question",
+            "Please clarify your request so I can avoid an incorrect comparison.",
+        )
+        return parsed
+
     # Completeness guards
+    if (parsed.get("metric") or "").lower() == "aov":
+        if not parsed.get("_aov_revenue_col") or not parsed.get("_count_distinct_key"):
+            parsed["is_complete"] = False
+            parsed["clarification_question"] = (
+                "I need one revenue column and one order identifier column to compute AOV. "
+                "Which should I use?"
+            )
+            return parsed
+
     if qt in ("aggregate", "time_series") and m and tr:
         parsed["is_complete"]            = True
         parsed["clarification_question"] = None
-    if qt == "comparison" and m and len(tr) >= 2:
-        parsed["is_complete"]            = True
-        parsed["clarification_question"] = None
-    if qt in ("top_n", "bottom_n", "threshold", "growth_ranking", "zero_filter"):
+    if qt in ("comparison", "intersection"):
+        if m and len(tr) >= 2 and _period_key(tr[0]) != _period_key(tr[1]):
+            parsed["is_complete"] = True
+            parsed["clarification_question"] = None
+        else:
+            parsed["is_complete"] = False
+            parsed["clarification_question"] = (
+                "Please provide two different time periods to compare "
+                "(for example: 2022 vs 2023)."
+            )
+    if qt in ("top_n", "bottom_n", "threshold", "zero_filter"):
         if parsed.get("entity") and tr:
             parsed["is_complete"]            = True
             parsed["clarification_question"] = None
+    if qt == "growth_ranking":
+        if not _has_metric_cue(user_query):
+            parsed["is_complete"] = False
+            parsed["clarification_question"] = (
+                "Which metric should I use for growth ranking "
+                "(e.g. revenue, quantity, record count)?"
+            )
+        elif parsed.get("entity") and len(tr) >= 2 and _period_key(tr[0]) != _period_key(tr[1]):
+            parsed["is_complete"] = True
+            parsed["clarification_question"] = None
+        else:
+            parsed["is_complete"] = False
+            parsed["clarification_question"] = (
+                "Please provide an entity and two different time periods for growth ranking "
+                "(for example: product growth in 2022 vs 2023)."
+            )
 
     return parsed
 
@@ -641,20 +1138,29 @@ def _post_process(
 
 def _call_qwen(user_query: str, schema: str) -> tuple[dict, dict]:
     system = _SYSTEM_TEMPLATE.format(schema=schema)
-    resp = requests.post(
-        GROQ_URL,
-        headers={"Authorization": f"Bearer {GROQ_API_TOKEN}",
-                 "Content-Type": "application/json"},
-        json={
-            "model": QWEN_MODEL,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user_query},
-            ],
-            "max_tokens": 700, "temperature": 0.0,
-        },
-        timeout=30,
-    )
+    payload = {
+        "model": QWEN_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user_query},
+        ],
+        "max_tokens": 700,
+        "temperature": 0.0,
+    }
+
+    if QWEN_ENABLE_REASONING and "qwen" in QWEN_MODEL.lower() and QWEN_REASONING_EFFORT:
+        payload["reasoning_effort"] = QWEN_REASONING_EFFORT
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
+    if resp.status_code >= 400 and "reasoning_effort" in payload:
+        # Backward-safe fallback for providers/models that don't support this field.
+        payload.pop("reasoning_effort", None)
+        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     raw  = data["choices"][0]["message"]["content"].strip()

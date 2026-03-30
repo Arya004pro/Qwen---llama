@@ -26,4 +26,9 @@ QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen/qwen3-32b")
 LLAMA_MODEL = os.getenv("LLAMA_MODEL", "llama-3.1-8b-instant")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
+# Reasoning controls for Qwen. Reasoning is hidden from user output because
+# downstream steps strip <think> blocks before parsing/formatting.
+QWEN_ENABLE_REASONING = os.getenv("QWEN_ENABLE_REASONING", "1") == "1"
+QWEN_REASONING_EFFORT = os.getenv("QWEN_REASONING_EFFORT", "medium")
+
 DUCKDB_PATH = os.getenv("DUCKDB_PATH", "motia/data/analytics.duckdb")

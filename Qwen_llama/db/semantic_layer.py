@@ -25,6 +25,25 @@ _METRIC_HINTS = (
     "duration", "score", "rate", "profit", "margin",
 )
 
+_REVENUE_COL_HINTS = (
+    "revenue", "sales", "amount", "earning", "total", "final", "net", "paid",
+)
+
+_REVENUE_COL_PENALTIES = (
+    "unit", "base", "list", "mrp", "msrp", "catalog", "original",
+    "cost", "tax", "discount", "coupon", "shipping", "commission",
+    "refund", "refunded", "before_",
+)
+
+_COUNT_ID_STRONG_HINTS = (
+    "order", "transaction", "invoice", "booking", "trip", "ride",
+    "ticket", "request", "visit", "session", "sale", "payment",
+)
+
+_COUNT_ID_WEAK_HINTS = (
+    "row", "line", "item", "detail", "record", "event", "log",
+)
+
 
 def _is_text(dtype: str) -> bool:
     d = dtype.upper()
@@ -70,6 +89,81 @@ def _collect_columns(conn, tables: list[str]) -> dict[str, list[tuple[str, str]]
         except Exception:
             continue
     return out
+
+
+def _score_revenue_column_name(col_name: str) -> int:
+    c = (col_name or "").lower()
+    score = 0
+    if any(k in c for k in _REVENUE_COL_HINTS):
+        score += 10
+    if "final" in c or "net" in c or "paid" in c:
+        score += 8
+    if "total" in c:
+        score += 6
+    if "price" in c or "fare" in c:
+        score += 3
+    if any(k in c for k in _REVENUE_COL_PENALTIES):
+        score -= 7
+    return score
+
+
+def _pick_primary_revenue_column(cols: list[tuple[str, str]]) -> str | None:
+    numeric_cols = [
+        c.lower() for c, dtype in cols
+        if _is_numeric(dtype) and not c.lower().endswith("_id") and not _is_date_like(c, dtype)
+    ]
+    if not numeric_cols:
+        return None
+    ranked = sorted(
+        numeric_cols,
+        key=lambda c: (
+            _score_revenue_column_name(c),
+            1 if "final" in c else 0,
+            1 if "total" in c else 0,
+            1 if "amount" in c else 0,
+            -len(c),
+        ),
+        reverse=True,
+    )
+    return ranked[0]
+
+
+def _pick_count_identifier(conn, table: str, cols: list[tuple[str, str]]) -> str | None:
+    id_cols = [c.lower() for c, _ in cols if c.lower().endswith("_id") or c.lower() == "id"]
+    if not id_cols:
+        return None
+
+    best: tuple[int, str] | None = None
+    for col in id_cols:
+        score = 0
+        if any(k in col for k in _COUNT_ID_STRONG_HINTS):
+            score += 10
+        if any(k in col for k in _COUNT_ID_WEAK_HINTS):
+            score -= 10
+        if col == "id":
+            score -= 2
+
+        try:
+            non_null, distinct_cnt = conn.execute(
+                f'SELECT COUNT("{col}"), COUNT(DISTINCT "{col}") FROM "{table}"'
+            ).fetchone()
+            non_null = int(non_null or 0)
+            distinct_cnt = int(distinct_cnt or 0)
+            if non_null > 0:
+                ratio = distinct_cnt / non_null
+                if 0.4 <= ratio < 0.995:
+                    score += 6
+                elif ratio >= 0.995:
+                    score -= 6
+                elif ratio < 0.05:
+                    score -= 4
+        except Exception:
+            pass
+
+        if best is None or score > best[0]:
+            best = (score, col)
+
+    return best[1] if best else None
 
 
 def build_semantic_catalog(conn, tables: list[str]) -> dict[str, Any]:
@@ -165,24 +259,7 @@ def build_semantic_catalog(conn, tables: list[str]) -> dict[str, Any]:
                 )
                 seen_metric_keys.add(avg_key)
 
-        # Count metric — find any primary-key-like _id column
-        # Prefer columns with domain-specific hints, fall back to any *_id
-        count_id = next(
-            (c for c in col_set if c.endswith("_id") and any(k in c for k in (
-                "order", "ride", "trip", "invoice", "booking", "transaction",
-                "ticket", "case", "patient", "claim", "shipment", "delivery",
-                "visit", "session", "request", "record", "entry", "event",
-            ))),
-            None,
-        )
-        if not count_id:
-            # Fallback: any *_id column that looks like a row PK
-            count_id = next(
-                (c for c in col_set if c.endswith("_id") and c != "id"
-                 and not any(fk in c for fk in ("customer_id", "user_id", "city_id",
-                     "state_id", "category_id", "product_id", "driver_id"))),
-                next((c for c in col_set if c == "id"), None),
-            )
+        count_id = _pick_count_identifier(conn, table, cols)
         if count_id:
             metrics.append(
                 {
@@ -192,6 +269,27 @@ def build_semantic_catalog(conn, tables: list[str]) -> dict[str, Any]:
                     "agg": "count_distinct",
                     "aliases": ["count", "total count", "number of", "how many",
                                 "records", "entries", "transactions"],
+                }
+            )
+
+        # Derived metric: AOV (Average Order Value)
+        revenue_col = _pick_primary_revenue_column(cols)
+        if revenue_col and count_id:
+            metrics.append(
+                {
+                    "name": "aov",
+                    "table": table,
+                    "numerator_column": revenue_col,
+                    "denominator_column": count_id,
+                    "agg": "ratio_sum_count_distinct",
+                    "aliases": [
+                        "aov",
+                        "average order value",
+                        "avg order value",
+                        "average basket value",
+                        "average transaction value",
+                        "average ticket size",
+                    ],
                 }
             )
 
@@ -227,6 +325,11 @@ def render_semantic_layer_lines(conn, tables: list[str]) -> list[str]:
                 expr = f'SUM("{m["column"]}")'
             elif m["agg"] == "avg":
                 expr = f'AVG("{m["column"]}")'
+            elif m["agg"] == "ratio_sum_count_distinct":
+                expr = (
+                    f'SUM("{m["numerator_column"]}") / '
+                    f'NULLIF(COUNT(DISTINCT "{m["denominator_column"]}"), 0)'
+                )
             else:
                 expr = f'COUNT(DISTINCT "{m["column"]}")'
             alias_preview = ", ".join(m["aliases"][:4])
@@ -298,6 +401,7 @@ def resolve_intent_with_semantic_layer(parsed: dict[str, Any], user_query: str =
     metric_known = (
         metric in all_cols
         or metric == "count"
+        or metric == "aov"
         or (metric.startswith("avg_") and metric[4:] in all_cols)
     )
     if metric and not metric_known:
@@ -315,6 +419,10 @@ def resolve_intent_with_semantic_layer(parsed: dict[str, Any], user_query: str =
                 score += 4
             if m["agg"] == "sum":
                 score += 1
+            if m["agg"] == "ratio_sum_count_distinct" and (
+                "aov" in target or "average order value" in target or "average basket" in target
+            ):
+                score += 8
 
             if target in {"revenue", "sales", "earning", "earnings", "income"}:
                 if any(k in col for k in ("revenue", "sales", "amount", "fare", "earning", "total", "final")):
@@ -338,6 +446,10 @@ def resolve_intent_with_semantic_layer(parsed: dict[str, Any], user_query: str =
                 out["metric"] = best["column"]
             elif best["agg"] == "avg":
                 out["metric"] = f'avg_{best["column"]}'
+            elif best["agg"] == "ratio_sum_count_distinct":
+                out["metric"] = "aov"
+                out["_aov_revenue_col"] = best["numerator_column"]
+                out["_count_distinct_key"] = best["denominator_column"]
             else:
                 out["metric"] = "count"
                 out["_count_distinct_key"] = best["column"]

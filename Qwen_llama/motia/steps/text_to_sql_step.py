@@ -29,7 +29,14 @@ from datetime import date, datetime, timezone
 from typing import Any
 from motia import FlowContext, queue
 
-from shared_config import GROQ_API_TOKEN, LLAMA_MODEL, QWEN_MODEL, GROQ_URL
+from shared_config import (
+    GROQ_API_TOKEN,
+    LLAMA_MODEL,
+    QWEN_MODEL,
+    GROQ_URL,
+    QWEN_ENABLE_REASONING,
+    QWEN_REASONING_EFFORT,
+)
 from utils.token_logger import log_tokens, add_tokens_to_state
 from db.schema_context import get_schema_prompt
 from db.sql_builder import build_sql
@@ -201,6 +208,69 @@ def _render_filter_clause(filters: dict) -> str:
     return "\n".join(lines)
 
 
+def _score_revenue_column(col_name: str) -> int:
+    c = (col_name or "").lower()
+    score = 0
+
+    if any(k in c for k in ("revenue", "sales", "earning", "amount", "total", "final", "net", "paid")):
+        score += 10
+    if "final" in c or "net" in c or "paid" in c:
+        score += 8
+    if "total" in c:
+        score += 6
+    if "price" in c or "fare" in c:
+        score += 3
+    if any(k in c for k in ("unit", "base", "list", "mrp", "msrp", "catalog", "original",
+                             "cost", "tax", "discount", "coupon", "shipping", "commission",
+                             "refund", "refunded", "before_")):
+        score -= 7
+
+    return score
+
+
+def _pick_best_revenue_column(columns: list[str]) -> str | None:
+    if not columns:
+        return None
+
+    ranked = sorted(
+        columns,
+        key=lambda c: (
+            _score_revenue_column(c),
+            1 if "final" in c.lower() else 0,
+            1 if "total" in c.lower() else 0,
+            1 if "amount" in c.lower() else 0,
+            -len(c),
+        ),
+        reverse=True,
+    )
+    return ranked[0] if ranked else None
+
+
+def _pick_best_count_key(columns: list[str]) -> str | None:
+    id_cols = [c for c in columns if c.endswith("_id") or c == "id"]
+    if not id_cols:
+        return None
+
+    def _score(c: str) -> tuple[int, int, int, int]:
+        s = 0
+        if any(k in c for k in ("order", "transaction", "invoice", "booking", "trip", "ride",
+                                "ticket", "request", "visit", "session", "sale", "payment")):
+            s += 10
+        if any(k in c for k in ("row", "line", "item", "detail", "record", "event", "log")):
+            s -= 10
+        if c == "id":
+            s -= 2
+        return (
+            s,
+            1 if c.endswith("_id") else 0,
+            1 if "order" in c else 0,
+            -len(c),
+        )
+
+    ranked = sorted(id_cols, key=_score, reverse=True)
+    return ranked[0]
+
+
 def _check_filters_present(sql: str, filters: dict, ctx, query_id: str) -> None:
     for col in filters:
         if col.lower() not in sql.lower():
@@ -214,7 +284,9 @@ def _check_filters_present(sql: str, filters: dict, ctx, query_id: str) -> None:
 
 def _build_time_series_sql_hint(parsed: dict) -> str:
     bucket = parsed.get("time_bucket", "month")
-    metric = parsed.get("metric", "total_fare")
+    metric = parsed.get("metric", "value")
+    aov_revenue_col = parsed.get("_aov_revenue_col") or "<revenue_column>"
+    aov_count_key = parsed.get("_count_distinct_key") or "<order_identifier_column>"
 
     if bucket == "year":
         bucket_expr  = "CAST(YEAR(date_col) AS VARCHAR)"
@@ -232,7 +304,12 @@ def _build_time_series_sql_hint(parsed: dict) -> str:
         bucket_expr  = "STRFTIME(date_col, '%Y-%m-%d')"
         bucket_label = "YYYY-MM-DD"
 
-    if metric == "count":
+    if metric == "aov":
+        agg_expr = (
+            f'SUM("{aov_revenue_col}") / '
+            f'NULLIF(COUNT(DISTINCT "{aov_count_key}"), 0)'
+        )
+    elif metric == "count":
         agg_expr = "COUNT(DISTINCT <order_pk_column>)"
     elif metric.startswith("avg_"):
         actual_col = metric[4:]
@@ -266,6 +343,7 @@ CRITICAL RULES for time_series (ALL MUST BE FOLLOWED):
 8. Label format: {bucket_label}
 9. For count metric: COUNT(DISTINCT <order_id_col>) NOT COUNT(*).
 10. For avg_ metrics: use AVG(<column>) not SUM.
+11. For AOV metric: SUM(<revenue_column>) / NULLIF(COUNT(DISTINCT <order_id_col>), 0).
 """
 
 
@@ -276,6 +354,7 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
     metric     = parsed.get("metric", "count")
     entity_key = parsed.get("_entity_group_key")
     count_key  = parsed.get("_count_distinct_key")
+    aov_revenue_col = parsed.get("_aov_revenue_col")
     qt         = parsed.get("query_type", "top_n")
     top_n      = parsed.get("top_n", 5)
     thr        = parsed.get("threshold") or {}
@@ -368,6 +447,8 @@ Parsed intent:
   query_type : {qt}
   entity     : {entity}
   metric     : {metric}
+    aov_numerator_col: {aov_revenue_col or 'N/A'}
+    count_distinct_key: {count_key or 'N/A'}
   time_bucket: {bucket if qt == 'time_series' else 'N/A'}
   top_n      : {top_n}
   filters    : {filter_desc}{date_hints}
@@ -393,6 +474,9 @@ STRICT RULES:
    - Default: SUM(column_name) AS value  (use exact column from schema)
    - If metric starts with "avg_": AVG(<column_without_avg_prefix>) AS value
    - If metric is "count": COUNT(DISTINCT <primary_order_id>) AS value
+    - If metric is "aov":
+         SUM({aov_revenue_col or '<revenue_column>'}) / NULLIF(COUNT(DISTINCT {count_key or '<order_identifier_column>'}), 0) AS value
+      (Use this exact derived formula; never use COUNT(DISTINCT row-like IDs) for AOV.)
 9. Ranking: {rank_instr}
 {groupby_rule}
 {filter_rule}
@@ -403,17 +487,29 @@ SQL:"""
 # ── LLM call ──────────────────────────────────────────────────────────────────
 
 def _call_llm(model: str, prompt: str) -> tuple[str, dict]:
-    resp = requests.post(
-        GROQ_URL,
-        headers={"Authorization": f"Bearer {GROQ_API_TOKEN}",
-                 "Content-Type": "application/json"},
-        json={
-            "model":    model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 1024, "temperature": 0.0,
-        },
-        timeout=45,
-    )
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1024,
+        "temperature": 0.0,
+    }
+
+    if (
+        QWEN_ENABLE_REASONING
+        and "qwen" in model.lower()
+        and QWEN_REASONING_EFFORT
+    ):
+        payload["reasoning_effort"] = QWEN_REASONING_EFFORT
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=45)
+    if resp.status_code >= 400 and "reasoning_effort" in payload:
+        payload.pop("reasoning_effort", None)
+        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=45)
     resp.raise_for_status()
     data = resp.json()
     return data["choices"][0]["message"]["content"].strip(), data.get("usage", {})
@@ -442,6 +538,7 @@ def _deterministic_time_series_fallback(parsed: dict) -> str | None:
     bucket    = (parsed.get("time_bucket") or "month").lower()
     filters   = parsed.get("filters", {}) or {}
     count_key = parsed.get("_count_distinct_key")
+    aov_revenue_col = (parsed.get("_aov_revenue_col") or "").lower().strip()
 
     try:
         conn = get_read_connection()
@@ -483,13 +580,27 @@ def _deterministic_time_series_fallback(parsed: dict) -> str | None:
 
             agg_expr = None
             score = 0
-            if metric == "count":
+            if metric == "aov":
+                ck = count_key if count_key and count_key in col_names else _pick_best_count_key(col_names)
+                revenue_col = aov_revenue_col if aov_revenue_col in col_names else None
+                if not revenue_col:
+                    candidates = [
+                        c for c in col_names
+                        if any(k in c for k in ("amount", "total", "revenue", "sales",
+                                                "earning", "price", "fare", "cost",
+                                                "fee", "payment", "profit", "final", "net", "paid"))
+                    ]
+                    revenue_col = _pick_best_revenue_column(candidates)
+                if ck and revenue_col:
+                    agg_expr = (
+                        f'SUM("{revenue_col}") / '
+                        f'NULLIF(COUNT(DISTINCT "{ck}"), 0)'
+                    )
+                    score += 8
+            elif metric == "count":
                 ck = count_key
                 if not ck or ck.lower() not in col_names:
-                    ck = next(
-                        (c for c in col_names if c.endswith("_id")),
-                        None
-                    )
+                    ck = _pick_best_count_key(col_names)
                 agg_expr = f'COUNT(DISTINCT "{ck}")' if ck else "COUNT(*)"
                 score += 6 if ck else 2
             elif metric.startswith("avg_"):
@@ -508,8 +619,9 @@ def _deterministic_time_series_fallback(parsed: dict) -> str | None:
                                                 "earning", "price", "fare", "cost",
                                                 "fee", "payment", "profit", "final"))
                     ]
-                    if candidates:
-                        agg_expr = f'SUM("{candidates[0]}")'
+                    best_money_col = _pick_best_revenue_column(candidates)
+                    if best_money_col:
+                        agg_expr = f'SUM("{best_money_col}")'
                         score += 4
             if not agg_expr:
                 continue
@@ -556,6 +668,7 @@ def _deterministic_comparison_fallback(parsed: dict) -> str | None:
     filters   = parsed.get("filters", {}) or {}
     top_n     = int(parsed.get("top_n") or 5)
     count_key = parsed.get("_count_distinct_key")
+    aov_revenue_col = (parsed.get("_aov_revenue_col") or "").lower().strip()
 
     try:
         conn = get_read_connection()
@@ -597,14 +710,32 @@ def _deterministic_comparison_fallback(parsed: dict) -> str | None:
                     entity_col = next((c for c in col_names if entity in c), None)
                 if not entity_col:
                     text_cols = [c for c, typ in cols if any(tk in typ for tk in ("VARCHAR", "CHAR", "TEXT", "STRING"))]
-                    if entity in ("course_name", "student_name", "platform", "category", "city", "coupon_code"):
-                        entity_col = next((c for c in text_cols if entity.replace("_name", "") in c.lower()), None)
+                    entity_base = entity.replace("_name", "").replace("_id", "")
+                    tokens = [tok for tok in entity_base.split("_") if tok]
+                    entity_col = next(
+                        (c for c in text_cols if any(tok in c.lower() for tok in tokens)),
+                        None,
+                    )
 
             agg_expr = None
-            if metric == "count":
+            if metric == "aov":
+                ck = count_key if count_key and count_key in col_names else _pick_best_count_key(col_names)
+                revenue_col = aov_revenue_col if aov_revenue_col in col_names else None
+                if not revenue_col:
+                    revenue_candidates = [
+                        c for c in col_names
+                        if any(k in c for k in ("final", "total", "amount", "price", "revenue", "sales", "earning", "fare", "net", "paid"))
+                    ]
+                    revenue_col = _pick_best_revenue_column(revenue_candidates)
+                if ck and revenue_col:
+                    agg_expr = (
+                        f'SUM("{revenue_col}") / '
+                        f'NULLIF(COUNT(DISTINCT "{ck}"), 0)'
+                    )
+            elif metric == "count":
                 ck = count_key if count_key and count_key in col_names else None
                 if not ck:
-                    ck = next((c for c in col_names if c.endswith("_id")), None)
+                    ck = _pick_best_count_key(col_names)
                 agg_expr = f'COUNT(DISTINCT "{ck}")' if ck else "COUNT(*)"
             elif metric.startswith("avg_"):
                 mcol = metric[4:]
@@ -613,10 +744,11 @@ def _deterministic_comparison_fallback(parsed: dict) -> str | None:
             elif metric in col_names:
                 agg_expr = f'SUM("{metric}")'
             else:
-                money_col = next(
-                    (c for c in col_names if any(k in c for k in ("final", "total", "amount", "price", "revenue", "sales", "earning", "fare"))),
-                    None,
-                )
+                revenue_candidates = [
+                    c for c in col_names
+                    if any(k in c for k in ("final", "total", "amount", "price", "revenue", "sales", "earning", "fare", "net", "paid"))
+                ]
+                money_col = _pick_best_revenue_column(revenue_candidates)
                 if money_col:
                     agg_expr = f'SUM("{money_col}")'
 

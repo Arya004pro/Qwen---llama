@@ -8,6 +8,7 @@ Changes vs original:
   - All other formatting (comparison, ranked, aggregate, etc.) unchanged.
 """
 
+import re
 from typing import Any
 from motia import FlowContext, queue
 
@@ -55,9 +56,9 @@ def _format_bucket_label(raw_label: str, bucket: str) -> str:
 def _infer_currency(metric: str, hint: str = "") -> str:
     m = (metric or "").lower()
     h = (hint or "").lower()
-    if any(x in m or x in h for x in ["inr", "rupee", "rs "]):
+    if re.search(r"\b(inr|rupee|rupees|rs)\b", f"{m} {h}"):
         return "Rs "
-    if any(x in m or x in h for x in ["usd", "dollar", "$"]):
+    if re.search(r"\b(usd|dollar|dollars)\b", f"{m} {h}") or "$" in m or "$" in h:
         return "$"
     if any(x in m for x in ["fare", "earnings", "commission", "revenue",
                               "amount", "price", "total", "salary", "sales", "profit"]):
@@ -71,7 +72,9 @@ def _metric_label(metric: str, currency: str) -> str:
     if not metric:
         return "Value"
     base = metric.strip().lower()
-    if base.startswith("avg_"):
+    if base in ("aov", "average_order_value"):
+        label = "Average Order Value"
+    elif base.startswith("avg_"):
         core = base[4:].replace("_", " ").strip().title()
         label = f"Average {core}" if core else "Average"
     else:
@@ -85,14 +88,43 @@ def _entity_label(entity: str) -> str:
     if not entity:
         return ""
     base = entity
+    if base.startswith("is_"):
+        base = base[3:] + "_status"
     for suffix in ("_name", "_id", "_type", "_code", "_key"):
         if base.endswith(suffix):
             base = base[: -len(suffix)]
             break
     words = base.replace("_", " ").strip()
-    if words and not words.endswith("s"):
-        words += "s"
+    if words:
+        if words.endswith("y") and not words.endswith(("ay", "ey", "iy", "oy", "uy")):
+            words = words[:-1] + "ies"
+        elif not words.endswith("s"):
+            words += "s"
     return words
+
+
+def _display_entity_name(raw_name: Any, entity: str) -> str:
+    name = str(raw_name)
+    if not entity:
+        return name
+
+    ent = entity.lower().strip()
+    if not ent.startswith("is_"):
+        return name
+
+    base = ent[3:].replace("_", " ").strip()
+    zero_vals = {"0", "0.0", "false", "False"}
+    one_vals = {"1", "1.0", "true", "True"}
+
+    if name in one_vals:
+        if base == "active":
+            return "Active"
+        return base.title()
+    if name in zero_vals:
+        if base == "active":
+            return "Inactive"
+        return f"Not {base}".title()
+    return name
 
 
 def _tick_fn(metric: str, currency: str) -> str:
@@ -477,14 +509,15 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     qt     = parsed.get("query_type", "top_n")
     entity = parsed.get("entity", "")
     metric = parsed.get("metric", "value")
+    metric_display = parsed.get("semantic_metric") or metric
     top_n  = parsed.get("top_n", 5)
     thr    = parsed.get("threshold")
     bucket = parsed.get("time_bucket", "month")
 
-    currency = _infer_currency(metric)
+    currency = _infer_currency(metric_display, user_query)
     p        = currency
     elabel   = _entity_label(entity) or entity or "items"
-    mlabel   = _metric_label(metric, "")
+    mlabel   = _metric_label(metric_display, "")
 
     _trs = parsed.get("time_ranges", [])
     if _trs and _trs[0].get("label"):
@@ -516,12 +549,12 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             text = (f"No {mlabel} data found {_period_phrase}. "
                     "The dataset may not cover this time range.")
         elif qt == "zero_filter":
-            text = (f"No {elabel} with zero {metric} found "
+            text = (f"No {elabel} with zero {mlabel} found "
                     f"between {start_date} and {end_date}.")
         elif qt == "threshold" and thr:
-            unit = "%" if thr.get("type") == "percentage" else f" {metric}"
+            unit = "%" if thr.get("type") == "percentage" else f" {mlabel}"
             text = (f"No {elabel} matched the filter "
-                    f"({metric} > {thr['value']}{unit}) "
+                f"({mlabel} > {thr['value']}{unit}) "
                     f"between {start_date} and {end_date}.")
         elif period_labels and len(period_labels) >= 2:
             text = (f"No data found for {period_labels[1]}.")
@@ -585,7 +618,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
 
         if labels and values:
             chart_config = _make_line_chart(
-                labels, values, metric, currency,
+                labels, values, metric_display, currency,
                 user_query or f"{bucket_label} {mlabel} trend",
                 period_str,
                 bucket,
@@ -604,10 +637,10 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         p1 = period_labels[0] if len(period_labels) > 0 else "Period 1"
         p2 = period_labels[1] if len(period_labels) > 1 else "Period 2"
         direction = "highest" if qt != "bottom_n" else "lowest"
-        header = f" {elabel.title()} with {direction} {metric} growth ({p1}  {p2}):"
+        header = f" {elabel.title()} with {direction} {mlabel} growth ({p1}  {p2}):"
         items = []
         for i, row in enumerate(results, 1):
-            name = row.get("name", "?")
+            name = _display_entity_name(row.get("name", "?"), entity)
             v1, v2, d = row.get("value1", 0), row.get("value2", 0), row.get("delta", 0)
             sign  = "+" if d >= 0 else ""
             pct   = (d / v1 * 100) if v1 != 0 else float("inf")
@@ -622,19 +655,19 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         if insights:
             insight_txt = "\n\nInsights:\n" + "\n".join(f"- {x}" for x in insights)
         formatted_text = header + insight_txt + _token_summary(token_usage, token_totals)
-        names  = [r.get("name", "?") for r in results]
+        names  = [_display_entity_name(r.get("name", "?"), entity) for r in results]
         deltas = [r.get("delta", 0)   for r in results]
         chart_config = _bar(
-            names, deltas, metric, currency, entity,
-            user_query or f"{elabel.title()} by {metric} growth: {p1}{p2}",
-            f"Delta in {metric} ({p1}  {p2})",
+            names, deltas, metric_display, currency, entity,
+            user_query or f"{elabel.title()} by {mlabel} growth: {p1}{p2}",
+            f"Delta in {mlabel} ({p1}  {p2})",
         )
 
     #  COMPARISON 
     elif has_value2:
         p1 = period_labels[0] if len(period_labels) > 0 else "Period 1"
         p2 = period_labels[1] if len(period_labels) > 1 else "Period 2"
-        header = f" Top {top_n} {elabel} by {metric}: {p1} vs {p2}"
+        header = f" Top {top_n} {elabel} by {mlabel}: {p1} vs {p2}"
         col_w  = max((len(r.get("name", "")) for r in results), default=20)
         col_w  = max(col_w, 20)
         sep    = "" * (col_w + 44)
@@ -642,18 +675,18 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         lines  = [header, sep, hdr, sep]
         items  = []
         for i, row in enumerate(results, 1):
-            name = row.get("name", "?")
+            name = _display_entity_name(row.get("name", "?"), entity)
             v1, v2 = row.get("value1"), row.get("value2")
             d = _delta_str(v1, v2, p)
             lines.append(f"  {i:>3}. {name:<{col_w}}  {_fmt(v1,p):>16}  {_fmt(v2,p):>16}  {d:>14}")
             items.append({"rank": i, "name": name,
                           f"{p1}_value": _fmt(v1, p), f"{p2}_value": _fmt(v2, p), "delta": d})
         formatted_text = "\n".join(lines) + _token_summary(token_usage, token_totals)
-        names = [r.get("name", "?")      for r in results]
+        names = [_display_entity_name(r.get("name", "?"), entity) for r in results]
         vals1 = [r.get("value1", 0) or 0 for r in results]
         vals2 = [r.get("value2", 0) or 0 for r in results]
-        base_cmp = _make_base(metric, currency, entity, legend=True, index_axis="y")
-        base_cmp["plugins"]["tooltip"]["callbacks"] = {"label": _cmp_tooltip_fn(metric, currency)}
+        base_cmp = _make_base(metric_display, currency, entity, legend=True, index_axis="y")
+        base_cmp["plugins"]["tooltip"]["callbacks"] = {"label": _cmp_tooltip_fn(metric_display, currency)}
         cmp_cfg = {
             "type": "bar",
             "data": {"labels": names, "datasets": [
@@ -667,7 +700,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             "options": base_cmp,
         }
         chart_config = {
-            "title":    user_query or f"{metric.title()} comparison: {p1} vs {p2}",
+            "title":    user_query or f"{mlabel} comparison: {p1} vs {p2}",
             "subtitle": f"{p1} vs {p2}",
             "prefix":   p,
             "config":   cmp_cfg,
@@ -677,11 +710,11 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     else:
         names, values = [], []
         if qt == "zero_filter":
-            header = (f"{len(results)} {elabel} had zero {metric} "
+            header = (f"{len(results)} {elabel} had zero {mlabel} "
                       f"between {start_date} and {end_date}:")
             items = []
             for i, row in enumerate(results, 1):
-                name = row.get("name", "?")
+                name = _display_entity_name(row.get("name", "?"), entity)
                 header += f"\n{i}. {name}"
                 items.append({"rank": i, "name": name, "value": "0"})
         else:
@@ -691,20 +724,20 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 thr_val  = thr.get("value", 0)
                 direction = "less than" if thr_op == "lt" else "more than"
                 thr_val_str = f"{thr_val:.0f}% of total" if thr_type == "percentage" else _fmt_indian(thr_val, p, decimals=0)
-                header = (f"{len(results)} {elabel} where {metric} contributed "
+                header = (f"{len(results)} {elabel} where {mlabel} contributed "
                           f"{direction} {thr_val_str} "
                           f"between {start_date} and {end_date}:")
             elif qt == "intersection":
                 p1 = period_labels[0] if len(period_labels) > 0 else "Period 1"
                 p2 = period_labels[1] if len(period_labels) > 1 else "Period 2"
-                header = f" {elabel.title()} present in BOTH {p1} AND {p2} (combined {metric}):"
+                header = f" {elabel.title()} present in BOTH {p1} AND {p2} (combined {mlabel}):"
             else:
                 rl = "Top" if qt == "top_n" else "Bottom"
                 period_str = _period_phrase if _period_phrase else f"between {start_date} and {end_date}"
                 header = f"{rl} {top_n} {elabel} by {mlabel} {period_str}:"
             items = []
             for i, row in enumerate(results, 1):
-                name  = row.get("name", "?")
+                name  = _display_entity_name(row.get("name", "?"), entity)
                 value = row.get("value", 0) or 0
                 val_s = _fmt_indian(value, p)
                 header += f"\n{i}. {name}  {val_s}"
@@ -721,8 +754,8 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         if names:
             rl = "Top" if qt != "bottom_n" else "Bottom"
             chart_config = _bar(
-                names, values, metric, currency, entity,
-                user_query or f"{rl} {elabel} by {metric}",
+                names, values, metric_display, currency, entity,
+                user_query or f"{rl} {elabel} by {mlabel}",
                 f"{start_date} to {end_date}",
             )
 

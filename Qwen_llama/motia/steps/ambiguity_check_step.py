@@ -98,7 +98,7 @@ def _live_entity_examples(max_items: int = 5) -> str:
             conn.close()
 
         if not candidates:
-            return "e.g. product, customer, city, category, driver"
+            return "e.g. customer, product, region, category, channel"
 
         candidates.sort(key=lambda x: -x[0])
         # Format: strip _name suffix for readability
@@ -109,7 +109,7 @@ def _live_entity_examples(max_items: int = 5) -> str:
         return ", ".join(formatted)
 
     except Exception:
-        return "e.g. product, customer, city, category, driver"
+        return "e.g. customer, product, region, category, channel"
 
 
 def _live_metric_examples(max_items: int = 5) -> str:
@@ -164,17 +164,17 @@ def _live_metric_examples(max_items: int = 5) -> str:
             conn.close()
 
         if not candidates:
-            return "e.g. revenue, fare, quantity, earnings, number of orders"
+            return "e.g. revenue, quantity, discount, margin, record count"
 
         candidates.sort(key=lambda x: -x[0])
         formatted = [c.replace("_", " ") for _, c in candidates[:max_items]]
-        # Always add "number of orders/rides" as a count option if not already there
+        # Always add a generic count option if not already present.
         if not any("count" in f or "number" in f for f in formatted):
-            formatted.append("number of orders")
+            formatted.append("record count")
         return ", ".join(formatted[:max_items])
 
     except Exception:
-        return "e.g. revenue, fare, quantity, earnings, number of orders"
+        return "e.g. revenue, quantity, discount, margin, record count"
 
 
 # ── Completeness check ─────────────────────────────────────────────────────────
@@ -186,6 +186,14 @@ def _is_actually_complete(parsed: dict) -> tuple[bool, str | None]:
     m   = parsed.get("metric")
     ent = parsed.get("entity")
     cq  = parsed.get("clarification_question")
+    if parsed.get("_force_clarification") and cq:
+        return False, str(cq)
+    if (m or "").lower() == "aov":
+        if not parsed.get("_aov_revenue_col") or not parsed.get("_count_distinct_key"):
+            return False, (
+                cq or
+                "I need one revenue column and one order identifier column to compute AOV. Which should I use?"
+            )
 
     # ── time_series (trend) ────────────────────────────────────────────────────
     if qt == "time_series":
@@ -216,7 +224,7 @@ def _is_actually_complete(parsed: dict) -> tuple[bool, str | None]:
         return True, None
 
     # ── ranked queries ────────────────────────────────────────────────────────
-    if qt in ("top_n", "bottom_n", "threshold", "growth_ranking", "zero_filter"):
+    if qt in ("top_n", "bottom_n", "threshold", "zero_filter"):
         if not ent:
             return False, (
                 cq or
@@ -233,6 +241,38 @@ def _is_actually_complete(parsed: dict) -> tuple[bool, str | None]:
                 cq or
                 "Please specify two time periods to compare "
                 "(e.g. Q1 2024 vs Q2 2024, or January vs February 2024)"
+            )
+        p1 = tr[0] or {}
+        p2 = tr[1] or {}
+        if (p1.get("start"), p1.get("end")) == (p2.get("start"), p2.get("end")):
+            return False, (
+                cq or
+                "Please specify two different time periods to compare "
+                "(e.g. 2023 vs 2024)."
+            )
+        return True, None
+
+    if qt == "growth_ranking":
+        if cq and "metric should i use for growth ranking" in cq.lower():
+            return False, cq
+        if not ent:
+            return False, (
+                cq or
+                f"Which dimension should I group by? ({_live_entity_examples()})"
+            )
+        if not tr or len(tr) < 2:
+            return False, (
+                cq or
+                "Please specify two time periods to compare "
+                "(e.g. Q1 2024 vs Q2 2024, or January vs February 2024)"
+            )
+        p1 = tr[0] or {}
+        p2 = tr[1] or {}
+        if (p1.get("start"), p1.get("end")) == (p2.get("start"), p2.get("end")):
+            return False, (
+                cq or
+                "Please specify two different time periods to compare "
+                "(e.g. 2023 vs 2024)."
             )
         return True, None
 

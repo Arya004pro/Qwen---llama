@@ -109,6 +109,57 @@ def _find_metric_col(cols: list[tuple[str, str]], metric: str) -> str | None:
     return numeric_cols[0] if numeric_cols else None
 
 
+def _score_revenue_col(col_name: str) -> int:
+    c = (col_name or "").lower()
+    score = 0
+    if any(k in c for k in ("revenue", "sales", "amount", "earning", "total", "final", "net", "paid")):
+        score += 10
+    if "final" in c or "net" in c or "paid" in c:
+        score += 8
+    if "total" in c:
+        score += 6
+    if "price" in c or "fare" in c:
+        score += 3
+    if any(k in c for k in ("unit", "base", "list", "mrp", "msrp", "catalog", "original",
+                             "cost", "tax", "discount", "coupon", "shipping", "commission",
+                             "refund", "refunded", "before_")):
+        score -= 7
+    return score
+
+
+def _pick_best_revenue_col(cols: list[tuple[str, str]]) -> str | None:
+    numeric_cols = [c for c, d in cols if _is_numeric(d) and not c.lower().endswith("_id")]
+    if not numeric_cols:
+        return None
+    ranked = sorted(
+        numeric_cols,
+        key=lambda c: (_score_revenue_col(c), 1 if "final" in c.lower() else 0, 1 if "total" in c.lower() else 0, -len(c)),
+        reverse=True,
+    )
+    return ranked[0]
+
+
+def _pick_best_count_key(cols: list[tuple[str, str]]) -> str | None:
+    id_cols = [c for c, _ in cols if c.lower().endswith("_id") or c.lower() == "id"]
+    if not id_cols:
+        return None
+
+    def _score(c: str) -> tuple[int, int, int, int]:
+        n = c.lower()
+        s = 0
+        if any(k in n for k in ("order", "transaction", "invoice", "booking", "trip", "ride",
+                                "ticket", "request", "visit", "session", "sale", "payment")):
+            s += 10
+        if any(k in n for k in ("row", "line", "item", "detail", "record", "event", "log")):
+            s -= 10
+        if n == "id":
+            s -= 2
+        return (s, 1 if n.endswith("_id") else 0, 1 if "order" in n else 0, -len(n))
+
+    ranked = sorted(id_cols, key=_score, reverse=True)
+    return ranked[0]
+
+
 def _find_entity_col(cols: list[tuple[str, str]], entity: str) -> str | None:
     """Find the best text column matching the requested entity."""
     col_names = {c.lower() for c, _ in cols}
@@ -226,6 +277,8 @@ def build_sql(parsed: dict) -> str | None:
     metric_raw = parsed.get("metric", "revenue")
     qt         = parsed.get("query_type", "top_n")
     filters    = parsed.get("filters", {})
+    aov_revenue_raw = parsed.get("_aov_revenue_col")
+    aov_count_key_raw = parsed.get("_count_distinct_key")
 
     # Complex query types are better handled by LLM
     if qt in ("comparison", "growth_ranking", "intersection",
@@ -243,10 +296,19 @@ def build_sql(parsed: dict) -> str | None:
     # Handle count metric
     is_count = metric_raw and metric_raw.lower() == "count"
     is_avg   = metric_raw and metric_raw.lower().startswith("avg_")
+    is_aov   = metric_raw and metric_raw.lower() == "aov"
 
     # Find columns across all tables
     metric_col = None
-    if not is_count:
+    if is_aov:
+        if isinstance(aov_revenue_raw, str) and aov_revenue_raw.strip():
+            metric_col = aov_revenue_raw.strip().lower()
+        else:
+            for table, cols in schema.items():
+                metric_col = _pick_best_revenue_col(cols)
+                if metric_col:
+                    break
+    elif not is_count:
         actual_metric = metric_raw[4:] if is_avg else metric_raw
         for table, cols in schema.items():
             metric_col = _find_metric_col(cols, actual_metric)
@@ -282,19 +344,26 @@ def build_sql(parsed: dict) -> str | None:
     filter_clause = _build_filter_clause(filters, table_cols)
 
     # Build aggregation expression
-    if is_count:
+    if is_aov:
+        table_cols_for_aov = schema.get(table, [])
+        revenue_col = m_col if m_col else _pick_best_revenue_col(table_cols_for_aov)
+        count_key = None
+        if isinstance(aov_count_key_raw, str) and aov_count_key_raw.strip():
+            raw = aov_count_key_raw.strip().lower()
+            if raw in {c.lower() for c, _ in table_cols_for_aov}:
+                count_key = raw
+        if not count_key:
+            count_key = _pick_best_count_key(table_cols_for_aov)
+        if not revenue_col or not count_key:
+            return None
+        agg_expr = (
+            f'SUM("{revenue_col}") / '
+            f'NULLIF(COUNT(DISTINCT "{count_key}"), 0)'
+        )
+    elif is_count:
         # Find best ID column for COUNT(DISTINCT ...)
         table_cols = schema.get(table, [])
-        id_col = None
-        for c, d in table_cols:
-            if c.lower().endswith("_id") and _is_numeric(d):
-                id_col = c
-                break
-        if not id_col:
-            for c, d in table_cols:
-                if c.lower().endswith("_id"):
-                    id_col = c
-                    break
+        id_col = _pick_best_count_key(table_cols)
         agg_expr = f'COUNT(DISTINCT "{id_col}")' if id_col else "COUNT(*)"
     elif is_avg:
         agg_expr = f'AVG("{m_col}")'

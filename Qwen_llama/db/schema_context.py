@@ -489,7 +489,7 @@ def _live_schema_prompt() -> str:
         lines += ["", "Detected Entities", "-----------------"]
         lines += [
             "Use these as preferred grouping dimensions for entity questions.",
-            "Map user terms like Drivers/Warehouses/Stores to the closest column below.",
+            "Map user wording to the closest detected dimension below.",
         ]
         if entity_hints:
             lines += entity_hints
