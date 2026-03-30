@@ -206,10 +206,9 @@ def _build_schema_keyword_maps() -> tuple[list[tuple[str, str]], list[tuple[str,
             for table in tables:
                 cols = conn.execute(f'DESCRIBE "{table}"').fetchall()
 
-                # Find order/PK id for count metric
+                # Find primary-key-like column for count metric
                 id_col = next(
-                    (c[0] for c in cols
-                     if any(k in c[0].lower() for k in ("order_id", "ride_id", "trip_id", "booking_id"))),
+                    (c[0] for c in cols if c[0].lower().endswith("_id")),
                     None,
                 )
 
@@ -392,7 +391,7 @@ def _default_clarification(parsed: dict) -> str:
     if qt in ("aggregate", "time_series"):
         return "What time period should I use? (e.g. 2024, Q1 2024, March 2024)"
     if not parsed.get("entity"):
-        return "Which dimension should I group by? (e.g. driver, city, category, customer, product)"
+        return "Which dimension should I group by? (e.g. course, student, platform, category, city)"
     if not parsed.get("time_ranges"):
         return "What time period should I use? (e.g. 2024, Q1 2024, March 2024)"
     if not parsed.get("metric"):
@@ -519,11 +518,53 @@ def _post_process(
     user_query: str = "",
     mandatory_filters: dict | None = None,
 ) -> dict:
+    ql = (user_query or "").lower()
     qt = parsed.get("query_type", "top_n")
     tr = parsed.get("time_ranges", [])
     m  = parsed.get("metric")
 
+    count_cues = (
+        "how many", "number of", "count", "enrollments", "orders",
+        "buyers", "students who", "percentage of orders",
+    )
+    avg_cues = ("average", "avg ", "aov", "average order value")
+    aggregate_cues = (
+        "total", "overall", "sum", "average", "avg", "how many", "number of",
+    )
+
+    if any(c in ql for c in count_cues):
+        parsed["metric"] = "count"
+        m = "count"
+    elif m and isinstance(m, str) and not m.startswith("avg_") and any(c in ql for c in avg_cues):
+        if m != "count":
+            parsed["metric"] = f"avg_{m}"
+            m = parsed["metric"]
+
     ranking_cue = _has_ranking_cue(user_query)
+    if qt in ("top_n", "bottom_n") and not ranking_cue and any(c in ql for c in aggregate_cues):
+        parsed["query_type"] = "aggregate"
+        parsed["entity"] = None
+        qt = "aggregate"
+
+    if qt in ("top_n", "bottom_n") and not parsed.get("entity"):
+        entity_map, _ = _build_schema_keyword_maps()
+        preferred_tokens = {
+            "course": "course",
+            "student": "student",
+            "platform": "platform",
+            "category": "category",
+            "city": "city",
+            "coupon": "coupon",
+            "payment": "payment",
+        }
+        for tok, needle in preferred_tokens.items():
+            if tok not in ql:
+                continue
+            match_col = next((col for _, col in entity_map if needle in col.lower()), None)
+            if match_col:
+                parsed["entity"] = match_col
+                break
+
     if _is_trend_query(user_query) and not ranking_cue and qt not in ("time_series",):
         parsed["query_type"] = "time_series"
         parsed["entity"]     = None
@@ -559,6 +600,12 @@ def _post_process(
             if inferred:
                 parsed["time_ranges"] = inferred
                 tr = inferred
+
+    if not tr and qt not in ("comparison", "intersection"):
+        inferred = _infer_dataset_time_range()
+        if inferred:
+            parsed["time_ranges"] = inferred
+            tr = inferred
 
     # Guard: swap ID columns → name columns
     entity = parsed.get("entity", "") or ""

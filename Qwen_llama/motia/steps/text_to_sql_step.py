@@ -64,14 +64,7 @@ _FORBIDDEN   = re.compile(
     re.IGNORECASE,
 )
 
-# ── Minimum tables required for the classic e-commerce fast path ───────────────
-# Only these exact table names activate the pre-built sql_builder / sql_registry.
-# Any other schema always goes through the LLM path.
-_ECOMMERCE_REQUIRED_TABLES = {
-    "orders", "customers", "products", "categories", "order_items",
-}
-_ECOMMERCE_VALID_ENTITIES = {"product", "customer", "city", "category", "state"}
-_ECOMMERCE_VALID_METRICS  = {"revenue", "quantity", "order_count"}
+# ── No schema-specific constants needed — all detection is live ────────────────
 
 
 # ── Schema helpers ─────────────────────────────────────────────────────────────
@@ -89,12 +82,6 @@ def _get_existing_tables() -> set[str]:
         return set()
 
 
-def _is_classic_ecommerce_schema(existing: set[str]) -> bool:
-    """
-    Return True only when the exact classic e-commerce table set is present.
-    This is the ONLY condition under which sql_builder / sql_registry are used.
-    """
-    return _ECOMMERCE_REQUIRED_TABLES.issubset(existing)
 
 
 def _detect_id_name_pairs() -> dict[str, str]:
@@ -180,12 +167,18 @@ def _explain(sql: str, parsed: dict | None = None) -> tuple[bool, str]:
     typ = thr.get("type", "")
     if n == 0:
         params = []
+    elif n == 1:
+        params = [num]
+    elif n == 2:
+        params = [d, d]
     elif qt == "threshold" and typ == "percentage" and n == 5:
         params = [d, d, num, d, d]
     elif qt == "threshold" and typ == "absolute" and n == 3:
         params = [d, d, num]
     elif qt in ("comparison", "growth_ranking") and n == 5:
         params = [d, d, d, d, num]
+    elif qt in ("comparison", "growth_ranking") and n == 4:
+        params = [d, d, d, d]
     else:
         params = [d if i < n - 1 else num for i in range(n)]
     return explain_query(sql, params)
@@ -494,8 +487,7 @@ def _deterministic_time_series_fallback(parsed: dict) -> str | None:
                 ck = count_key
                 if not ck or ck.lower() not in col_names:
                     ck = next(
-                        (c for c in col_names
-                         if any(k in c for k in ("order_id", "ride_id", "trip_id", "booking_id", "id"))),
+                        (c for c in col_names if c.endswith("_id")),
                         None
                     )
                 agg_expr = f'COUNT(DISTINCT "{ck}")' if ck else "COUNT(*)"
@@ -512,8 +504,9 @@ def _deterministic_time_series_fallback(parsed: dict) -> str | None:
                 else:
                     candidates = [
                         c for c in col_names
-                        if any(k in c for k in ("final_price", "total_amount", "total_fare",
-                                                "revenue", "sales", "earning", "amount", "price"))
+                        if any(k in c for k in ("amount", "total", "revenue", "sales",
+                                                "earning", "price", "fare", "cost",
+                                                "fee", "payment", "profit", "final"))
                     ]
                     if candidates:
                         agg_expr = f'SUM("{candidates[0]}")'
@@ -521,7 +514,7 @@ def _deterministic_time_series_fallback(parsed: dict) -> str | None:
             if not agg_expr:
                 continue
 
-            if any(k in date_col.lower() for k in ("order_date", "created_at", "date")):
+            if any(k in date_col.lower() for k in ("date", "created", "time")):
                 score += 2
             if metric in col_names:
                 score += 2
@@ -556,6 +549,150 @@ def _deterministic_time_series_fallback(parsed: dict) -> str | None:
     )
 
 
+def _deterministic_comparison_fallback(parsed: dict) -> str | None:
+    """Build robust two-period comparison SQL without relying on LLM output."""
+    metric    = (parsed.get("metric") or "count").lower()
+    entity    = (parsed.get("entity") or "").lower().strip() or None
+    filters   = parsed.get("filters", {}) or {}
+    top_n     = int(parsed.get("top_n") or 5)
+    count_key = parsed.get("_count_distinct_key")
+
+    try:
+        conn = get_read_connection()
+        table_rows = conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='main' AND table_type='BASE TABLE' ORDER BY table_name"
+        ).fetchall()
+        tables = [r[0] for r in table_rows]
+    except Exception:
+        return None
+
+    def _pick_plan() -> tuple[str, str, str | None, str] | None:
+        best = None
+        for t in tables:
+            try:
+                cols = [(c[0], str(c[1]).upper()) for c in conn.execute(f'DESCRIBE "{t}"').fetchall()]
+            except Exception:
+                continue
+            col_names = [c[0].lower() for c in cols]
+            date_cols = [
+                c for c, typ in cols
+                if (
+                    "DATE" in typ
+                    or "TIMESTAMP" in typ
+                    or any(k in c.lower() for k in ("date", "time", "created", "updated", "at"))
+                )
+            ]
+            if not date_cols:
+                continue
+            date_col = next((c for c in date_cols if "date" in c.lower()), date_cols[0])
+
+            entity_col = None
+            if entity:
+                if entity in col_names:
+                    entity_col = entity
+                elif entity.endswith("_name") and entity[:-5] in col_names:
+                    entity_col = entity[:-5]
+                else:
+                    entity_col = next((c for c in col_names if entity in c), None)
+                if not entity_col:
+                    text_cols = [c for c, typ in cols if any(tk in typ for tk in ("VARCHAR", "CHAR", "TEXT", "STRING"))]
+                    if entity in ("course_name", "student_name", "platform", "category", "city", "coupon_code"):
+                        entity_col = next((c for c in text_cols if entity.replace("_name", "") in c.lower()), None)
+
+            agg_expr = None
+            if metric == "count":
+                ck = count_key if count_key and count_key in col_names else None
+                if not ck:
+                    ck = next((c for c in col_names if c.endswith("_id")), None)
+                agg_expr = f'COUNT(DISTINCT "{ck}")' if ck else "COUNT(*)"
+            elif metric.startswith("avg_"):
+                mcol = metric[4:]
+                if mcol in col_names:
+                    agg_expr = f'AVG("{mcol}")'
+            elif metric in col_names:
+                agg_expr = f'SUM("{metric}")'
+            else:
+                money_col = next(
+                    (c for c in col_names if any(k in c for k in ("final", "total", "amount", "price", "revenue", "sales", "earning", "fare"))),
+                    None,
+                )
+                if money_col:
+                    agg_expr = f'SUM("{money_col}")'
+
+            if not agg_expr:
+                continue
+
+            score = 0
+            if metric in col_names:
+                score += 5
+            if entity_col:
+                score += 4
+            if all((k in col_names) for k in filters.keys()):
+                score += 2
+            if any(k in date_col.lower() for k in ("date", "time", "created")):
+                score += 2
+
+            if best is None or score > best[0]:
+                best = (score, t, date_col, entity_col, agg_expr)
+
+        return (best[1], best[2], best[3], best[4]) if best else None
+
+    try:
+        plan = _pick_plan()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if not plan:
+        return None
+
+    table, date_col, entity_col, agg_expr = plan
+    filter_clause = _render_filter_clause(filters)
+    where_extra = f"\n{filter_clause}" if filter_clause else ""
+
+    if entity_col:
+        return (
+            f'WITH p1 AS (\n'
+            f'  SELECT "{entity_col}" AS name, {agg_expr} AS value1\n'
+            f'  FROM "{table}"\n'
+            f'  WHERE CAST("{date_col}" AS DATE) >= ? AND CAST("{date_col}" AS DATE) < ?{where_extra}\n'
+            f'  GROUP BY "{entity_col}"\n'
+            f'),\n'
+            f'p2 AS (\n'
+            f'  SELECT "{entity_col}" AS name, {agg_expr} AS value2\n'
+            f'  FROM "{table}"\n'
+            f'  WHERE CAST("{date_col}" AS DATE) >= ? AND CAST("{date_col}" AS DATE) < ?{where_extra}\n'
+            f'  GROUP BY "{entity_col}"\n'
+            f')\n'
+            f'SELECT COALESCE(p1.name, p2.name) AS name,\n'
+            f'       COALESCE(p1.value1, 0) AS value1,\n'
+            f'       COALESCE(p2.value2, 0) AS value2,\n'
+            f'       COALESCE(p2.value2, 0) - COALESCE(p1.value1, 0) AS delta\n'
+            f'FROM p1\n'
+            f'FULL OUTER JOIN p2 ON p1.name = p2.name\n'
+            f'ORDER BY value1 DESC\n'
+            f'LIMIT {top_n}'
+        )
+
+    return (
+        f'WITH p1 AS (\n'
+        f'  SELECT {agg_expr} AS value1\n'
+        f'  FROM "{table}"\n'
+        f'  WHERE CAST("{date_col}" AS DATE) >= ? AND CAST("{date_col}" AS DATE) < ?{where_extra}\n'
+        f'),\n'
+        f'p2 AS (\n'
+        f'  SELECT {agg_expr} AS value2\n'
+        f'  FROM "{table}"\n'
+        f'  WHERE CAST("{date_col}" AS DATE) >= ? AND CAST("{date_col}" AS DATE) < ?{where_extra}\n'
+        f')\n'
+        f"SELECT 'Total' AS name, p1.value1 AS value1, p2.value2 AS value2, (p2.value2 - p1.value1) AS delta\n"
+        f'FROM p1 CROSS JOIN p2'
+    )
+
+
 # ── Handler ───────────────────────────────────────────────────────────────────
 
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
@@ -569,12 +706,10 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     filters = parsed.get("filters", {}) or {}
 
     existing_tables = _get_existing_tables()
-    is_ecommerce    = _is_classic_ecommerce_schema(existing_tables)
 
     ctx.logger.info("📋 DB tables found", {
         "queryId":      query_id,
         "tables":       list(existing_tables),
-        "is_ecommerce": is_ecommerce,
     })
 
     ctx.logger.info("🧬 TextToSQL", {
@@ -589,16 +724,8 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     fallback_used = False
     sql_source    = "builder"
 
-    # ── Fast path: deterministic builder for classic e-commerce schema ─────────
-    # Only activated when the exact required tables are present AND the entity/
-    # metric combination is in the known set. All other datasets always use LLM.
-    use_builder = (
-        is_ecommerce
-        and not bool(filters)
-        and qt not in ("time_series",)
-        and parsed.get("entity") in _ECOMMERCE_VALID_ENTITIES
-        and parsed.get("metric") in _ECOMMERCE_VALID_METRICS
-    )
+    # ── Fast path: deterministic builder (schema-driven, works for any dataset) ─
+    use_builder = qt in ("top_n", "bottom_n", "aggregate", "zero_filter")
 
     if use_builder:
         built = build_sql(parsed)
@@ -658,14 +785,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             log_tokens(ctx, query_id, "TextToSQL", model, usage)
             await add_tokens_to_state(ctx, query_id, "TextToSQL", model, usage)
 
-    # ── Registry fallback (e-commerce only) ────────────────────────────────────
-    if generated_sql is None and is_ecommerce:
-        fb = _registry_fallback(parsed)
-        if fb:
-            generated_sql = fb
-            fallback_used = True
-            sql_source    = "registry_fallback"
-            ctx.logger.warn("⚠️ Registry fallback used", {"queryId": query_id})
+    # ── Registry fallback — no longer used (registry is empty) ──────────────────
 
     # ── Deterministic time-series fallback (any schema) ────────────────────────
     if generated_sql is None and qt == "time_series":
@@ -676,11 +796,19 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             sql_source    = "deterministic_time_series_fallback"
             ctx.logger.warn("Deterministic time_series fallback used", {"queryId": query_id})
 
+    if generated_sql is None and qt in ("comparison", "growth_ranking", "intersection"):
+        fb = _deterministic_comparison_fallback(parsed)
+        if fb:
+            generated_sql = fb
+            fallback_used = True
+            sql_source    = "deterministic_comparison_fallback"
+            ctx.logger.warn("Deterministic comparison fallback used", {"queryId": query_id})
+
     if generated_sql is None:
         msg = (
             f"Could not generate SQL for query_type={qt} "
             f"entity={parsed.get('entity')} metric={parsed.get('metric')}. "
-            "Try rephrasing — e.g. 'Top 5 restaurants by revenue in 2023'."
+            "Try rephrasing with explicit metric, dimension, and period."
         )
         qs = await ctx.state.get("queries", query_id)
         if qs:

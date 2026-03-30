@@ -10,26 +10,11 @@ from db.duckdb_connection import get_read_connection
 from db.semantic_layer import render_semantic_layer_lines
 
 _STATIC_FALLBACK = """
-Tables
-------
-states         : state_id (PK), state_name
-cities         : city_id (PK), city_name, state_id (FK->states)
-customers      : customer_id (PK), customer_name, gender, age, region_id, city_id (FK->cities)
-categories     : category_id (PK), category_name
-products       : product_id (PK), product_name, category_id (FK->categories), price DOUBLE
-orders         : order_id (PK), customer_id (FK->customers), order_date DATE, total_amount DOUBLE
-order_items    : order_item_id (PK), order_id (FK->orders), product_id (FK->products),
-                 quantity INT, item_price DOUBLE
+No tables are currently loaded in the database.
+Please upload a dataset first (CSV, JSON, or Parquet) to begin querying.
 
-Aggregation rules
------------------
-product/category revenue    = SUM(oi.quantity * oi.item_price)
-customer/city/state revenue = SUM(o.total_amount)
-quantity sold               = SUM(oi.quantity)
-order count                 = COUNT(DISTINCT o.order_id)
-
-Date filter: always use o.order_date BETWEEN ? AND ?
-Use ? placeholders for all params.
+Once data is loaded, the schema will be auto-detected from the live database.
+Use ? placeholders for all params in generated SQL.
 """
 
 # ── Column patterns that signal "exclude this row from metrics" ───────────────
@@ -222,35 +207,38 @@ def _detect_uniqueness_profile(conn, tables: list[str]) -> tuple[list[str], list
             id_like = (
                 n == "id" or n.endswith("_id") or n.endswith("_uuid") or n.endswith("_key")
                 or "email" in n or "phone" in n or "mobile" in n or n.endswith("_code")
+                or ratio > 0.99
             )
             if distinct_cnt >= 2 and ratio >= 0.98 and id_like:
                 unique_like.append(col_name)
 
-            if (n == "name" or n.endswith("_name") or "title" in n) and distinct_cnt >= 2 and ratio < 0.98:
+            if _is_text_type(dtype) and distinct_cnt >= 2 and ratio < 0.98:
                 label_non_unique.append(f"{col_name} ({distinct_cnt}/{non_null}, ratio={ratio:.2f})")
 
         if unique_like:
-            profile_lines.append(f'  "{table}" unique-like identifiers: {", ".join(unique_like[:6])}')
+            profile_lines.append(f'  "{table}" UNIQUE columns (use for COUNT DISTINCT): {", ".join(unique_like[:10])}')
         if label_non_unique:
-            profile_lines.append(f'  "{table}" non-unique labels: {", ".join(label_non_unique[:4])}')
+            profile_lines.append(f'  "{table}" non-unique labels: {", ".join(label_non_unique[:6])}')
 
-        # Build safe grouping map: <base>_name -> <base>_id/<base>_code when key is unique-like.
-        for raw_col, _ in cols:
+        # Build safe grouping map: <base> -> <base>_id/<base>_code when key is unique-like.
+        for raw_col, dtype in cols:
             c = raw_col.lower()
-            if c == "name" or c.endswith("_name"):
+            if _is_text_type(dtype):
                 base = c[:-5] if c.endswith("_name") else c
                 key_candidates = [f"{base}_id", f"{base}_code", f"{base}_key", f"{base}_uuid", "id"]
                 chosen = None
                 for k in key_candidates:
+                    if k == c: continue
                     stats = col_stats.get(k)
-                    if not stats:
-                        continue
+                    if not stats: continue
                     _, non_null, ratio = stats
                     if non_null >= 2 and ratio >= 0.98:
                         chosen = k
                         break
                 if chosen:
-                    grouping_lines.append(f'  "{table}": display "{c}" -> group by "{chosen}" + "{c}"')
+                    lbl_stats = col_stats.get(c)
+                    if lbl_stats and lbl_stats[2] < 0.98:
+                        grouping_lines.append(f'  "{table}": to group by "{c}", use GROUP BY "{chosen}", "{c}"')
 
     return profile_lines, grouping_lines
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sales Analytics — Live Pipeline</title>
+<title>Data Analytics — Live Pipeline</title>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -482,7 +482,7 @@ footer {
 
 <header>
   <div class="api-dot" id="api-dot"></div>
-  <h1>Sales Analytics</h1>
+  <h1>Data Analytics</h1>
   <span class="badge">Live pipeline</span>
   <span style="margin-left:auto;font-size:11px;color:var(--muted)" id="query-id-label"></span>
 </header>
@@ -551,7 +551,7 @@ footer {
   <div class="status-bar" id="status-bar">Ready — enter a query below</div>
   <div class="input-row">
     <input class="q-input" id="query-input"
-      placeholder="e.g. Top 5 products by revenue in March 2024"
+      placeholder="e.g. Top 5 items by revenue in March 2024"
       onkeydown="if(event.key==='Enter') sendQuery()">
     <button class="send-btn" id="send-btn" onclick="sendQuery()">Send</button>
   </div>

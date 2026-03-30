@@ -16,6 +16,10 @@ _TABLE_REF_RE = re.compile(
     r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*|\"[^\"]+\")(?:\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_]*)?",
     re.IGNORECASE,
 )
+_CTE_NAME_RE = re.compile(
+    r"(?:\bWITH\b|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(",
+    re.IGNORECASE,
+)
 
 
 def _extract_tables(sql: str) -> set[str]:
@@ -26,6 +30,13 @@ def _extract_tables(sql: str) -> set[str]:
             raw = raw[1:-1]
         tables.add(raw.lower())
     return tables
+
+
+def _extract_cte_names(sql: str) -> set[str]:
+    names: set[str] = set()
+    for m in _CTE_NAME_RE.finditer(sql or ""):
+        names.add(m.group(1).lower())
+    return names
 
 
 def validate_query(sql: str, params: Iterable[Any] | None = None) -> tuple[bool, list[str], list[str]]:
@@ -57,7 +68,8 @@ def validate_query(sql: str, params: Iterable[Any] | None = None) -> tuple[bool,
         }
 
         referenced = _extract_tables(raw)
-        missing = sorted(t for t in referenced if t not in existing)
+        cte_names = _extract_cte_names(raw)
+        missing = sorted(t for t in referenced if t not in existing and t not in cte_names)
         if missing:
             errors.append(f"Referenced table(s) not found: {', '.join(missing)}")
 

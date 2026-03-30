@@ -1,4 +1,4 @@
-"""streamlit_app.py  Sales Analytics Pipeline Dashboard
+"""streamlit_app.py  Data Analytics Pipeline Dashboard
 
 Layout changes:
   - Data source (file upload) stays in left panel, top position.
@@ -99,7 +99,7 @@ def _on_enter():
 
 
 st.set_page_config(
-    page_title="Sales Analytics Pipeline",
+    page_title="Data Analytics Pipeline",
     layout="wide",
 )
 
@@ -573,7 +573,7 @@ def _build_export_pdf(state: dict, user_query: str) -> bytes:
         canv.rect(0, 0, letter[0], letter[1], stroke=0, fill=1)
         canv.setFont("Helvetica", 8)
         canv.setFillColor(colors.HexColor("#64748b"))
-        canv.drawString(_doc.leftMargin, 0.30*inch, "Sales Analytics Report")
+        canv.drawString(_doc.leftMargin, 0.30*inch, "Data Analytics Report")
         canv.drawRightString(letter[0]-_doc.rightMargin, 0.30*inch, f"Page {_doc.page}")
         canv.restoreState()
 
@@ -809,7 +809,7 @@ def render_schema_section():
 
 #  Page layout 
 
-st.markdown("## Sales Analytics - Live Pipeline")
+st.markdown("## Data Analytics - Live Pipeline")
 
 if api_ok():
     st.success("Motia API connected (localhost:3121)")

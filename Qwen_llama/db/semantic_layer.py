@@ -165,11 +165,24 @@ def build_semantic_catalog(conn, tables: list[str]) -> dict[str, Any]:
                 )
                 seen_metric_keys.add(avg_key)
 
-        # Count metric
+        # Count metric — find any primary-key-like _id column
+        # Prefer columns with domain-specific hints, fall back to any *_id
         count_id = next(
-            (c for c in col_set if c.endswith("_id") and any(k in c for k in ("order", "ride", "trip", "invoice", "booking"))),
+            (c for c in col_set if c.endswith("_id") and any(k in c for k in (
+                "order", "ride", "trip", "invoice", "booking", "transaction",
+                "ticket", "case", "patient", "claim", "shipment", "delivery",
+                "visit", "session", "request", "record", "entry", "event",
+            ))),
             None,
         )
+        if not count_id:
+            # Fallback: any *_id column that looks like a row PK
+            count_id = next(
+                (c for c in col_set if c.endswith("_id") and c != "id"
+                 and not any(fk in c for fk in ("customer_id", "user_id", "city_id",
+                     "state_id", "category_id", "product_id", "driver_id"))),
+                next((c for c in col_set if c == "id"), None),
+            )
         if count_id:
             metrics.append(
                 {
@@ -177,7 +190,8 @@ def build_semantic_catalog(conn, tables: list[str]) -> dict[str, Any]:
                     "table": table,
                     "column": count_id,
                     "agg": "count_distinct",
-                    "aliases": ["count", "orders", "bookings", "trips", "rides", "number of"],
+                    "aliases": ["count", "total count", "number of", "how many",
+                                "records", "entries", "transactions"],
                 }
             )
 

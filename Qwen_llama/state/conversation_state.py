@@ -1,13 +1,14 @@
 """state/conversation_state.py
 
 Parses a natural-language analytics query into structured intent fields.
-All detection is pattern-based and fully generalised — no entity names,
-date values, or thresholds are hardcoded.
+All entity/metric detection is SCHEMA-DRIVEN — columns are read from
+the live DuckDB database at runtime.  No table names, column names,
+or domain-specific keywords are hardcoded.
 
 Fields
 ------
-entity            product | customer | city | category
-metric            revenue | quantity
+entity            detected dimension column (from live schema)
+metric            detected metric column (from live schema)
 time_range        "custom_range" when a date token is found
 raw_time_text     original text kept for date_parser
 ranking           top | bottom | aggregate | threshold | zero_filter | top_growth
@@ -20,6 +21,7 @@ threshold_type    "absolute" | "percentage" | None
 """
 
 import re
+from functools import lru_cache
 
 # ─── token sets ──────────────────────────────────────────────────────────────
 
@@ -51,6 +53,99 @@ def _has_year(t):    return bool(_YEAR_RE.search(t))
 def _count_years(t): return len(_YEAR_RE.findall(t))
 
 
+# ─── Schema-driven keyword detection ────────────────────────────────────────
+
+_TEXT_TYPES = ("VARCHAR", "CHAR", "TEXT", "STRING")
+_NUM_TYPES  = ("INT", "BIGINT", "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC", "REAL")
+_DATE_HINTS = ("date", "time", "created", "updated", "timestamp", "at")
+
+_MONETARY_KEYWORDS = (
+    "revenue", "sales", "amount", "total", "fare", "earning", "price",
+    "cost", "payment", "final", "profit", "income",
+)
+_QUANTITY_KEYWORDS = ("quantity", "qty", "units", "volume", "pieces", "items")
+_COUNT_KEYWORDS    = ("count", "how many", "number of", "total number")
+
+
+def _load_schema_maps() -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[str]]:
+    """
+    Read live schema from DuckDB and return:
+      entity_map  : [(keyword, column_name), ...]
+      metric_map  : [(keyword, column_name), ...]
+      entity_labels : [plural_display_name, ...]
+    """
+    entity_map: list[tuple[str, str]] = []
+    metric_map: list[tuple[str, str]] = []
+    entity_labels: list[str] = []
+
+    try:
+        from db.duckdb_connection import get_read_connection
+        conn = get_read_connection()
+        try:
+            tables = [
+                r[0] for r in conn.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema='main' AND table_name NOT LIKE '_raw_%' "
+                    "ORDER BY table_name"
+                ).fetchall()
+            ]
+            for table in tables:
+                cols = conn.execute(f'DESCRIBE "{table}"').fetchall()
+                for col, dtype, *_ in cols:
+                    d = dtype.upper() if isinstance(dtype, str) else str(dtype).upper()
+                    cname = col.lower()
+
+                    # Skip date columns
+                    if any(k in cname for k in _DATE_HINTS):
+                        continue
+
+                    # Entity columns (text, non-ID)
+                    if any(t in d for t in _TEXT_TYPES):
+                        if cname.endswith("_id") or cname.endswith("_key") or cname.endswith("_uuid"):
+                            continue
+                        base = cname
+                        for sfx in ("_name", "_title", "_label", "_type", "_mode"):
+                            if base.endswith(sfx):
+                                base = base[:-len(sfx)]
+                                break
+                        bw = base.replace("_", " ").strip()
+                        if bw:
+                            entity_map.append((bw, col))
+                            # Also add plural
+                            if not bw.endswith("s"):
+                                entity_map.append((bw + "s", col))
+                            entity_labels.append(bw + "s" if not bw.endswith("s") else bw)
+                        if cname.replace("_", " ") != bw:
+                            entity_map.append((cname.replace("_", " "), col))
+
+                    # Metric columns (numeric, non-ID)
+                    elif any(t in d for t in _NUM_TYPES):
+                        if cname.endswith("_id") or cname.endswith("_key"):
+                            continue
+                        bw = cname.replace("_", " ")
+                        metric_map.append((bw, col))
+                        # Add revenue/sales aliases for monetary columns
+                        if any(k in cname for k in ("price", "fare", "amount", "total", "final", "revenue", "earning", "cost", "profit")):
+                            for alias in ("revenue", "sales", "earnings", "income", "money", "spending"):
+                                metric_map.append((alias, col))
+                        # Add quantity aliases
+                        if any(k in cname for k in ("quantity", "qty", "units", "volume")):
+                            for alias in ("quantity", "units", "items", "pieces", "volume"):
+                                metric_map.append((alias, col))
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+    # Deduplicate preserving order
+    seen_e: set = set()
+    seen_m: set = set()
+    entity_map = [(k, v) for k, v in entity_map if (k, v) not in seen_e and not seen_e.add((k, v))]
+    metric_map = [(k, v) for k, v in metric_map if (k, v) not in seen_m and not seen_m.add((k, v))]
+
+    return entity_map, metric_map, list(dict.fromkeys(entity_labels))
+
+
 # ─── state class ─────────────────────────────────────────────────────────────
 
 class ConversationState:
@@ -73,8 +168,8 @@ class ConversationState:
     def normalize(self, text: str) -> str:
         t = text.lower().strip()
         for src, dst in {
-            "revnue": "revenue", "prodcts": "products",
-            "qty": "quantity",   "versus": "vs",
+            "revnue": "revenue", "qty": "quantity",
+            "versus": "vs",
         }.items():
             t = t.replace(src, dst)
         return t
@@ -133,10 +228,6 @@ class ConversationState:
         return len(months) >= 2 or len(quarters) >= 2
 
     def _detect_growth_ranking(self, t: str) -> bool:
-        """
-        Comparison query whose goal is to RANK entities by their growth delta.
-        e.g. "Which city had the HIGHEST revenue growth from Q1 to Q2"
-        """
         _sup = {"highest", "most", "best", "largest", "biggest",
                 "lowest", "least", "worst", "smallest", "maximum", "minimum"}
         _growth = {"growth", "grew", "increase", "decrease", "change", "growth rate"}
@@ -147,14 +238,11 @@ class ConversationState:
             "zero sales", "no sales", "zero quantity", "not sold",
             "zero revenue", "no orders", "never sold",
             "without sales", "without orders", "no transactions",
+            "zero activity", "no activity", "inactive",
         }
         return any(kw in t for kw in _kw)
 
     def _parse_threshold(self, t: str):
-        """
-        Return (value, type) for the numeric threshold in the query.
-        Generalised — works for any number the user specifies.
-        """
         # Percentage first (most specific signal)
         m = _PCT_RE.search(t)
         if m:
@@ -165,7 +253,7 @@ class ConversationState:
         if m:
             return float(m.group(1)), "absolute"
 
-        # Generic number next to threshold keyword (currency amounts etc.)
+        # Generic number next to threshold keyword
         _kw_pos = None
         for kw in ["exceed", "above", "more than", "greater than",
                    "at least", "over", "below", "fewer than", "under", "less than"]:
@@ -175,7 +263,6 @@ class ConversationState:
                 break
 
         if _kw_pos is not None:
-            # Scan for the first number after (or shortly before) the keyword
             segment = t[max(0, _kw_pos - 10): _kw_pos + 40]
             for m in _NUM_RE.finditer(segment):
                 val = float(m.group(1).replace(",", ""))
@@ -197,38 +284,62 @@ class ConversationState:
 
         t = self.normalize(text)
 
-        # ── entity ────────────────────────────────────────────────────────────
-        if "product" in t:
-            self.entity = "product"
-        elif "category" in t or "categor" in t:
-            self.entity = "category"
-        elif "customer" in t:
-            self.entity = "customer"
-        elif "city" in t or "cities" in t:
-            self.entity = "city"
+        # ── entity (SCHEMA-DRIVEN) ────────────────────────────────────────────
+        entity_map, metric_map, entity_labels = _load_schema_maps()
 
-        # ── metric ────────────────────────────────────────────────────────────
-        if any(w in t for w in ["revenue", "sales", "growth", "earning", "amount",
-                                   "spending", "spent", "purchase", "purchasing",
-                                   "best selling", "top selling"]):
-            self.metric = "revenue"
-        elif any(w in t for w in ["quantity", "units", "pieces",
-                                   "how many", "count of", "number of"]):
-            self.metric = "quantity"
+        # Sort by keyword length descending so longer matches win
+        sorted_entities = sorted(entity_map, key=lambda x: len(x[0]), reverse=True)
+        sorted_metrics  = sorted(metric_map, key=lambda x: len(x[0]), reverse=True)
+
+        for kw, col in sorted_entities:
+            if kw in t:
+                self.entity = col
+                break
+
+        # ── metric (SCHEMA-DRIVEN) ────────────────────────────────────────────
+        # First check for explicit revenue/sales/quantity/count keywords
+        if any(w in t for w in _MONETARY_KEYWORDS):
+            for kw, col in sorted_metrics:
+                if kw in t:
+                    self.metric = col
+                    break
+            if self.metric is None:
+                # Use first monetary metric from schema
+                for kw, col in sorted_metrics:
+                    if any(k in kw for k in ("revenue", "sales", "amount", "price", "fare", "total")):
+                        self.metric = col
+                        break
+        elif any(w in t for w in _QUANTITY_KEYWORDS):
+            for kw, col in sorted_metrics:
+                if any(k in kw for k in _QUANTITY_KEYWORDS):
+                    self.metric = col
+                    break
+        elif any(w in t for w in _COUNT_KEYWORDS):
+            self.metric = "count"
+        else:
+            # Try matching any metric keyword in the query
+            for kw, col in sorted_metrics:
+                if kw in t:
+                    self.metric = col
+                    break
 
         # Smart default: if entity+ranking known but no metric signal,
-        # default to revenue (the overwhelming majority of analytics queries).
-        # Quantity is always explicit ("units sold", "quantity", "pieces").
-        # "ordered", "placed orders", "purchases" without a metric word → revenue.
+        # default to the first monetary metric found in schema
         if self.metric is None and self.entity is not None:
-            self.metric = "revenue"
+            for kw, col in sorted_metrics:
+                if any(k in kw for k in ("revenue", "sales", "amount", "price", "fare", "total", "earning")):
+                    self.metric = col
+                    break
+            # If still None, use first numeric metric
+            if self.metric is None and sorted_metrics:
+                self.metric = sorted_metrics[0][1]
 
         # ── zero filter (early exit) ──────────────────────────────────────────
         if self._detect_zero_filter(t):
             self.ranking       = "zero_filter"
             self.time_range    = "custom_range"
             self.raw_time_text = text
-            return   # no further ranking detection needed
+            return
 
         # ── threshold ─────────────────────────────────────────────────────────
         _threshold_kw = {
@@ -254,21 +365,13 @@ class ConversationState:
         elif self._detect_comparison(t):
             self.is_comparison = True
             self.raw_time_text = text
-            if self.entity is None:
-                self.entity = "product"
 
             if self._detect_growth_ranking(t):
                 self.is_growth_ranking = True
                 self.ranking           = "top_growth"
             else:
                 if self.ranking is None:
-                    # "by category/product/city/customer" in the query means
-                    # the user wants a per-entity breakdown, not a single total
-                    _by_entity = any(p in t for p in [
-                        "by category", "by product", "by city",
-                        "by customer", "per category", "per product",
-                        "per city", "per customer",
-                    ])
+                    _by_entity = bool(re.search(r"\bby\s+\w+", t) or re.search(r"\bper\s+\w+", t))
                     self.ranking = "top" if _by_entity else "aggregate"
 
         # ── intersection ──────────────────────────────────────────────────────
@@ -306,7 +409,7 @@ class ConversationState:
                 self.ranking = "top"
                 self.top_n   = 1
             elif self.is_growth_ranking:
-                self.top_n   = 1   # show the ONE entity with biggest growth
+                self.top_n   = 1
 
         if any(x in t for x in ["lowest", "worst", "smallest", "minimum"]):
             if self.ranking is None:
@@ -324,16 +427,39 @@ class ConversationState:
     def is_complete(self) -> bool:
         return bool(self.entity and self.metric and self.time_range)
 
+    def get_entity_display_label(self) -> str:
+        """Return a human-readable plural label for the current entity."""
+        if not self.entity:
+            return "items"
+        base = self.entity.lower()
+        for sfx in ("_name", "_title", "_label"):
+            if base.endswith(sfx):
+                base = base[:-len(sfx)]
+                break
+        base = base.replace("_", " ")
+        if not base.endswith("s"):
+            base += "s"
+        return base
+
     def merge_clarification(self, clarification_text: str) -> None:
         t = self.normalize(clarification_text)
+
+        entity_map, metric_map, _ = _load_schema_maps()
+        sorted_entities = sorted(entity_map, key=lambda x: len(x[0]), reverse=True)
+        sorted_metrics  = sorted(metric_map, key=lambda x: len(x[0]), reverse=True)
+
         if self.entity is None:
-            if "product"  in t:                    self.entity = "product"
-            elif "category" in t or "categor" in t: self.entity = "category"
-            elif "customer" in t:                   self.entity = "customer"
-            elif "city" in t or "cities" in t:      self.entity = "city"
+            for kw, col in sorted_entities:
+                if kw in t:
+                    self.entity = col
+                    break
+
         if self.metric is None:
-            if any(w in t for w in ["revenue", "sales"]):    self.metric = "revenue"
-            elif any(w in t for w in ["quantity", "units"]): self.metric = "quantity"
+            for kw, col in sorted_metrics:
+                if kw in t:
+                    self.metric = col
+                    break
+
         if self.time_range is None and (_has_month(t) or _has_quarter(t) or _has_year(t)):
             self.time_range    = "custom_range"
             self.raw_time_text = clarification_text

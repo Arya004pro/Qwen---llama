@@ -122,8 +122,8 @@ def _validate_syntax(sql: str, ranking: str) -> tuple[bool, str]:
 # ─── Prompt ───────────────────────────────────────────────────────────────────
 
 def _build_prompt(intent: dict[str, Any], schema_prompt: str) -> str:
-    entity    = intent.get("entity",         "product")
-    metric    = intent.get("metric",         "revenue")
+    entity    = intent.get("entity",         "(auto-detect from schema)")
+    metric    = intent.get("metric",         "(auto-detect from schema)")
     ranking   = intent.get("ranking",        "top")
     top_n     = intent.get("top_n",          5)
     raw_query = intent.get("raw_user_query", "")
@@ -143,8 +143,8 @@ def _build_prompt(intent: dict[str, Any], schema_prompt: str) -> str:
         ),
         "threshold": (
             "Use a HAVING clause derived from the user's question.\n"
-            "For 'more than 10% of total revenue', write:\n"
-            "  HAVING SUM(...) > 0.10 * (SELECT SUM(...) FROM ... WHERE order_date BETWEEN ? AND ?)\n"
+            "For 'more than 10% of total', write:\n"
+            "  HAVING SUM(...) > 0.10 * (SELECT SUM(...) FROM ... WHERE <date_col> BETWEEN ? AND ?)\n"
             "Alias the group-by column as 'name' and the metric as 'value'.\n"
             "End with ORDER BY value DESC. No LIMIT clause."
         ),
