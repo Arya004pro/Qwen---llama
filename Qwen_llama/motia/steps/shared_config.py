@@ -23,12 +23,25 @@ for _env in [
 
 GROQ_API_TOKEN = os.getenv("GROQ_API_TOKEN")
 QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen/qwen3-32b")
-LLAMA_MODEL = os.getenv("LLAMA_MODEL", "llama-3.1-8b-instant")
+LLAMA_MODEL = os.getenv("LLAMA_MODEL", "llama-3.3-70b-versatile")
+SQL_GENERATOR_MODEL = os.getenv("SQL_GENERATOR_MODEL", LLAMA_MODEL)
+INSIGHTS_MODEL = os.getenv("INSIGHTS_MODEL", QWEN_MODEL)
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # Reasoning controls for Qwen. Reasoning is hidden from user output because
 # downstream steps strip <think> blocks before parsing/formatting.
 QWEN_ENABLE_REASONING = os.getenv("QWEN_ENABLE_REASONING", "1") == "1"
 QWEN_REASONING_EFFORT = os.getenv("QWEN_REASONING_EFFORT", "medium")
+
+try:
+    PARSE_INTENT_MAX_RETRIES = max(1, int(os.getenv("PARSE_INTENT_MAX_RETRIES", "2")))
+except ValueError:
+    PARSE_INTENT_MAX_RETRIES = 2
+
+AI_INSIGHTS_MODE = (os.getenv("AI_INSIGHTS_MODE", "adaptive") or "adaptive").strip().lower()
+try:
+    AI_INSIGHTS_ROW_THRESHOLD = max(1, int(os.getenv("AI_INSIGHTS_ROW_THRESHOLD", "8")))
+except ValueError:
+    AI_INSIGHTS_ROW_THRESHOLD = 8
 
 DUCKDB_PATH = os.getenv("DUCKDB_PATH", "motia/data/analytics.duckdb")

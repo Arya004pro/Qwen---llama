@@ -32,7 +32,7 @@ from motia import FlowContext, queue
 from shared_config import (
     GROQ_API_TOKEN,
     LLAMA_MODEL,
-    QWEN_MODEL,
+    SQL_GENERATOR_MODEL,
     GROQ_URL,
     QWEN_ENABLE_REASONING,
     QWEN_REASONING_EFFORT,
@@ -358,6 +358,7 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
     qt         = parsed.get("query_type", "top_n")
     top_n      = parsed.get("top_n", 5)
     disable_limit = bool(parsed.get("_disable_limit"))
+    rank_within_time = bool(parsed.get("_rank_within_time"))
     thr        = parsed.get("threshold") or {}
     filters    = parsed.get("filters", {}) or {}
     trs        = parsed.get("time_ranges", [])
@@ -385,7 +386,15 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
         )
 
     # ── Ranking instruction ───────────────────────────────────────────────────
-    if qt == "time_series":
+    if rank_within_time:
+        rank_instr = (
+            f"Return TOP/BOTTOM {top_n} entities WITHIN EACH {bucket.upper()} bucket using a window function.\n"
+            f"Pattern: ROW_NUMBER() OVER (PARTITION BY <bucket_expr> ORDER BY value {'DESC' if qt != 'bottom_n' else 'ASC'}) AS rn\n"
+            f"Then filter rn <= {top_n}.\n"
+            f"Output columns must be: period, name, value.\n"
+            f"ORDER BY period ASC, value {'DESC' if qt != 'bottom_n' else 'ASC'}."
+        )
+    elif qt == "time_series":
         ts_hint    = _build_time_series_sql_hint(parsed)
         rank_instr = (
             f"This is a TIME SERIES / TREND query.\n"
@@ -450,7 +459,7 @@ Parsed intent:
   metric     : {metric}
     aov_numerator_col: {aov_revenue_col or 'N/A'}
     count_distinct_key: {count_key or 'N/A'}
-  time_bucket: {bucket if qt == 'time_series' else 'N/A'}
+    time_bucket: {bucket if (qt == 'time_series' or rank_within_time) else 'N/A'}
   top_n      : {top_n}
     disable_limit: {disable_limit}
   filters    : {filter_desc}{date_hints}
@@ -482,6 +491,27 @@ STRICT RULES:
 9. Ranking: {rank_instr}
 {groupby_rule}
 {filter_rule}
+
+SCHEMA-AGNOSTIC PATTERN EXAMPLES (use exact schema columns; placeholders only):
+- Aggregate:
+    SELECT <agg_expr> AS value
+    FROM <table>
+    WHERE <date_col> >= ? AND <date_col> < ?
+
+- Grouped ranking/breakdown:
+    SELECT <entity_col> AS name, <agg_expr> AS value
+    FROM <table>
+    WHERE <date_col> >= ? AND <date_col> < ?
+    GROUP BY <entity_col>
+    ORDER BY value DESC
+    [LIMIT N only when ranking is requested]
+
+- Time series:
+    SELECT <bucket_expr> AS name, <agg_expr> AS value
+    FROM <table>
+    WHERE <date_col> >= ? AND <date_col> < ?
+    GROUP BY <bucket_expr>
+    ORDER BY name ASC
 
 SQL:"""
 
@@ -515,6 +545,64 @@ def _call_llm(model: str, prompt: str) -> tuple[str, dict]:
     resp.raise_for_status()
     data = resp.json()
     return data["choices"][0]["message"]["content"].strip(), data.get("usage", {})
+
+
+def _build_sql_fix_prompt(
+    user_query: str,
+    parsed: dict,
+    schema: str,
+    bad_sql: str,
+    error_msg: str,
+) -> str:
+    return f"""You are a DuckDB SQL repair assistant. Return ONLY corrected SQL.
+
+User question: \"{user_query}\"
+
+{schema}
+
+Parsed intent:
+  query_type : {parsed.get('query_type')}
+  entity     : {parsed.get('entity')}
+  metric     : {parsed.get('metric')}
+  time_bucket: {parsed.get('time_bucket')}
+
+Broken SQL:
+{bad_sql}
+
+Error:
+{error_msg}
+
+Repair rules:
+1. Keep original intent and metric semantics unchanged.
+2. Use EXACT table/column names from schema.
+3. Keep placeholders (?) for dynamic values; do not inline dates.
+4. Return one SELECT/WITH statement only; no semicolon, no comments.
+5. Alias grouped label as name and aggregated value as value.
+
+SQL:"""
+
+
+def _try_repair_sql(
+    model: str,
+    user_query: str,
+    parsed: dict,
+    schema: str,
+    bad_sql: str,
+    error_msg: str,
+) -> tuple[str | None, dict]:
+    try:
+        fix_prompt = _build_sql_fix_prompt(user_query, parsed, schema, bad_sql, error_msg)
+        raw_fix, usage_fix = _call_llm(model, fix_prompt)
+        repaired_sql = _extract_sql(raw_fix)
+        ok, reason = _is_safe(repaired_sql)
+        if not ok:
+            return None, usage_fix
+        ok2, _ = _explain(repaired_sql, parsed)
+        if not ok2:
+            return None, usage_fix
+        return repaired_sql, usage_fix
+    except Exception:
+        return None, {}
 
 
 def _registry_fallback(parsed: dict) -> str | None:
@@ -660,6 +748,162 @@ def _deterministic_time_series_fallback(parsed: dict) -> str | None:
         f'{where_extra}\n'
         f'GROUP BY {b_expr}\n'
         f'ORDER BY name ASC'
+    )
+
+
+def _deterministic_rank_within_time_fallback(parsed: dict) -> str | None:
+    """Build SQL for top/bottom N entities within each time bucket."""
+    metric    = (parsed.get("metric") or "count").lower()
+    entity    = (parsed.get("entity") or "").lower().strip()
+    bucket    = (parsed.get("time_bucket") or "year").lower()
+    filters   = parsed.get("filters", {}) or {}
+    top_n     = int(parsed.get("top_n") or 5)
+    qt        = (parsed.get("query_type") or "top_n").lower()
+    count_key = parsed.get("_count_distinct_key")
+    aov_revenue_col = (parsed.get("_aov_revenue_col") or "").lower().strip()
+
+    if not entity:
+        return None
+
+    try:
+        conn = get_read_connection()
+        table_rows = conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='main' AND table_type='BASE TABLE' ORDER BY table_name"
+        ).fetchall()
+        tables = [r[0] for r in table_rows]
+    except Exception:
+        return None
+
+    def _bucket_expr(date_col: str) -> str:
+        d = f'CAST("{date_col}" AS DATE)'
+        if bucket == "year":
+            return f"CAST(YEAR({d}) AS VARCHAR)"
+        if bucket == "quarter":
+            return f"CONCAT(CAST(YEAR({d}) AS VARCHAR), '-Q', CAST(QUARTER({d}) AS VARCHAR))"
+        if bucket == "week":
+            return f"STRFTIME({d}, '%Y-W%W')"
+        if bucket == "day":
+            return f"STRFTIME({d}, '%Y-%m-%d')"
+        return f"STRFTIME({d}, '%Y-%m')"
+
+    def _pick_plan() -> tuple[str, str, str, str] | None:
+        best = None
+        for t in tables:
+            try:
+                cols = [(c[0], str(c[1]).upper()) for c in conn.execute(f'DESCRIBE "{t}"').fetchall()]
+            except Exception:
+                continue
+
+            col_names = [c[0].lower() for c in cols]
+            date_cols = [
+                c for c, typ in cols
+                if (
+                    "DATE" in typ
+                    or "TIMESTAMP" in typ
+                    or any(k in c.lower() for k in ("date", "time", "created", "updated", "at"))
+                )
+            ]
+            if not date_cols:
+                continue
+            date_col = next((c for c in date_cols if "date" in c.lower()), date_cols[0])
+
+            entity_col = None
+            if entity in col_names:
+                entity_col = entity
+            elif entity.endswith("_name") and entity[:-5] in col_names:
+                entity_col = entity[:-5]
+            else:
+                tokens = [tok for tok in entity.replace("_", " ").split() if tok]
+                text_cols = [c for c, typ in cols if any(tk in typ for tk in ("VARCHAR", "CHAR", "TEXT", "STRING"))]
+                for c in text_cols:
+                    low = c.lower()
+                    if any(tok in low for tok in tokens):
+                        entity_col = c
+                        break
+
+            if not entity_col:
+                continue
+
+            agg_expr = None
+            if metric == "aov":
+                ck = count_key if count_key and count_key in col_names else _pick_best_count_key(col_names)
+                revenue_col = aov_revenue_col if aov_revenue_col in col_names else None
+                if not revenue_col:
+                    revenue_candidates = [
+                        c for c in col_names
+                        if any(k in c for k in ("final", "total", "amount", "price", "revenue", "sales", "earning", "fare", "net", "paid"))
+                    ]
+                    revenue_col = _pick_best_revenue_column(revenue_candidates)
+                if ck and revenue_col:
+                    agg_expr = f'SUM("{revenue_col}") / NULLIF(COUNT(DISTINCT "{ck}"), 0)'
+            elif metric == "count":
+                ck = count_key if count_key and count_key in col_names else _pick_best_count_key(col_names)
+                agg_expr = f'COUNT(DISTINCT "{ck}")' if ck else "COUNT(*)"
+            elif metric.startswith("avg_"):
+                mcol = metric[4:]
+                if mcol in col_names:
+                    agg_expr = f'AVG("{mcol}")'
+            elif metric in col_names:
+                agg_expr = f'SUM("{metric}")'
+            else:
+                revenue_candidates = [
+                    c for c in col_names
+                    if any(k in c for k in ("final", "total", "amount", "price", "revenue", "sales", "earning", "fare", "net", "paid"))
+                ]
+                money_col = _pick_best_revenue_column(revenue_candidates)
+                if money_col:
+                    agg_expr = f'SUM("{money_col}")'
+
+            if not agg_expr:
+                continue
+
+            score = 0
+            if metric in col_names:
+                score += 5
+            if entity_col:
+                score += 5
+            if any(k in date_col.lower() for k in ("date", "time", "created")):
+                score += 2
+            if all((k in col_names) for k in filters.keys()):
+                score += 2
+
+            if best is None or score > best[0]:
+                best = (score, t, date_col, entity_col, agg_expr)
+
+        return (best[1], best[2], best[3], best[4]) if best else None
+
+    try:
+        plan = _pick_plan()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if not plan:
+        return None
+
+    table, date_col, entity_col, agg_expr = plan
+    b_expr = _bucket_expr(date_col)
+    direction = "ASC" if qt == "bottom_n" else "DESC"
+    filter_clause = _render_filter_clause(filters)
+    where_extra = f"\n{filter_clause}" if filter_clause else ""
+
+    return (
+        "WITH ranked AS (\n"
+        f"  SELECT {b_expr} AS period,\n"
+        f"         \"{entity_col}\" AS name,\n"
+        f"         {agg_expr} AS value,\n"
+        f"         ROW_NUMBER() OVER (PARTITION BY {b_expr} ORDER BY {agg_expr} {direction}) AS rn\n"
+        f"  FROM \"{table}\"\n"
+        f"  WHERE CAST(\"{date_col}\" AS DATE) >= ? AND CAST(\"{date_col}\" AS DATE) < ?{where_extra}\n"
+        f"  GROUP BY {b_expr}, \"{entity_col}\"\n"
+        ")\n"
+        "SELECT period, name, value\n"
+        "FROM ranked\n"
+        "WHERE rn <= ?\n"
+        f"ORDER BY period ASC, value {direction}"
     )
 
 
@@ -837,6 +1081,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     parsed["_user_query"] = user_query
 
     qt      = parsed.get("query_type", "top_n")
+    rank_within_time = bool(parsed.get("_rank_within_time"))
     filters = parsed.get("filters", {}) or {}
 
     existing_tables = _get_existing_tables()
@@ -859,7 +1104,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     sql_source    = "builder"
 
     # ── Fast path: deterministic builder (schema-driven, works for any dataset) ─
-    use_builder = qt in ("top_n", "bottom_n", "aggregate", "zero_filter")
+    use_builder = qt in ("top_n", "bottom_n", "aggregate", "zero_filter") and not rank_within_time
 
     if use_builder:
         built = build_sql(parsed)
@@ -877,11 +1122,17 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 ctx.logger.warn("⚠️ Builder safety failed — falling to LLM",
                                 {"queryId": query_id, "reason": reason})
 
+    if generated_sql is None and rank_within_time:
+        fb = _deterministic_rank_within_time_fallback(parsed)
+        if fb:
+            generated_sql = fb
+            fallback_used = True
+            sql_source = "deterministic_rank_within_time_fallback"
+            ctx.logger.info("✅ Deterministic rank-within-time SQL built", {"queryId": query_id})
+
     # ── LLM path: used for all non-e-commerce datasets and complex query types ─
     if generated_sql is None:
-        _COMPLEX = {"growth_ranking", "comparison", "threshold", "intersection",
-                    "zero_filter", "time_series"}
-        model      = QWEN_MODEL if qt in _COMPLEX else LLAMA_MODEL
+        model      = SQL_GENERATOR_MODEL or LLAMA_MODEL
         sql_source = f"llm_{model.split('/')[0]}"
 
         ctx.logger.info("🤖 LLM SQL generation", {"queryId": query_id, "model": model})
@@ -901,15 +1152,26 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                     generated_sql = sql
                     ctx.logger.info("✅ LLM SQL validated", {"queryId": query_id})
                 else:
-                    # For time_series, prefer deterministic fallback over broken LLM SQL.
-                    if qt == "time_series":
-                        ctx.logger.warn(
-                            "⚠️ LLM EXPLAIN failed for time_series — using deterministic fallback",
-                            {"queryId": query_id, "error": err})
+                    ctx.logger.warn("⚠️ LLM EXPLAIN failed — trying SQL self-repair",
+                                    {"queryId": query_id, "error": err})
+                    repaired_sql, repair_usage = _try_repair_sql(
+                        model=model,
+                        user_query=user_query,
+                        parsed=parsed,
+                        schema=schema,
+                        bad_sql=sql,
+                        error_msg=err,
+                    )
+                    if repair_usage:
+                        log_tokens(ctx, query_id, "TextToSQLRepair", model, repair_usage)
+                        await add_tokens_to_state(ctx, query_id, "TextToSQLRepair", model, repair_usage)
+
+                    if repaired_sql:
+                        generated_sql = repaired_sql
+                        ctx.logger.info("✅ SQL repaired and validated", {"queryId": query_id})
                     else:
-                        ctx.logger.warn("⚠️ LLM EXPLAIN failed — attempting execution anyway",
-                                        {"queryId": query_id, "error": err})
-                        generated_sql = sql
+                        ctx.logger.warn("⚠️ SQL self-repair failed; using deterministic fallback if available",
+                                        {"queryId": query_id})
             else:
                 ctx.logger.warn("⚠️ LLM safety failed", {"queryId": query_id, "reason": reason})
         except Exception as exc:

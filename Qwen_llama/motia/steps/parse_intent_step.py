@@ -13,6 +13,7 @@ import os
 import sys
 import re
 import json
+import time
 import calendar
 from datetime import datetime, timezone
 from typing import Any
@@ -32,6 +33,7 @@ from shared_config import (
     GROQ_URL,
     QWEN_ENABLE_REASONING,
     QWEN_REASONING_EFFORT,
+    PARSE_INTENT_MAX_RETRIES,
 )
 from utils.token_logger import log_tokens, add_tokens_to_state
 from utils.time_parser import parse_time_ranges_from_query
@@ -165,6 +167,24 @@ _TREND_KEYWORDS = {
 _ALL_TIME_YEARLY_HINTS = {
     "each year", "every year", "yearly", "annual", "annually",
     "by year", "per year",
+}
+
+_RANK_WITHIN_TIME_CUES: dict[str, tuple[str, ...]] = {
+    "year": (
+        "per year", "by year", "each year", "every year", "year-wise", "yearly", "annual", "annually",
+    ),
+    "quarter": (
+        "per quarter", "by quarter", "each quarter", "quarter-wise", "quarterly",
+    ),
+    "month": (
+        "per month", "by month", "each month", "month-wise", "monthly",
+    ),
+    "week": (
+        "per week", "by week", "each week", "week-wise", "weekly",
+    ),
+    "day": (
+        "per day", "by day", "each day", "day-wise", "daily",
+    ),
 }
 
 _REVENUE_QUERY_HINTS = (
@@ -355,10 +375,13 @@ def _should_skip_mandatory_filter(col_name: str, user_query: str, chosen_entity:
     return False
 
 
-def _find_split_dimension_for_query(user_query: str) -> str | None:
+def _find_split_dimension_for_query(user_query: str, require_split_cue: bool = True) -> str | None:
     ql = (user_query or "").lower()
     split_cue = any(x in ql for x in (" vs ", " versus ", " compared to ", " against "))
-    if not split_cue:
+    grouping_cue = bool(re.search(r"\b(per|by|for each|each)\b", ql))
+    if require_split_cue and not split_cue:
+        return None
+    if not split_cue and not grouping_cue:
         return None
 
     # Keep this generic: identify low-cardinality columns likely used for categorical splits.
@@ -405,14 +428,18 @@ def _find_split_dimension_for_query(user_query: str) -> str | None:
 
                 score = 0
                 name_tokens = [t for t in c.replace("is_", "").split("_") if len(t) >= 3]
-                if any(tok in ql for tok in name_tokens):
+                token_hit = any(tok in ql for tok in name_tokens)
+                if token_hit:
                     score += 10
                 if c.startswith("is_"):
                     score += 4
                 if distinct_cnt <= 6:
                     score += 3
-                if any(w in ql for w in ("count", "number of", "how many", "total")):
+                if token_hit and any(w in ql for w in ("count", "number of", "how many", "total")):
                     score += 2
+
+                if not split_cue and not token_hit:
+                    continue
 
                 if score > 0 and (best is None or score > best[0]):
                     best = (score, col)
@@ -423,7 +450,11 @@ def _find_split_dimension_for_query(user_query: str) -> str | None:
         return None
 
 
-def _infer_boolean_flag_filters(user_query: str, split_cue: bool) -> dict[str, int]:
+def _infer_boolean_flag_filters(
+    user_query: str,
+    split_cue: bool,
+    chosen_entity: str | None = None,
+) -> dict[str, int]:
     if split_cue:
         return {}
 
@@ -444,6 +475,8 @@ def _infer_boolean_flag_filters(user_query: str, split_cue: bool) -> dict[str, i
             for col, dtype, *_ in cols:
                 c = str(col).lower()
                 d = str(dtype).upper()
+                if chosen_entity and c == str(chosen_entity).lower().strip():
+                    continue
                 if not any(t in d for t in ("INT", "BIGINT", "SMALLINT", "TINYINT", "BOOLEAN")):
                     continue
 
@@ -699,6 +732,16 @@ def _is_trend_query(query: str) -> bool:
     return any(kw in q for kw in _TREND_KEYWORDS)
 
 
+def _infer_rank_within_time_bucket(query: str) -> str | None:
+    q = (query or "").lower()
+    if not _has_ranking_cue(query):
+        return None
+    for bucket, cues in _RANK_WITHIN_TIME_CUES.items():
+        if any(c in q for c in cues):
+            return bucket
+    return None
+
+
 def _has_ranking_cue(query: str) -> bool:
     q = f" {query.lower()} "
     if _TOPN_RE.search(q):
@@ -718,6 +761,38 @@ def _has_metric_cue(query: str) -> bool:
         "discount", "profit", "margin", "rate", "score",
     )
     return any(c in q for c in metric_cues)
+
+
+def _should_use_rule_first(user_query: str) -> bool:
+    q = (user_query or "").strip().lower()
+    if not q:
+        return False
+    if len(q) > 220:
+        return False
+
+    complex_cues = (
+        "correlation", "cohort", "retention", "attribution", "causal",
+        "forecast", "prediction", "why ", "reason", "root cause",
+        "intersection", "growth ranking", "percentile", "median",
+    )
+    if any(c in q for c in complex_cues):
+        return False
+
+    has_simple_shape = (
+        _has_ranking_cue(q)
+        or _is_trend_query(q)
+        or any(c in q for c in ("total", "overall", "sum", "average", "count", "number of", "how many"))
+        or any(c in q for c in (" vs ", " versus ", " compared to ", " against "))
+    )
+    if not has_simple_shape:
+        return False
+
+    if not _has_metric_cue(q) and not any(c in q for c in ("count", "number of", "how many", "orders", "records")):
+        return False
+
+    extracted_ranges, _ = parse_time_ranges_from_query(user_query)
+    has_time = bool(extracted_ranges) or _looks_like_all_time_trend(user_query) or bool(re.search(r"\b(19|20)\d{2}\b", q))
+    return has_time
 
 
 def _infer_entity_from_grouping_cue(
@@ -765,6 +840,50 @@ def _infer_entity_from_grouping_cue(
                 elif tgt in v or v in tgt:
                     score += 6
         if score > 0 and (best is None or score > best[0]):
+            best = (score, col)
+
+    return best[1] if best else None
+
+
+def _infer_entity_from_query_terms(
+    user_query: str,
+    entity_map: list[tuple[str, str]],
+) -> str | None:
+    q = (user_query or "").lower()
+    query_terms = {
+        t for t in re.findall(r"[a-z][a-z0-9_]+", q)
+        if len(t) >= 3 and t not in {
+            "top", "bottom", "highest", "lowest", "most", "least",
+            "show", "list", "give", "with", "from", "into", "over",
+            "trend", "time", "year", "month", "week", "day", "quarter",
+            "total", "average", "count", "number", "records", "values",
+        }
+    }
+    if not query_terms:
+        return None
+
+    best: tuple[int, str] | None = None
+    for kw, col in entity_map:
+        k = (kw or "").lower().replace("_", " ").strip()
+        c = (col or "").lower().replace("_", " ").strip()
+        tokens = {
+            t for t in re.findall(r"[a-z][a-z0-9]+", f"{k} {c}")
+            if len(t) >= 3 and t not in {"name", "type", "status", "code", "id"}
+        }
+        if not tokens:
+            continue
+
+        overlap = len(tokens & query_terms)
+        if overlap <= 0:
+            continue
+
+        score = overlap * 5
+        if k and k in q:
+            score += 4
+        if c and c in q:
+            score += 3
+
+        if best is None or score > best[0]:
             best = (score, col)
 
     return best[1] if best else None
@@ -933,12 +1052,24 @@ def _post_process(
             m = parsed["metric"]
 
     ranking_cue = _has_ranking_cue(user_query)
+    rank_within_time_bucket = _infer_rank_within_time_bucket(user_query)
 
     if not parsed.get("entity") and grouping_cue:
         entity_map_for_grouping, _ = _build_schema_keyword_maps()
         inferred_entity = _infer_entity_from_grouping_cue(user_query, entity_map_for_grouping)
         if inferred_entity:
             parsed["entity"] = inferred_entity
+        if not parsed.get("entity"):
+            inferred_low_card_entity = _find_split_dimension_for_query(
+                user_query,
+                require_split_cue=False,
+            )
+            if inferred_low_card_entity:
+                parsed["entity"] = inferred_low_card_entity
+
+    if rank_within_time_bucket and parsed.get("entity") and parsed.get("query_type") in ("top_n", "bottom_n"):
+        parsed["_rank_within_time"] = True
+        parsed["time_bucket"] = rank_within_time_bucket
 
     if split_cue and any(c in ql for c in count_cues):
         split_entity = _find_split_dimension_for_query(user_query)
@@ -948,6 +1079,8 @@ def _post_process(
             parsed["metric"] = "count"
             parsed["semantic_metric"] = "count"
             parsed["top_n"] = max(int(parsed.get("top_n") or 5), 20)
+            # Split comparisons should return all groups, not an arbitrary top-N slice.
+            parsed["_disable_limit"] = True
             current_filters = dict(parsed.get("filters") or {})
             current_filters.pop(split_entity, None)
             parsed["filters"] = current_filters
@@ -955,13 +1088,19 @@ def _post_process(
             m = "count"
 
             if _is_trend_query(user_query):
+                split_label = split_entity.replace("is_", "").replace("_", " ")
                 parsed["is_complete"] = False
                 parsed["_force_clarification"] = True
                 parsed["clarification_question"] = (
-                    "Do you want a year-wise trend for one status, or an overall paid vs refunded split?"
+                    f"Do you want a time-bucket trend for one {split_label} value, "
+                    f"or an overall split by {split_label}?"
                 )
 
-    inferred_flag_filters = _infer_boolean_flag_filters(user_query, split_cue)
+    inferred_flag_filters = _infer_boolean_flag_filters(
+        user_query,
+        split_cue,
+        parsed.get("entity"),
+    )
     if inferred_flag_filters:
         current_filters = dict(parsed.get("filters") or {})
         for fk, fv in inferred_flag_filters.items():
@@ -1002,28 +1141,10 @@ def _post_process(
         inferred_entity = _infer_entity_from_grouping_cue(user_query, entity_map)
         if inferred_entity:
             parsed["entity"] = inferred_entity
-        preferred_tokens = {
-            "product": "product",
-            "customer": "customer",
-            "region": "region",
-            "segment": "segment",
-            "channel": "channel",
-            "course": "course",
-            "student": "student",
-            "platform": "platform",
-            "category": "category",
-            "city": "city",
-            "coupon": "coupon",
-            "payment": "payment",
-        }
         if not parsed.get("entity"):
-            for tok, needle in preferred_tokens.items():
-                if tok not in ql:
-                    continue
-                match_col = next((col for _, col in entity_map if needle in col.lower()), None)
-                if match_col:
-                    parsed["entity"] = match_col
-                    break
+            inferred_entity = _infer_entity_from_query_terms(user_query, entity_map)
+            if inferred_entity:
+                parsed["entity"] = inferred_entity
 
     if (
         _is_trend_query(user_query)
@@ -1057,7 +1178,8 @@ def _post_process(
             parsed["time_ranges"] = extracted
             tr = extracted
             if (suggested_qt == "comparison"
-                    and parsed.get("query_type") not in ("comparison", "growth_ranking", "intersection")):
+                    and parsed.get("query_type") not in ("comparison", "growth_ranking", "intersection")
+                    and not (split_cue and parsed.get("entity") and parsed.get("_disable_limit"))):
                 parsed["query_type"] = "comparison"
                 qt = "comparison"
         elif qt == "time_series" and _looks_like_all_time_trend(user_query):
@@ -1117,33 +1239,15 @@ def _post_process(
     # user phrasing + live schema column names.
     if parsed.get("query_type") in ("top_n", "bottom_n", "threshold", "growth_ranking", "zero_filter") and not parsed.get("entity"):
         entity_map, _ = _build_schema_keyword_maps()
-        hint_groups = [
-            (("product", "products", "item", "items"), ("product", "item")),
-            (("customer", "customers", "client", "clients", "user", "users"), ("customer", "client", "user")),
-            (("region", "regions", "state", "states"), ("region", "state")),
-            (("segment", "segments"), ("segment",)),
-            (("channel", "channels"), ("channel",)),
-            (("platform", "platforms", "channel", "channels"), ("platform", "channel")),
-            (("city", "cities", "town", "towns"), ("city",)),
-            (("course", "courses"), ("course",)),
-            (("student", "students", "learner", "learners"), ("student", "learner")),
-            (("category", "categories"), ("category",)),
-            (("coupon", "coupons", "promo", "promocode", "coupon code"), ("coupon", "promo")),
-            (("payment", "payment mode", "payment method"), ("payment",)),
-        ]
-        for terms, needles in hint_groups:
-            if not any(t in ql for t in terms):
-                continue
-            match_col = next(
-                (
-                    col for _, col in entity_map
-                    if any(n in col.lower() for n in needles)
-                ),
-                None,
-            )
-            if match_col:
-                parsed["entity"] = match_col
-                break
+        inferred_entity = _infer_entity_from_grouping_cue(user_query, entity_map)
+        if not inferred_entity:
+            inferred_entity = _infer_entity_from_query_terms(user_query, entity_map)
+        if inferred_entity:
+            parsed["entity"] = inferred_entity
+
+    if rank_within_time_bucket and parsed.get("entity") and parsed.get("query_type") in ("top_n", "bottom_n"):
+        parsed["_rank_within_time"] = True
+        parsed["time_bucket"] = rank_within_time_bucket
 
     # Refresh derived fields in case semantic resolution or previous guards updated intent.
     qt = parsed.get("query_type", qt)
@@ -1247,6 +1351,22 @@ def _call_qwen(user_query: str, schema: str) -> tuple[dict, dict]:
         return json.loads(obj), data.get("usage", {})
 
 
+def _call_qwen_with_retry(user_query: str, schema: str) -> tuple[dict, dict]:
+    attempts = max(1, int(PARSE_INTENT_MAX_RETRIES or 1))
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _call_qwen(user_query, schema)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                break
+            time.sleep(min(0.5 * attempt, 1.5))
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Qwen parse failed with unknown error")
+
+
 # ── Handler ───────────────────────────────────────────────────────────────────
 
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
@@ -1263,18 +1383,41 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     if merged_parsed:
         ctx.logger.info("Clarification path", {"queryId": query_id})
         parsed = _post_process(merged_parsed, user_query, mandatory_filters)
+        parsed["_parser_source"] = "clarification_merge"
     else:
         ctx.logger.info("Qwen intent extraction", {"queryId": query_id, "query": user_query})
         try:
-            schema = get_schema_prompt()
-            parsed, usage = _call_qwen(user_query, schema)
-            parsed = _post_process(parsed, user_query, mandatory_filters)
-            log_tokens(ctx, query_id, "ParseIntent", QWEN_MODEL, usage)
-            await add_tokens_to_state(ctx, query_id, "ParseIntent", QWEN_MODEL, usage)
-            ctx.logger.info("Intent parsed", {"queryId": query_id, "parsed": parsed})
+            rule_first = _should_use_rule_first(user_query)
+            if rule_first:
+                candidate = _post_process(_fallback_parse(user_query), user_query, mandatory_filters)
+                if candidate.get("is_complete") and candidate.get("metric"):
+                    parsed = candidate
+                    parsed["_parser_source"] = "rule_based_primary"
+                    log_tokens(ctx, query_id, "ParseIntentRule", "rule_based", {})
+                    await add_tokens_to_state(ctx, query_id, "ParseIntentRule", "rule_based", {})
+                    ctx.logger.info("Intent parsed via rule-first path", {"queryId": query_id, "parsed": parsed})
+                else:
+                    schema = get_schema_prompt()
+                    parsed, usage = _call_qwen_with_retry(user_query, schema)
+                    parsed = _post_process(parsed, user_query, mandatory_filters)
+                    parsed["_parser_source"] = "qwen_llm"
+                    log_tokens(ctx, query_id, "ParseIntent", QWEN_MODEL, usage)
+                    await add_tokens_to_state(ctx, query_id, "ParseIntent", QWEN_MODEL, usage)
+                    ctx.logger.info("Intent parsed via Qwen after rule-first fallback", {"queryId": query_id, "parsed": parsed})
+            else:
+                schema = get_schema_prompt()
+                parsed, usage = _call_qwen_with_retry(user_query, schema)
+                parsed = _post_process(parsed, user_query, mandatory_filters)
+                parsed["_parser_source"] = "qwen_llm"
+                log_tokens(ctx, query_id, "ParseIntent", QWEN_MODEL, usage)
+                await add_tokens_to_state(ctx, query_id, "ParseIntent", QWEN_MODEL, usage)
+                ctx.logger.info("Intent parsed", {"queryId": query_id, "parsed": parsed})
         except Exception as exc:
             ctx.logger.error("Intent parse failed", {"error": str(exc), "queryId": query_id})
             parsed = _post_process(_fallback_parse(user_query), user_query, mandatory_filters)
+            parsed["_parser_source"] = "rule_based_fallback"
+            log_tokens(ctx, query_id, "ParseIntentFallback", "rule_based", {})
+            await add_tokens_to_state(ctx, query_id, "ParseIntentFallback", "rule_based", {})
 
     qs = await ctx.state.get("queries", query_id)
     if qs:

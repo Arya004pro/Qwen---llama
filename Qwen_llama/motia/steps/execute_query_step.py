@@ -255,7 +255,8 @@ def _run_sql(sql: str, params: tuple) -> list:
     return _run_sql_raw(sql_duck, list(params))
 
 
-def _rows_to_dicts(rows: list) -> list[dict]:
+def _rows_to_dicts(rows: list, parsed: dict | None = None) -> list[dict]:
+    rank_within_time = bool((parsed or {}).get("_rank_within_time"))
     result = []
     for row in rows:
         if len(row) == 1:
@@ -264,9 +265,16 @@ def _rows_to_dicts(rows: list) -> list[dict]:
             result.append({"name":  str(row[0]),
                            "value": float(row[1]) if row[1] is not None else 0.0})
         elif len(row) == 3:
-            result.append({"name":   str(row[0]),
-                           "value1": float(row[1]) if row[1] is not None else 0.0,
-                           "value2": float(row[2]) if row[2] is not None else 0.0})
+            if rank_within_time:
+                result.append({
+                    "period": str(row[0]),
+                    "name": str(row[1]),
+                    "value": float(row[2]) if row[2] is not None else 0.0,
+                })
+            else:
+                result.append({"name":   str(row[0]),
+                               "value1": float(row[1]) if row[1] is not None else 0.0,
+                               "value2": float(row[2]) if row[2] is not None else 0.0})
         elif len(row) >= 4:
             result.append({"name":   str(row[0]),
                            "value1": float(row[1]) if row[1] is not None else 0.0,
@@ -409,7 +417,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
 
     try:
         rows    = _run_sql(generated_sql, params)
-        results = _rows_to_dicts(rows)
+        results = _rows_to_dicts(rows, parsed)
     except Exception as exc:
         err_str = str(exc)
         repaired_sql = _repair_add_missing_group_by(generated_sql, err_str)
@@ -421,7 +429,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             return
         try:
             rows    = _run_sql(repaired_sql, params)
-            results = _rows_to_dicts(rows)
+            results = _rows_to_dicts(rows, parsed)
             generated_sql = repaired_sql
             ctx.logger.warn("Repaired GROUP BY and retried", {"queryId": query_id})
         except Exception as exc2:

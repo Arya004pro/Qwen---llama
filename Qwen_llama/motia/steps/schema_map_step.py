@@ -1,4 +1,4 @@
-"""Step 4: Schema Map — LLaMA 3.1-8B schema mapping + token logging."""
+"""Step 4: Schema Map — schema mapping using configured LLaMA model + token logging."""
 
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,7 +30,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     time_range = parsed.get("time_range")
     ranking   = parsed.get("ranking")
 
-    ctx.logger.info("🗺️ Schema mapping with LLaMA 3.1-8B", {
+    ctx.logger.info("🗺️ Schema mapping with configured LLaMA model", {
         "queryId": query_id, "model": LLAMA_MODEL,
         "entity": entity, "metric": metric,
     })

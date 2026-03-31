@@ -8,7 +8,7 @@ Changes vs original:
   - All other formatting (comparison, ranked, aggregate, etc.) unchanged.
   - FIX: Header no longer says "Top N" when result is a full distribution/breakdown.
       Only says "Top N" when results == top_n (truncated). Otherwise says "breakdown".
-  - FIX: is_* boolean entity columns get human-readable labels (e.g. "Refund Status breakdown").
+    - FIX: is_* boolean entity columns get human-readable labels (e.g. "Status breakdown").
   - FIX: _post_process top_n inflated to 20 for vs-queries now handled gracefully.
 """
 
@@ -127,18 +127,10 @@ def _display_entity_name(raw_name: Any, entity: str) -> str:
     if name in one_vals:
         if base == "active":
             return "Active"
-        if base == "refunded":
-            return "Refunded"
-        if base == "cancelled":
-            return "Cancelled"
         return base.title()
     if name in zero_vals:
         if base == "active":
             return "Inactive"
-        if base == "refunded":
-            return "Not Refunded"
-        if base == "cancelled":
-            return "Not Cancelled"
         return f"Not {base}".title()
     return name
 
@@ -160,7 +152,7 @@ def _ranked_header(
 
     # Full distribution (all rows returned, no truncation)
     if disable_limit or result_count < top_n or result_count <= 5:
-        return f"📊 {elabel_title} breakdown by {mlabel} {period_str}:"
+        return f"{elabel_title} breakdown by {mlabel} {period_str}:"
 
     if qt == "bottom_n":
         return f"Bottom {top_n} {elabel_title} by {mlabel} {period_str}:"
@@ -371,6 +363,7 @@ def _bar(labels, values, metric, currency, entity, title, subtitle):
             "backgroundColor": [_PALETTE[i % len(_PALETTE)] for i in range(len(labels))],
             "borderColor":     [_BORDERS[i % len(_PALETTE)] for i in range(len(labels))],
             "borderWidth": 1, "borderRadius": 4,
+            "minBarLength": 6,
         }]},
         "options": base,
     }
@@ -488,6 +481,64 @@ def _insights_ranked(items: list[dict], currency: str) -> list[str]:
     return insights
 
 
+def _insights_ranked_by_period(items: list[dict], currency: str) -> list[str]:
+    if not items:
+        return []
+
+    by_period: dict[str, list[dict]] = {}
+    for row in items:
+        period = str(row.get("period", "")).strip() or "Unknown"
+        by_period.setdefault(period, []).append(row)
+
+    if not by_period:
+        return []
+
+    periods = list(by_period.keys())
+    all_values = [float(r.get("raw_value", 0) or 0) for r in items]
+    overall_avg = (sum(all_values) / len(all_values)) if all_values else 0.0
+
+    leaders = []
+    for p in periods:
+        rows = sorted(by_period[p], key=lambda r: float(r.get("raw_value", 0) or 0), reverse=True)
+        if rows:
+            leaders.append((p, str(rows[0].get("name", "?")), float(rows[0].get("raw_value", 0) or 0)))
+
+    unique_leaders = {n for _, n, _ in leaders}
+    insights = [
+        f"Covered {len(periods)} time buckets with top {max(len(v) for v in by_period.values())} entities per bucket.",
+        f"Distinct period leaders: {len(unique_leaders)}.",
+    ]
+    if leaders:
+        best = max(leaders, key=lambda x: x[2])
+        insights.append(
+            f"Strongest bucket leader: {best[1]} in {best[0]} at {_fmt_indian(best[2], currency)} (overall avg {_fmt_indian(overall_avg, currency)})."
+        )
+    return insights
+
+
+def _is_binary_status_split(entity: str, items: list[dict]) -> bool:
+    return bool((entity or "").lower().startswith("is_") and len(items) == 2)
+
+
+def _insights_binary_status_split(entity: str, items: list[dict]) -> list[str]:
+    raw = {str(i.get("name", "")).strip().lower(): float(i.get("raw_value", 0) or 0) for i in items}
+    total = sum(raw.values())
+    if total <= 0:
+        return []
+
+    entries = sorted(raw.items(), key=lambda kv: kv[1], reverse=True)
+    top_label, top_value = entries[0]
+    other_label, other_value = entries[1]
+    ratio_txt = "N/A"
+    if other_value > 0:
+        ratio_txt = f"{(top_value / other_value):.1f}:1"
+    return [
+        f"{top_label.title()} share: {(top_value / total) * 100:.1f}%.",
+        f"{other_label.title()} share: {(other_value / total) * 100:.1f}%.",
+        f"{top_label.title()} to {other_label.title()} ratio: {ratio_txt}.",
+    ]
+
+
 def _anomaly_insights(anomalies: dict[str, Any], currency: str) -> list[str]:
     if not isinstance(anomalies, dict):
         return []
@@ -579,6 +630,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
 
     has_delta  = results and "delta"  in results[0]
     has_value2 = results and "value2" in results[0] and not has_delta
+    is_rank_within_time = bool(parsed.get("_rank_within_time")) and bool(results) and "period" in results[0]
     is_scalar  = results and len(results) == 1 and "name" not in results[0]
     is_empty   = not results or (is_scalar and results[0].get("value") is None)
 
@@ -660,6 +712,60 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 user_query or f"{bucket_label} {mlabel} trend",
                 period_str,
                 bucket,
+            )
+
+    #  RANKED WITHIN TIME BUCKET 
+    elif is_rank_within_time:
+        period_str = _period_phrase if _period_phrase else f"between {start_date} and {end_date}"
+        direction = "Top" if qt != "bottom_n" else "Bottom"
+        header = f"{direction} {top_n} {elabel.title()} by {mlabel} for each {bucket} {period_str}:"
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        ordered_periods: list[str] = []
+        items = []
+        for row in results:
+            period = str(row.get("period", "?")).strip()
+            if period not in grouped:
+                grouped[period] = []
+                ordered_periods.append(period)
+            grouped[period].append(row)
+
+        lines = [header]
+        for period in ordered_periods:
+            lines.append("")
+            lines.append(f"{period}:")
+            ranked_rows = grouped[period]
+            for idx, row in enumerate(ranked_rows, 1):
+                name = _display_entity_name(row.get("name", "?"), entity)
+                value = row.get("value", 0) or 0
+                lines.append(f"{idx}. {name}  {_fmt_indian(value, p)}")
+                items.append({
+                    "period": period,
+                    "rank": idx,
+                    "name": name,
+                    "value": _fmt_indian(value, p),
+                    "raw_value": value,
+                })
+
+        insights = _insights_ranked_by_period(items, p)
+        if insights:
+            lines.append("")
+            lines.append("Insights:")
+            lines.extend([f"- {x}" for x in insights])
+
+        formatted_text = "\n".join(lines) + _token_summary(token_usage, token_totals)
+
+        labels = [f"{it['period']} | {it['name']}" for it in items]
+        values = [it.get("raw_value", 0) or 0 for it in items]
+        if labels and values:
+            chart_config = _bar(
+                labels,
+                values,
+                metric_display,
+                currency,
+                entity,
+                user_query or f"{direction} {elabel} by {mlabel} per {bucket}",
+                period_str,
             )
 
     #  AGGREGATE scalar 
@@ -786,7 +892,10 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 names.append(name)
                 values.append(value)
 
-        insights = _insights_ranked(items, p) if items else []
+        if items and _is_binary_status_split(entity, items):
+            insights = _insights_binary_status_split(entity, items)
+        else:
+            insights = _insights_ranked(items, p) if items else []
         insight_txt = ""
         if insights:
             insight_txt = "\n\nInsights:\n" + "\n".join(f"- {x}" for x in insights)

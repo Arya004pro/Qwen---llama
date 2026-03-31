@@ -16,6 +16,10 @@ _TABLE_REF_RE = re.compile(
     r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*|\"[^\"]+\")(?:\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_]*)?",
     re.IGNORECASE,
 )
+_EXTRACT_FN_RE = re.compile(
+    r"\bEXTRACT\s*\(\s*[A-Za-z_]+\s+FROM\s+[^\)]*\)",
+    re.IGNORECASE,
+)
 _CTE_NAME_RE = re.compile(
     r"(?:\bWITH\b|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(",
     re.IGNORECASE,
@@ -23,8 +27,11 @@ _CTE_NAME_RE = re.compile(
 
 
 def _extract_tables(sql: str) -> set[str]:
+    # Avoid false positives where EXTRACT(... FROM <column>) is parsed like
+    # a table reference by the generic FROM/JOIN regex.
+    search_sql = _EXTRACT_FN_RE.sub("EXTRACT_FN", sql or "")
     tables: set[str] = set()
-    for m in _TABLE_REF_RE.finditer(sql):
+    for m in _TABLE_REF_RE.finditer(search_sql):
         raw = m.group(1).strip()
         if raw.startswith('"') and raw.endswith('"'):
             raw = raw[1:-1]
