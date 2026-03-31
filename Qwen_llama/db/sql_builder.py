@@ -3,6 +3,10 @@
 Fully dynamic SQL builder.  Reads live schema from DuckDB and constructs
 parameterised SQL for any dataset — no hardcoded table/column names.
 
+Key fix: the builder now detects BIGINT epoch datetime columns and generates
+the correct epoch_ms()/to_timestamp() cast instead of CAST(col AS DATE),
+which would fail with "Unimplemented type for cast (BIGINT -> DATE)".
+
 Public API
 ----------
   build_sql(parsed_intent) -> str | None
@@ -14,12 +18,12 @@ from __future__ import annotations
 
 from db.duckdb_connection import get_read_connection
 
-
 # ── Schema introspection helpers ──────────────────────────────────────────────
 
 _TEXT_TYPES  = ("VARCHAR", "CHAR", "TEXT", "STRING")
 _NUM_TYPES   = ("INT", "BIGINT", "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC", "REAL")
 _DATE_HINTS  = ("date", "time", "created", "updated", "timestamp", "at")
+_BIGINT_TYPES = ("BIGINT", "INT8", "LONG", "HUGEINT", "INT64")
 
 
 def _is_text(dtype: str) -> bool:
@@ -36,6 +40,34 @@ def _is_date_type(col_name: str, dtype: str) -> bool:
     d = dtype.upper()
     return ("DATE" in d or "TIMESTAMP" in d
             or any(k in col_name.lower() for k in _DATE_HINTS))
+
+
+def _is_bigint_type(dtype: str) -> bool:
+    d = dtype.upper()
+    return any(t in d for t in _BIGINT_TYPES)
+
+
+def _detect_epoch_scale(conn, table: str, col: str) -> str:
+    """
+    Detect if a BIGINT column is millisecond or second epoch and return
+    the appropriate DuckDB conversion expression.
+
+    epoch_ms()       → milliseconds (e.g. 1_700_000_000_000 = Nov 2023)
+    to_timestamp()   → seconds      (e.g. 1_700_000_000    = Nov 2023)
+    """
+    try:
+        r = conn.execute(
+            f'SELECT MAX("{col}") FROM "{table}" WHERE "{col}" IS NOT NULL LIMIT 1'
+        ).fetchone()
+        if r and r[0] is not None:
+            mv = int(r[0])
+            if mv > 1_500_000_000_000:
+                return f'epoch_ms("{col}")'
+            elif mv > 1_000_000_000:
+                return f'to_timestamp("{col}")'
+    except Exception:
+        pass
+    return f'epoch_ms("{col}")'  # safe default
 
 
 def _load_schema() -> dict[str, list[tuple[str, str]]]:
@@ -63,7 +95,6 @@ def _find_date_col(cols: list[tuple[str, str]]) -> str | None:
     candidates = [c for c, d in cols if _is_date_type(c, d)]
     if not candidates:
         return None
-    # Prefer columns with 'date' in the name, then 'created', then first
     for pref in ("date", "created", "time"):
         for c in candidates:
             if pref in c.lower():
@@ -71,19 +102,46 @@ def _find_date_col(cols: list[tuple[str, str]]) -> str | None:
     return candidates[0]
 
 
+def _get_date_cast_expr(table: str, col: str, cols: list[tuple[str, str]]) -> str:
+    """
+    Return the correct SQL expression to cast a date column for comparison.
+
+    For native DATE/TIMESTAMP columns: CAST("col" AS DATE)
+    For BIGINT epoch columns:          CAST(epoch_ms("col") AS DATE)
+                                    or CAST(to_timestamp("col") AS DATE)
+
+    This is the key fix for "Unimplemented type for cast (BIGINT -> DATE)".
+    """
+    # Find the dtype for this column
+    col_dtype = next(
+        (d.upper() for c, d in cols if c.lower() == col.lower()),
+        ""
+    )
+
+    if any(t in col_dtype for t in _BIGINT_TYPES):
+        # BIGINT epoch — must use epoch conversion
+        conn = get_read_connection()
+        try:
+            epoch_expr = _detect_epoch_scale(conn, table, col)
+        finally:
+            conn.close()
+        return f'CAST({epoch_expr} AS DATE)'
+
+    # Native date/timestamp
+    return f'CAST("{col}" AS DATE)'
+
+
 def _find_metric_col(cols: list[tuple[str, str]], metric: str) -> str | None:
     """Find the best numeric column matching the requested metric."""
     col_names = {c.lower() for c, _ in cols}
 
-    # Exact match
     if metric.lower() in col_names:
         return metric.lower()
 
-    # Keyword-based search for revenue/sales/earnings → monetary columns
     _MONETARY_KEYWORDS = ("final", "total", "amount", "revenue", "sales",
                           "earning", "fare", "price", "cost", "payment", "profit")
     _QUANTITY_KEYWORDS = ("quantity", "qty", "units", "volume", "count")
-    
+
     numeric_cols = [c for c, d in cols if _is_numeric(d) and not c.lower().endswith("_id")]
 
     if metric.lower() in ("revenue", "sales", "earnings", "income", "money", "amount"):
@@ -97,12 +155,10 @@ def _find_metric_col(cols: list[tuple[str, str]], metric: str) -> str | None:
                 if kw in c.lower():
                     return c
 
-    # Fuzzy: metric keyword as substring in any numeric column
     for c in numeric_cols:
         if metric.lower().replace("_", "") in c.lower().replace("_", ""):
             return c
 
-    # Default: first monetary-like numeric column, else first numeric
     for c in numeric_cols:
         if any(k in c.lower() for k in _MONETARY_KEYWORDS):
             return c
@@ -133,7 +189,8 @@ def _pick_best_revenue_col(cols: list[tuple[str, str]]) -> str | None:
         return None
     ranked = sorted(
         numeric_cols,
-        key=lambda c: (_score_revenue_col(c), 1 if "final" in c.lower() else 0, 1 if "total" in c.lower() else 0, -len(c)),
+        key=lambda c: (_score_revenue_col(c), 1 if "final" in c.lower() else 0,
+                       1 if "total" in c.lower() else 0, -len(c)),
         reverse=True,
     )
     return ranked[0]
@@ -164,11 +221,9 @@ def _find_entity_col(cols: list[tuple[str, str]], entity: str) -> str | None:
     """Find the best text column matching the requested entity."""
     col_names = {c.lower() for c, _ in cols}
 
-    # Exact match
     if entity.lower() in col_names:
         return entity.lower()
 
-    # Try entity_name pattern
     name_col = f"{entity.lower()}_name"
     if name_col in col_names:
         return name_col
@@ -177,7 +232,6 @@ def _find_entity_col(cols: list[tuple[str, str]], entity: str) -> str | None:
                  and not c.lower().endswith("_id")
                  and not _is_date_type(c, d)]
 
-    # Fuzzy substring match
     for c in text_cols:
         if entity.lower().replace("_", "") in c.lower().replace("_", ""):
             return c
@@ -192,7 +246,7 @@ def _find_best_table(
     need_date: bool = True,
 ) -> tuple[str, str | None, str | None, str | None] | None:
     """
-    Find the single table (or closest match) that contains the needed columns.
+    Find the single table that contains the needed columns.
     Returns (table, entity_col_resolved, metric_col_resolved, date_col) or None.
     """
     best = None
@@ -202,19 +256,16 @@ def _find_best_table(
         col_names = {c.lower() for c, _ in cols}
         score = 0
 
-        # Entity presence
         e_found = None
         if entity_col:
             if entity_col.lower() in col_names:
                 e_found = entity_col.lower()
                 score += 5
             else:
-                # Try to find it in this table
                 e_found = _find_entity_col(cols, entity_col)
                 if e_found:
                     score += 3
 
-        # Metric presence
         m_found = None
         if metric_col:
             if metric_col.lower() in col_names:
@@ -225,13 +276,12 @@ def _find_best_table(
                 if m_found:
                     score += 3
 
-        # Date presence
         d_found = _find_date_col(cols)
         if d_found:
             score += 2
 
         if need_date and not d_found:
-            continue  # Skip tables without date columns
+            continue
 
         if score > best_score:
             best_score = score
@@ -272,6 +322,9 @@ def build_sql(parsed: dict) -> str | None:
 
     Returns a SQL string with ? placeholders, or None if the schema
     cannot satisfy the request (caller should fall through to LLM).
+
+    Key change: uses _get_date_cast_expr() which handles BIGINT epoch
+    columns with the correct epoch_ms()/to_timestamp() conversion.
     """
     entity_raw = parsed.get("entity")
     metric_raw = parsed.get("metric", "revenue")
@@ -281,7 +334,6 @@ def build_sql(parsed: dict) -> str | None:
     aov_revenue_raw = parsed.get("_aov_revenue_col")
     aov_count_key_raw = parsed.get("_count_distinct_key")
 
-    # Complex query types are better handled by LLM
     if qt in ("comparison", "growth_ranking", "intersection",
               "threshold", "time_series"):
         return None
@@ -294,12 +346,10 @@ def build_sql(parsed: dict) -> str | None:
     if not schema:
         return None
 
-    # Handle count metric
     is_count = metric_raw and metric_raw.lower() == "count"
     is_avg   = metric_raw and metric_raw.lower().startswith("avg_")
     is_aov   = metric_raw and metric_raw.lower() == "aov"
 
-    # Find columns across all tables
     metric_col = None
     if is_aov:
         if isinstance(aov_revenue_raw, str) and aov_revenue_raw.strip():
@@ -323,15 +373,12 @@ def build_sql(parsed: dict) -> str | None:
             if entity_col:
                 break
 
-    # If we need entity but can't find it, bail to LLM
     if entity_raw and qt in ("top_n", "bottom_n", "zero_filter") and not entity_col:
         return None
 
-    # If we need metric but can't find it (and it's not count), bail
     if not is_count and not metric_col:
         return None
 
-    # Find the best table containing these columns
     result = _find_best_table(schema, entity_col, metric_col, need_date=True)
     if not result:
         return None
@@ -341,20 +388,26 @@ def build_sql(parsed: dict) -> str | None:
     if not d_col:
         return None
 
-    table_cols = {c.lower() for c, _ in schema.get(table, [])}
+    # ── Epoch-aware date cast (THE KEY FIX) ──────────────────────────────────
+    # Determines the right SQL expression based on actual column type.
+    # For BIGINT epoch: CAST(epoch_ms("col") AS DATE)
+    # For native DATE:  CAST("col" AS DATE)
+    table_cols_list = schema.get(table, [])
+    date_cast = _get_date_cast_expr(table, d_col, table_cols_list)
+
+    table_cols = {c.lower() for c, _ in table_cols_list}
     filter_clause = _build_filter_clause(filters, table_cols)
 
     # Build aggregation expression
     if is_aov:
-        table_cols_for_aov = schema.get(table, [])
-        revenue_col = m_col if m_col else _pick_best_revenue_col(table_cols_for_aov)
+        revenue_col = m_col if m_col else _pick_best_revenue_col(table_cols_list)
         count_key = None
         if isinstance(aov_count_key_raw, str) and aov_count_key_raw.strip():
             raw = aov_count_key_raw.strip().lower()
-            if raw in {c.lower() for c, _ in table_cols_for_aov}:
+            if raw in table_cols:
                 count_key = raw
         if not count_key:
-            count_key = _pick_best_count_key(table_cols_for_aov)
+            count_key = _pick_best_count_key(table_cols_list)
         if not revenue_col or not count_key:
             return None
         agg_expr = (
@@ -362,17 +415,15 @@ def build_sql(parsed: dict) -> str | None:
             f'NULLIF(COUNT(DISTINCT "{count_key}"), 0)'
         )
     elif is_count:
-        # Find best ID column for COUNT(DISTINCT ...)
-        table_cols = schema.get(table, [])
-        id_col = _pick_best_count_key(table_cols)
+        id_col = _pick_best_count_key(table_cols_list)
         agg_expr = f'COUNT(DISTINCT "{id_col}")' if id_col else "COUNT(*)"
     elif is_avg:
         agg_expr = f'AVG("{m_col}")'
     else:
         agg_expr = f'SUM("{m_col}")'
 
-    # Build date filter
-    date_filter = f'CAST("{d_col}" AS DATE) >= ? AND CAST("{d_col}" AS DATE) < ?{filter_clause}'
+    # Build date filter using the epoch-aware cast expression
+    date_filter = f'{date_cast} >= ? AND {date_cast} < ?{filter_clause}'
 
     ascending = qt == "bottom_n"
     direction = "ASC" if ascending else "DESC"

@@ -1,17 +1,17 @@
 ﻿"""Step 5: Execute Query — runs SQL against DuckDB.
 
-Changes vs original:
-  - _DATETIME_COL_HINTS: removed domain-specific names "order_date",
-    "order_datetime", "ride_date" — these are already matched by the
-    generic "date" substring, so they were redundant and misleading when
-    working with other dataset schemas.
-  - All execution, rewrite, and repair logic unchanged.
+Key fix: auto-detects BIGINT epoch timestamp columns (e.g. order_datetime stored as
+Unix ms/s) and rewrites SQL patterns like CAST(col AS DATE) or EXTRACT(X FROM col)
+to use the correct DuckDB epoch conversion (epoch_ms / to_timestamp).
+This makes the system fully generalised — any dataset with BIGINT datetime columns
+works without manual schema configuration.
 """
 
 import os
 import sys
 import calendar
 import re
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -30,9 +30,9 @@ config = {
     "name": "ExecuteQuery",
     "description": (
         "Executes LLM-generated SQL against DuckDB. "
+        "Auto-detects BIGINT epoch timestamp columns and rewrites SQL accordingly. "
         "Uses exclusive end-date (>= start AND < end+1day). "
-        "Auto-repairs missing GROUP BY for time-series queries. "
-        "Auto-adds ID column to GROUP BY when only a *_name column is present."
+        "Auto-repairs missing GROUP BY for time-series queries."
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::execute")],
@@ -40,24 +40,20 @@ config = {
 }
 
 # ── Datetime column hints ──────────────────────────────────────────────────────
-# Generic substrings only — no domain-specific column names.
-# Any column whose name contains one of these tokens is treated as a
-# datetime column and gets the BETWEEN → ">= AND <" rewrite applied.
 _DATETIME_COL_HINTS = {
-    "date",       # matches order_date, ride_date, created_date, etc.
-    "time",       # matches datetime, timestamp, order_time, etc.
-    "timestamp",
-    "created",
-    "updated",
-    "at",         # matches created_at, updated_at, etc.
-    "on",         # matches ordered_on, etc.
-    "when",
+    "date", "time", "timestamp", "created", "updated", "at", "on", "when",
 }
 
-# ── SQL rewrite patterns ──────────────────────────────────────────────────────
+# BIGINT-like types that might store epoch timestamps
+_BIGINT_TYPES = ("BIGINT", "INT8", "LONG", "HUGEINT", "INT64")
 
+# ── SQL rewrite patterns ──────────────────────────────────────────────────────
 _EXTRACT_YEAR_PAT = re.compile(
     r"EXTRACT\s*\(\s*YEAR\s+FROM\s+(\w+)\s*\)\s*=\s*\?", re.IGNORECASE)
+_EXTRACT_YEAR_IN_PARAMS_PAT = re.compile(
+    r"EXTRACT\s*\(\s*YEAR\s+FROM[^\)]*\)\s+IN\s*\(\s*\?\s*,\s*\?\s*\)",
+    re.IGNORECASE,
+)
 _EXTRACT_MONTH_PAT = re.compile(
     r"\s*AND\s+EXTRACT\s*\(\s*MONTH\s+FROM\s+\w+\s*\)\s+BETWEEN\s+\d+\s+AND\s+\d+",
     re.IGNORECASE)
@@ -70,6 +66,158 @@ _NAME_EXPR_RE = re.compile(r"(?is)\bSELECT\s+(?P<expr>.*?)\s+AS\s+name\b")
 _MISSING_GB_COL_RE = re.compile(
     r'column\s+"([^"]+)"\s+must appear in the GROUP BY', re.IGNORECASE)
 _HAS_GROUP_BY_RE = re.compile(r"\bGROUP\s+BY\b", re.IGNORECASE)
+
+_BIGINT_MAP_CACHE_TTL_SECONDS = 120.0
+_bigint_map_cache_value: dict[str, str] | None = None
+_bigint_map_cache_at: float = 0.0
+
+
+# ── BIGINT epoch detection (NEW) ───────────────────────────────────────────────
+
+def _build_bigint_datetime_map() -> dict[str, str]:
+    """
+    Scan live DuckDB schema for BIGINT columns that look like epoch timestamps.
+
+    Returns {column_name_lower: epoch_cast_expr} for every such column found,
+    e.g. {'order_datetime': 'epoch_ms("order_datetime")'}.
+
+    This is fully schema-agnostic — it works for any dataset, not just Uber/Zomato.
+    """
+    global _bigint_map_cache_value, _bigint_map_cache_at
+    now = time.monotonic()
+    if _bigint_map_cache_value is not None and (now - _bigint_map_cache_at) < _BIGINT_MAP_CACHE_TTL_SECONDS:
+        return dict(_bigint_map_cache_value)
+
+    result: dict[str, str] = {}
+    try:
+        conn = get_read_connection()
+        tables = [r[0] for r in conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
+        ).fetchall()]
+
+        for table in tables:
+            cols = [(c[0], c[1].upper()) for c in conn.execute(f'DESCRIBE "{table}"').fetchall()]
+            for col, dtype in cols:
+                col_l = col.lower()
+                # Only columns whose name contains a date-like keyword
+                if not any(k in col_l for k in _DATETIME_COL_HINTS):
+                    continue
+                # Only integer-typed columns (DATE/TIMESTAMP handled natively by DuckDB)
+                if not any(t in dtype for t in _BIGINT_TYPES):
+                    continue
+                # Skip if already in result (first table wins)
+                if col_l in result:
+                    continue
+
+                # Determine epoch scale by sampling max value
+                cast_expr = _detect_epoch_scale(conn, table, col)
+                if cast_expr:
+                    result[col_l] = cast_expr
+
+        conn.close()
+    except Exception:
+        pass
+
+    _bigint_map_cache_value = dict(result)
+    _bigint_map_cache_at = now
+    return result
+
+
+def _detect_epoch_scale(conn, table: str, col: str) -> str | None:
+    """
+    Sample the column to determine if values are millisecond or second epoch.
+    Returns the appropriate DuckDB conversion expression, or None if undetermined.
+
+    Thresholds:
+      > 1_500_000_000_000 → milliseconds (epoch_ms)   e.g. 1_700_000_000_000 = Nov 2023 ms
+      > 1_000_000_000     → seconds      (to_timestamp) e.g. 1_700_000_000   = Nov 2023 s
+    """
+    try:
+        r = conn.execute(
+            f'SELECT MAX("{col}") FROM "{table}" WHERE "{col}" IS NOT NULL LIMIT 1'
+        ).fetchone()
+        if r and r[0] is not None:
+            mv = int(r[0])
+            if mv > 1_500_000_000_000:
+                return f'epoch_ms("{col}")'
+            elif mv > 1_000_000_000:
+                return f'to_timestamp("{col}")'
+    except Exception:
+        pass
+    # Default: assume ms for unknown BIGINT date columns
+    return f'epoch_ms("{col}")'
+
+
+def _rewrite_bigint_epoch_cols(sql: str, bigint_map: dict[str, str]) -> tuple[str, bool]:
+    """
+    Rewrite SQL so BIGINT epoch datetime columns use proper DuckDB epoch functions.
+
+    Handles these SQL patterns (case-insensitive, with or without quotes on col):
+      1. CAST(col AS DATE)          → CAST(epoch_ms(col) AS DATE)
+      2. CAST("col" AS DATE)        → CAST(epoch_ms(col) AS DATE)
+      3. EXTRACT(X FROM col)        → EXTRACT(X FROM epoch_ms(col))
+      4. STRFTIME(col, '...')       → STRFTIME(epoch_ms(col), '...')
+      5. DATE_TRUNC('x', col)       → DATE_TRUNC('x', epoch_ms(col))
+      6. col >= ?  (bare comparison) → CAST(epoch_ms(col) AS DATE) >= ?
+
+    This is a generalised fix — works for any BIGINT epoch column in any dataset.
+    """
+    if not bigint_map or not sql:
+        return sql, False
+
+    changed = False
+
+    for col_l, epoch_expr in bigint_map.items():
+        # Build a regex that matches col with or without double-quotes
+        col_re = re.escape(col_l)
+        col_pattern = rf'(?:"(?:{col_re})"|\b(?:{col_re})\b)'
+
+        # 1. CAST(col AS DATE) — the most common failure case
+        pat = re.compile(rf'CAST\s*\(\s*{col_pattern}\s+AS\s+DATE\s*\)', re.IGNORECASE)
+        if pat.search(sql):
+            sql = pat.sub(f'CAST({epoch_expr} AS DATE)', sql)
+            changed = True
+
+        # 2. EXTRACT(X FROM col) — used in year/month grouping
+        pat = re.compile(rf'EXTRACT\s*\(\s*(\w+)\s+FROM\s+{col_pattern}\s*\)', re.IGNORECASE)
+        if pat.search(sql):
+            # epoch_ms() returns TIMESTAMP, EXTRACT works directly on TIMESTAMP
+            sql = pat.sub(lambda m, ep=epoch_expr: f'EXTRACT({m.group(1)} FROM {ep})', sql)
+            changed = True
+
+        # 3. STRFTIME(col, '...') — used in time bucket expressions
+        pat = re.compile(rf'STRFTIME\s*\(\s*{col_pattern}\s*,', re.IGNORECASE)
+        if pat.search(sql):
+            sql = pat.sub(f'STRFTIME({epoch_expr},', sql)
+            changed = True
+
+        # 4. DATE_TRUNC('bucket', col)
+        pat = re.compile(
+            rf"DATE_TRUNC\s*\(\s*('[^']+')\s*,\s*{col_pattern}\s*\)", re.IGNORECASE
+        )
+        if pat.search(sql):
+            sql = pat.sub(lambda m, ep=epoch_expr: f'DATE_TRUNC({m.group(1)}, {ep})', sql)
+            changed = True
+
+        # 5. YEAR(col) / MONTH(col) / DAY(col) scalar functions
+        for fn in ("YEAR", "MONTH", "DAY", "QUARTER", "WEEK"):
+            pat = re.compile(rf'\b{fn}\s*\(\s*{col_pattern}\s*\)', re.IGNORECASE)
+            if pat.search(sql):
+                sql = pat.sub(f'{fn}({epoch_expr})', sql)
+                changed = True
+
+        # 6. Bare column comparison: col >= ? or col < ? (without any cast)
+        # Only apply if no epoch conversion is already present for this column.
+        if epoch_expr not in sql:
+            pat = re.compile(rf'{col_pattern}\s*(>=|<=|>|<|=)\s*\?', re.IGNORECASE)
+            if pat.search(sql):
+                sql = pat.sub(
+                    lambda m, ep=epoch_expr: f'CAST({ep} AS DATE) {m.group(1).strip()} ?',
+                    sql
+                )
+                changed = True
+
+    return sql, changed
 
 
 # ── Schema helpers ─────────────────────────────────────────────────────────────
@@ -233,7 +381,7 @@ def _repair_add_missing_group_by(sql: str, error_text: str) -> str | None:
     expr_upper = name_expr.upper()
     is_time_bucket = any(kw in expr_upper for kw in [
         "EXTRACT(", "STRFTIME(", "DATE_TRUNC(", "YEAR(", "MONTH(",
-        "QUARTER(", "WEEK(", "DAY(",
+        "QUARTER(", "WEEK(", "DAY(", "EPOCH_MS(", "TO_TIMESTAMP(",
     ])
     if not is_time_bucket:
         return None
@@ -305,6 +453,18 @@ def _build_params(sql: str, parsed: dict) -> tuple:
     if qt in ("comparison", "growth_ranking", "intersection") and len(trs) >= 2:
         s1 = _d(trs[0]["start"]);  e1 = _end(trs[0]["end"])
         s2 = _d(trs[1]["start"]);  e2 = _end(trs[1]["end"])
+        if n == 4 and _EXTRACT_YEAR_IN_PARAMS_PAT.search(sql):
+            y1 = _d(trs[0]["start"]).year
+            y2 = _d(trs[1]["start"]).year
+            s_min = min(s1, s2)
+            e_max = max(e1, e2)
+            return (s_min, e_max, y1, y2)
+        if n == 5 and _EXTRACT_YEAR_IN_PARAMS_PAT.search(sql):
+            y1 = _d(trs[0]["start"]).year
+            y2 = _d(trs[1]["start"]).year
+            s_min = min(s1, s2)
+            e_max = max(e1, e2)
+            return (s_min, e_max, y1, y2, top_n)
         if n == 4:  return (s1, e1, s2, e2)
         if n == 5:  return (s1, e1, s2, e2, top_n)
         base = [s1, e1, s2, e2]
@@ -393,7 +553,21 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     if between_rewritten:
         ctx.logger.info("Rewrote BETWEEN->range for datetime col", {"queryId": query_id})
 
-    # ── Rewrite 3: Add missing GROUP BY for time-bucket SELECT expressions ────
+    # ── Rewrite 3: BIGINT epoch timestamp columns (NEW — generalised fix) ─────
+    # Detects any BIGINT column whose name looks like a date (e.g. order_datetime,
+    # created_at stored as ms/s integer) and rewrites CAST(col AS DATE) →
+    # CAST(epoch_ms(col) AS DATE), EXTRACT(X FROM col) → EXTRACT(X FROM epoch_ms(col)),
+    # etc.  Fully schema-agnostic — works for any dataset.
+    bigint_map = _build_bigint_datetime_map()
+    if bigint_map:
+        generated_sql, epoch_rewritten = _rewrite_bigint_epoch_cols(generated_sql, bigint_map)
+        if epoch_rewritten:
+            ctx.logger.info(
+                "Rewrote BIGINT epoch datetime columns",
+                {"queryId": query_id, "cols": list(bigint_map.keys())},
+            )
+
+    # ── Rewrite 4: Add missing GROUP BY for time-bucket SELECT expressions ────
     if qt == "time_series" and not _HAS_GROUP_BY_RE.search(generated_sql):
         repaired = _repair_add_missing_group_by(generated_sql, "")
         if repaired:
@@ -441,7 +615,8 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         "top_n", "bottom_n", "threshold", "intersection",
         "zero_filter", "growth_ranking", "comparison",
     }
-    if qt in ranked_types and results and "name" not in results[0]:
+    is_top_percent_share = bool(parsed.get("_top_percent_share"))
+    if qt in ranked_types and results and "name" not in results[0] and not is_top_percent_share:
         qs = await ctx.state.get("queries", query_id)
         await _error(ctx, qs, query_id,
                      f"SQL returned scalar instead of rows for query_type={qt}.")

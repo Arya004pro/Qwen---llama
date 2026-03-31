@@ -751,13 +751,36 @@ def render_steps(completed_idx, is_error, step_times):
 def render_tokens(usage, totals):
     if not usage:
         return
-    rows = [{"Step": e.get("step", "?"),
-             "Model": (e.get("model") or "").split("/")[-1].replace("-instant", ""),
-             "Prompt": e.get("prompt_tokens", 0),
-             "Completion": e.get("completion_tokens", 0),
-             "Total": e.get("total_tokens", 0)} for e in usage]
+    def _is_llm_entry(e: dict) -> bool:
+        if "is_llm" in e:
+            return bool(e.get("is_llm"))
+        model = (e.get("model") or "").strip()
+        return model not in ("rule_based", "adaptive_rule")
+
+    llm_rows = 0
+    rows = []
+    for e in usage:
+        is_llm = _is_llm_entry(e)
+        if is_llm:
+            llm_rows += 1
+            prompt = e.get("prompt_tokens", 0)
+            completion = e.get("completion_tokens", 0)
+            total = e.get("total_tokens", 0)
+        else:
+            prompt = 0
+            completion = 0
+            total = 0
+        rows.append({
+            "Step": e.get("step", "?"),
+            "Model": (e.get("model") or "").split("/")[-1].replace("-instant", ""),
+            "Prompt": prompt,
+            "Completion": completion,
+            "Total": total,
+        })
     st.dataframe(rows, width="stretch", hide_index=True)
-    if totals and totals.get("total_tokens"):
+    if llm_rows == 0:
+        st.caption("LLM not used for this query (rule-based and deterministic steps).")
+    elif totals and totals.get("total_tokens"):
         c1, c2, c3 = st.columns(3)
         c1.metric("Prompt tokens",     totals.get("prompt_tokens", 0))
         c2.metric("Completion tokens", totals.get("completion_tokens", 0))

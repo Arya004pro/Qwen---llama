@@ -38,10 +38,4 @@ try:
 except ValueError:
     PARSE_INTENT_MAX_RETRIES = 2
 
-AI_INSIGHTS_MODE = (os.getenv("AI_INSIGHTS_MODE", "adaptive") or "adaptive").strip().lower()
-try:
-    AI_INSIGHTS_ROW_THRESHOLD = max(1, int(os.getenv("AI_INSIGHTS_ROW_THRESHOLD", "8")))
-except ValueError:
-    AI_INSIGHTS_ROW_THRESHOLD = 8
-
 DUCKDB_PATH = os.getenv("DUCKDB_PATH", "motia/data/analytics.duckdb")

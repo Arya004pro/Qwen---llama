@@ -42,11 +42,6 @@ from db.schema_context import get_schema_prompt
 from db.sql_builder import build_sql
 from db.duckdb_connection import explain_query, get_read_connection
 
-try:
-    from db.sql_registry import SQL_REGISTRY
-except ImportError:
-    SQL_REGISTRY = {}
-
 logger = logging.getLogger(__name__)
 
 config = {
@@ -271,6 +266,43 @@ def _pick_best_count_key(columns: list[str]) -> str | None:
     return ranked[0]
 
 
+def _is_repeat_entity_count_intent(parsed: dict, user_query: str) -> bool:
+    if parsed.get("_repeat_entity_count"):
+        return True
+    q = f" {(user_query or '').lower()} "
+    has_repeat = any(x in q for x in (" repeat ", " repeated ", " returning ", " return "))
+    has_actor = any(
+        x in q for x in (
+            "buyer", "customer", "user", "client", "account", "member",
+            "driver", "vendor", "merchant", "seller", "partner", "employee",
+            "agent", "store", "warehouse", "branch",
+        )
+    )
+    return has_repeat and has_actor
+
+
+def _top_percent_share_value(parsed: dict, user_query: str) -> float | None:
+    raw = parsed.get("_top_percent_share")
+    if raw is not None:
+        try:
+            pct = float(raw)
+            if 0 < pct < 100:
+                return pct
+        except Exception:
+            pass
+    q = (user_query or "").lower()
+    m = re.search(r"\btop\s+(\d+(?:\.\d+)?)\s*(?:%|percent\b)", q)
+    if not m:
+        return None
+    if not any(x in q for x in ("contribution", "contribute", "share", "percent of", "percentage of")):
+        return None
+    try:
+        pct = float(m.group(1))
+    except Exception:
+        return None
+    return pct if 0 < pct < 100 else None
+
+
 def _check_filters_present(sql: str, filters: dict, ctx, query_id: str) -> None:
     for col in filters:
         if col.lower() not in sql.lower():
@@ -359,6 +391,8 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
     top_n      = parsed.get("top_n", 5)
     disable_limit = bool(parsed.get("_disable_limit"))
     rank_within_time = bool(parsed.get("_rank_within_time"))
+    repeat_entity_count = bool(parsed.get("_repeat_entity_count"))
+    top_percent_share = _top_percent_share_value(parsed, user_query)
     thr        = parsed.get("threshold") or {}
     filters    = parsed.get("filters", {}) or {}
     trs        = parsed.get("time_ranges", [])
@@ -430,6 +464,29 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
     else:
         rank_instr = f"ORDER BY value DESC LIMIT {top_n}"
 
+    repeat_instr = ""
+    if repeat_entity_count:
+        repeat_instr = (
+            "\n12. REPEAT-ENTITY COUNT (CRITICAL):\n"
+            "    This asks for number of repeat/returning entities.\n"
+            "    Return one scalar row: SELECT COUNT(*) AS value FROM (...) repeats.\n"
+            "    Inside repeats CTE:\n"
+            "      - GROUP BY entity key (customer/user/driver/store etc.)\n"
+            "      - HAVING COUNT(DISTINCT event_id) >= 2 (or COUNT(*) >= 2 if no event id exists)\n"
+            "      - apply date filter and mandatory business filters before grouping.\n"
+        )
+
+    top_percent_instr = ""
+    if top_percent_share is not None:
+        top_percent_instr = (
+            "\n13. TOP-PERCENT SHARE (CRITICAL):\n"
+            f"    User asks contribution/share of top {top_percent_share:g}% entities.\n"
+            "    Do NOT use LIMIT 10 for 'top 10%'.\n"
+            "    Build grouped entity totals, rank descending, compute cutoff = ceil(total_entities * pct/100).\n"
+            "    Return a scalar percentage as alias `value`:\n"
+            "      (sum(top-slice metric) / sum(all metric)) * 100.\n"
+        )
+
     date_hints = ""
     if trs:
         for i, tr in enumerate(trs[:2]):
@@ -491,6 +548,8 @@ STRICT RULES:
 9. Ranking: {rank_instr}
 {groupby_rule}
 {filter_rule}
+{repeat_instr}
+{top_percent_instr}
 
 SCHEMA-AGNOSTIC PATTERN EXAMPLES (use exact schema columns; placeholders only):
 - Aggregate:
@@ -603,20 +662,6 @@ def _try_repair_sql(
         return repaired_sql, usage_fix
     except Exception:
         return None, {}
-
-
-def _registry_fallback(parsed: dict) -> str | None:
-    """Fast-path fallback using hardcoded SQL registry (e-commerce schema only)."""
-    qt = parsed.get("query_type", "top_n")
-    if qt not in ("top_n", "bottom_n", "aggregate"):
-        return None
-    entity = parsed.get("entity")
-    metric = parsed.get("metric")
-    key    = "top" if qt == "top_n" else "bottom" if qt == "bottom_n" else "aggregate"
-    try:
-        return SQL_REGISTRY[entity][metric][key]
-    except (KeyError, TypeError):
-        return None
 
 
 def _deterministic_time_series_fallback(parsed: dict) -> str | None:
@@ -748,6 +793,310 @@ def _deterministic_time_series_fallback(parsed: dict) -> str | None:
         f'{where_extra}\n'
         f'GROUP BY {b_expr}\n'
         f'ORDER BY name ASC'
+    )
+
+
+def _deterministic_repeat_entity_count_fallback(parsed: dict, user_query: str) -> str | None:
+    """Count repeat entities (>=2 distinct events) in the selected period."""
+    filters = parsed.get("filters", {}) or {}
+    entity_hint = (parsed.get("entity") or "").lower().strip()
+    count_key_hint = (parsed.get("_count_distinct_key") or "").lower().strip()
+
+    def _is_entity_col(col: str, dtype: str, query_l: str) -> bool:
+        c = col.lower()
+        d = dtype.upper()
+        if any(k in c for k in ("date", "time", "created", "updated", "timestamp")):
+            return False
+        if any(k in c for k in ("order", "booking", "transaction", "invoice", "payment", "trip", "ride", "ticket", "request", "session", "visit", "row", "line", "item", "detail", "record", "event", "log")):
+            return False
+        if "CHAR" in d or "TEXT" in d or "STRING" in d or "VARCHAR" in d:
+            return (
+                c.endswith("_name")
+                or any(k in c for k in ("email", "phone", "mobile", "user", "customer", "buyer", "client", "driver", "vendor", "merchant", "seller", "store", "warehouse", "branch"))
+                or (entity_hint and entity_hint in c)
+            )
+        if c == "id" or c.endswith("_id") or c.endswith("_uuid") or c.endswith("_key") or c.endswith("_code"):
+            if any(k in c for k in ("user", "customer", "buyer", "client", "driver", "vendor", "merchant", "seller", "store", "warehouse", "branch", "account", "member", "employee", "agent", "partner")):
+                return True
+            if any(k in query_l for k in ("buyer", "customer", "user", "client", "driver", "vendor", "store", "warehouse")):
+                return True
+        return False
+
+    def _pick_entity_key(cols: list[tuple[str, str]], query_l: str) -> str | None:
+        col_names = [c[0].lower() for c in cols]
+        if entity_hint and entity_hint in col_names:
+            return entity_hint
+        if entity_hint.endswith("_name") and entity_hint[:-5] in col_names:
+            return entity_hint[:-5]
+
+        best: tuple[int, str] | None = None
+        for col, dtype in cols:
+            if not _is_entity_col(col, dtype, query_l):
+                continue
+            c = col.lower()
+            score = 0
+            if c.endswith("_id") or c == "id":
+                score += 4
+            if c.endswith("_name"):
+                score += 6
+            if any(k in c for k in ("user", "customer", "buyer", "client", "driver", "vendor", "merchant", "seller", "store", "warehouse", "branch", "account", "member", "employee", "agent", "partner")):
+                score += 8
+            if any(k in query_l for k in c.replace("_", " ").split()):
+                score += 3
+            if best is None or score > best[0]:
+                best = (score, c)
+        return best[1] if best else None
+
+    try:
+        conn = get_read_connection()
+        table_rows = conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='main' AND table_type='BASE TABLE' ORDER BY table_name"
+        ).fetchall()
+        tables = [r[0] for r in table_rows]
+    except Exception:
+        return None
+
+    query_l = (user_query or "").lower()
+    try:
+        best = None
+        for t in tables:
+            try:
+                cols = [(c[0], str(c[1]).upper()) for c in conn.execute(f'DESCRIBE "{t}"').fetchall()]
+            except Exception:
+                continue
+            col_names = [c[0].lower() for c in cols]
+            date_cols = [
+                c for c, typ in cols
+                if (
+                    "DATE" in typ
+                    or "TIMESTAMP" in typ
+                    or any(k in c.lower() for k in ("date", "time", "created", "updated", "at"))
+                )
+            ]
+            if not date_cols:
+                continue
+            date_col = next((c for c in date_cols if "date" in c.lower()), date_cols[0])
+
+            entity_key = _pick_entity_key(cols, query_l)
+            if not entity_key:
+                continue
+
+            event_key = count_key_hint if count_key_hint in col_names else _pick_best_count_key(col_names)
+            if event_key and event_key.lower() == entity_key.lower():
+                event_key = None
+
+            score = 0
+            if entity_hint and entity_hint in col_names:
+                score += 5
+            if event_key:
+                score += 4
+            if all((k in col_names) for k in filters.keys()):
+                score += 2
+            if "date" in date_col.lower() or "time" in date_col.lower():
+                score += 2
+
+            if best is None or score > best[0]:
+                best = (score, t, date_col, entity_key, event_key, set(col_names))
+
+        if not best:
+            return None
+
+        _, table, date_col, entity_key, event_key, table_cols = best
+        filter_clause = _render_filter_clause({k: v for k, v in filters.items() if k in table_cols})
+        where_extra = f"\n{filter_clause}" if filter_clause else ""
+        having_expr = (
+            f'COUNT(DISTINCT "{event_key}") >= 2'
+            if event_key
+            else "COUNT(*) >= 2"
+        )
+
+        return (
+            "WITH repeats AS (\n"
+            f'  SELECT "{entity_key}" AS entity_key\n'
+            f'  FROM "{table}"\n'
+            f'  WHERE CAST("{date_col}" AS DATE) >= ? AND CAST("{date_col}" AS DATE) < ?{where_extra}\n'
+            f'  GROUP BY "{entity_key}"\n'
+            f"  HAVING {having_expr}\n"
+            ")\n"
+            "SELECT COUNT(*) AS value\n"
+            "FROM repeats"
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _deterministic_top_percent_share_fallback(parsed: dict, user_query: str) -> str | None:
+    pct = _top_percent_share_value(parsed, user_query)
+    if pct is None:
+        return None
+
+    metric = (parsed.get("metric") or "count").lower()
+    entity = (parsed.get("entity") or "").lower().strip()
+    filters = parsed.get("filters", {}) or {}
+    count_key = parsed.get("_count_distinct_key")
+    aov_revenue_col = (parsed.get("_aov_revenue_col") or "").lower().strip()
+    entity_key_hint = (parsed.get("_entity_group_key") or "").lower().strip()
+
+    if not entity:
+        return None
+
+    try:
+        conn = get_read_connection()
+        table_rows = conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='main' AND table_type='BASE TABLE' ORDER BY table_name"
+        ).fetchall()
+        tables = [r[0] for r in table_rows]
+    except Exception:
+        return None
+
+    def _pick_plan() -> tuple[str, str, str, str | None, str] | None:
+        best = None
+        for t in tables:
+            try:
+                cols = [(c[0], str(c[1]).upper()) for c in conn.execute(f'DESCRIBE "{t}"').fetchall()]
+            except Exception:
+                continue
+
+            col_names = [c[0].lower() for c in cols]
+            date_cols = [
+                c for c, typ in cols
+                if (
+                    "DATE" in typ
+                    or "TIMESTAMP" in typ
+                    or any(k in c.lower() for k in ("date", "time", "created", "updated", "at"))
+                )
+            ]
+            if not date_cols:
+                continue
+            date_col = next((c for c in date_cols if "date" in c.lower()), date_cols[0])
+
+            entity_col = None
+            if entity in col_names:
+                entity_col = entity
+            elif entity.endswith("_name") and entity[:-5] in col_names:
+                entity_col = entity[:-5]
+            else:
+                tokens = [tok for tok in entity.replace("_", " ").split() if tok]
+                text_cols = [c for c, typ in cols if any(tk in typ for tk in ("VARCHAR", "CHAR", "TEXT", "STRING"))]
+                for c in text_cols:
+                    low = c.lower()
+                    if any(tok in low for tok in tokens):
+                        entity_col = c
+                        break
+
+            if not entity_col:
+                continue
+
+            group_key = entity_key_hint if entity_key_hint in col_names else None
+            if not group_key:
+                base = entity_col[:-5] if entity_col.endswith("_name") else entity_col
+                for cand in (f"{base}_id", f"{base}_code", f"{base}_key", "id"):
+                    if cand in col_names and cand != entity_col:
+                        group_key = cand
+                        break
+
+            agg_expr = None
+            if metric == "aov":
+                ck = count_key if count_key and count_key in col_names else _pick_best_count_key(col_names)
+                revenue_col = aov_revenue_col if aov_revenue_col in col_names else None
+                if not revenue_col:
+                    revenue_candidates = [
+                        c for c in col_names
+                        if any(k in c for k in ("final", "total", "amount", "price", "revenue", "sales", "earning", "fare", "net", "paid"))
+                    ]
+                    revenue_col = _pick_best_revenue_column(revenue_candidates)
+                if ck and revenue_col:
+                    agg_expr = f'SUM("{revenue_col}") / NULLIF(COUNT(DISTINCT "{ck}"), 0)'
+            elif metric == "count":
+                ck = count_key if count_key and count_key in col_names else _pick_best_count_key(col_names)
+                agg_expr = f'COUNT(DISTINCT "{ck}")' if ck else "COUNT(*)"
+            elif metric.startswith("avg_"):
+                mcol = metric[4:]
+                if mcol in col_names:
+                    agg_expr = f'AVG("{mcol}")'
+            elif metric in col_names:
+                agg_expr = f'SUM("{metric}")'
+            else:
+                revenue_candidates = [
+                    c for c in col_names
+                    if any(k in c for k in ("final", "total", "amount", "price", "revenue", "sales", "earning", "fare", "net", "paid"))
+                ]
+                money_col = _pick_best_revenue_column(revenue_candidates)
+                if money_col:
+                    agg_expr = f'SUM("{money_col}")'
+
+            if not agg_expr:
+                continue
+
+            score = 0
+            if metric in col_names:
+                score += 5
+            if entity_col:
+                score += 5
+            if group_key:
+                score += 2
+            if all((k in col_names) for k in filters.keys()):
+                score += 2
+            if any(k in date_col.lower() for k in ("date", "time", "created")):
+                score += 2
+
+            if best is None or score > best[0]:
+                best = (score, t, date_col, entity_col, group_key, agg_expr)
+
+        return (best[1], best[2], best[3], best[4], best[5]) if best else None
+
+    try:
+        plan = _pick_plan()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if not plan:
+        return None
+
+    table, date_col, entity_col, group_key, agg_expr = plan
+    filter_clause = _render_filter_clause(filters)
+    where_extra = f"\n{filter_clause}" if filter_clause else ""
+
+    group_by_expr = f'"{entity_col}"'
+    select_name_expr = f'"{entity_col}" AS name'
+    if group_key and group_key != entity_col:
+        group_by_expr = f'"{group_key}", "{entity_col}"'
+
+    pct_str = f"{pct:.6f}"
+    cutoff_expr = f"GREATEST(1, CEIL(total_entities * {pct_str} / 100.0))"
+
+    return (
+        "WITH entity_totals AS (\n"
+        f"  SELECT {select_name_expr}, {agg_expr} AS value\n"
+        f'  FROM "{table}"\n'
+        f'  WHERE CAST("{date_col}" AS DATE) >= ? AND CAST("{date_col}" AS DATE) < ?{where_extra}\n'
+        f"  GROUP BY {group_by_expr}\n"
+        "),\n"
+        "ranked AS (\n"
+        "  SELECT name,\n"
+        "         value,\n"
+        "         ROW_NUMBER() OVER (ORDER BY value DESC) AS rn,\n"
+        "         COUNT(*) OVER () AS total_entities,\n"
+        "         SUM(value) OVER () AS grand_total\n"
+        "  FROM entity_totals\n"
+        "),\n"
+        "cut AS (\n"
+        f"  SELECT *, {cutoff_expr} AS cutoff\n"
+        "  FROM ranked\n"
+        ")\n"
+        "SELECT CASE\n"
+        "         WHEN MAX(grand_total) IS NULL OR MAX(grand_total) = 0 THEN 0\n"
+        "         ELSE (SUM(CASE WHEN rn <= cutoff THEN value ELSE 0 END) * 100.0) / MAX(grand_total)\n"
+        "       END AS value\n"
+        "FROM cut"
     )
 
 
@@ -1102,9 +1451,32 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     usage         = {}
     fallback_used = False
     sql_source    = "builder"
+    is_repeat_entity_count = _is_repeat_entity_count_intent(parsed, user_query)
+    is_top_percent_share = _top_percent_share_value(parsed, user_query) is not None
+
+    if generated_sql is None and is_repeat_entity_count:
+        fb = _deterministic_repeat_entity_count_fallback(parsed, user_query)
+        if fb:
+            generated_sql = fb
+            fallback_used = True
+            sql_source = "deterministic_repeat_entity_count_fallback"
+            ctx.logger.info("✅ Deterministic repeat-entity SQL built", {"queryId": query_id})
+
+    if generated_sql is None and is_top_percent_share:
+        fb = _deterministic_top_percent_share_fallback(parsed, user_query)
+        if fb:
+            generated_sql = fb
+            fallback_used = True
+            sql_source = "deterministic_top_percent_share_fallback"
+            ctx.logger.info("✅ Deterministic top-percent-share SQL built", {"queryId": query_id})
 
     # ── Fast path: deterministic builder (schema-driven, works for any dataset) ─
-    use_builder = qt in ("top_n", "bottom_n", "aggregate", "zero_filter") and not rank_within_time
+    use_builder = (
+        qt in ("top_n", "bottom_n", "aggregate", "zero_filter")
+        and not rank_within_time
+        and not is_repeat_entity_count
+        and not is_top_percent_share
+    )
 
     if use_builder:
         built = build_sql(parsed)
@@ -1129,6 +1501,14 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             fallback_used = True
             sql_source = "deterministic_rank_within_time_fallback"
             ctx.logger.info("✅ Deterministic rank-within-time SQL built", {"queryId": query_id})
+
+    if generated_sql is None and qt in ("comparison", "growth_ranking", "intersection"):
+        fb = _deterministic_comparison_fallback(parsed)
+        if fb:
+            generated_sql = fb
+            fallback_used = True
+            sql_source = "deterministic_comparison_fallback"
+            ctx.logger.info("✅ Deterministic comparison SQL built", {"queryId": query_id})
 
     # ── LLM path: used for all non-e-commerce datasets and complex query types ─
     if generated_sql is None:
@@ -1191,14 +1571,6 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             fallback_used = True
             sql_source    = "deterministic_time_series_fallback"
             ctx.logger.warn("Deterministic time_series fallback used", {"queryId": query_id})
-
-    if generated_sql is None and qt in ("comparison", "growth_ranking", "intersection"):
-        fb = _deterministic_comparison_fallback(parsed)
-        if fb:
-            generated_sql = fb
-            fallback_used = True
-            sql_source    = "deterministic_comparison_fallback"
-            ctx.logger.warn("Deterministic comparison fallback used", {"queryId": query_id})
 
     if generated_sql is None:
         msg = (

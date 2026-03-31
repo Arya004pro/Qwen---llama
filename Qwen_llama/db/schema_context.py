@@ -1,9 +1,11 @@
 """Schema prompt builder for SQL generation.
 
-Key addition: _detect_business_rules() scans the live schema for well-known
-'filter' columns (is_cancelled, is_deleted, status …) and injects mandatory
-WHERE-clause hints so the LLM never includes cancelled / inactive rows in
-revenue / count calculations.
+Key additions:
+  - _get_epoch_cast_expr(): detects millisecond vs second BIGINT epoch columns
+  - _detect_date_columns(): now distinguishes native DATE/TIMESTAMP from BIGINT
+    epoch columns and provides the correct SQL cast expression to the LLM
+  - _detect_business_rules(): scans for well-known filter columns
+  - All detection is live from DuckDB — fully schema-agnostic
 """
 
 from db.duckdb_connection import get_read_connection
@@ -18,7 +20,6 @@ Use ? placeholders for all params in generated SQL.
 """
 
 # ── Column patterns that signal "exclude this row from metrics" ───────────────
-# Maps column_name → the SQL condition that keeps VALID rows only.
 _FILTER_COLUMN_RULES: dict[str, str] = {
     "is_cancelled":  "{col} = 0",
     "is_deleted":    "{col} = 0",
@@ -32,7 +33,6 @@ _FILTER_COLUMN_RULES: dict[str, str] = {
     "is_test":       "{col} = 0",
 }
 
-# "status" columns need a value-inspection step — these strings mark BAD rows.
 _STATUS_BAD_VALUES: set[str] = {
     "cancelled", "canceled", "refunded", "void", "failed",
     "rejected", "returned", "closed", "inactive", "deleted",
@@ -49,6 +49,9 @@ _NON_ENTITY_NAME_HINTS: tuple[str, ...] = (
     "status", "type", "description", "comment", "note", "month",
     "year", "week", "day",
 )
+
+# Integer types that might hold epoch timestamps
+_BIGINT_TYPES = ("BIGINT", "INT8", "LONG", "HUGEINT", "INT64")
 
 
 def _is_text_type(dtype: str) -> bool:
@@ -77,12 +80,47 @@ def _looks_like_entity_column(col_name: str) -> bool:
     return any(k in n for k in _ENTITY_NAME_HINTS)
 
 
-def _detect_entities(conn, tables: list[str]) -> list[str]:
-    """
-    Detect likely business entities from high-cardinality text columns.
-    """
-    hints: list[str] = []
+# ── Epoch timestamp helpers (NEW) ─────────────────────────────────────────────
 
+def _get_epoch_cast_expr(conn, table: str, col: str) -> str:
+    """
+    Determine the correct DuckDB epoch→timestamp conversion for a BIGINT column.
+
+    Thresholds:
+      > 1_500_000_000_000 → epoch_ms()       (ms since Unix epoch, e.g. ~Nov 2017)
+      > 1_000_000_000     → to_timestamp()   (s since Unix epoch, e.g. ~Sep 2001)
+      otherwise           → epoch_ms()       (safe default)
+
+    Returns a DuckDB expression string, e.g. 'epoch_ms("order_datetime")'
+    """
+    try:
+        r = conn.execute(
+            f'SELECT MAX("{col}") FROM "{table}" WHERE "{col}" IS NOT NULL LIMIT 1'
+        ).fetchone()
+        if r and r[0] is not None:
+            mv = int(r[0])
+            if mv > 1_500_000_000_000:
+                return f'epoch_ms("{col}")'
+            elif mv > 1_000_000_000:
+                return f'to_timestamp("{col}")'
+    except Exception:
+        pass
+    return f'epoch_ms("{col}")'  # safe default for unknown scale
+
+
+def _is_bigint_epoch_col(col_name: str, dtype: str) -> bool:
+    """Return True when this BIGINT column name looks like a datetime column."""
+    _DATE_KEYWORDS = ("date", "time", "created", "updated", "at", "on", "when", "timestamp")
+    d = dtype.upper()
+    if not any(t in d for t in _BIGINT_TYPES):
+        return False
+    return any(k in col_name.lower() for k in _DATE_KEYWORDS)
+
+
+# ── Entity detection ──────────────────────────────────────────────────────────
+
+def _detect_entities(conn, tables: list[str]) -> list[str]:
+    hints: list[str] = []
     for table in tables:
         try:
             cols = [(c[0], c[1].upper()) for c in conn.execute(f'DESCRIBE "{table}"').fetchall()]
@@ -100,12 +138,7 @@ def _detect_entities(conn, tables: list[str]) -> list[str]:
 
             try:
                 non_null, distinct_cnt = conn.execute(
-                    f'''
-                    SELECT
-                        COUNT("{col_name}") AS non_null_count,
-                        COUNT(DISTINCT "{col_name}") AS distinct_count
-                    FROM "{table}"
-                    '''
+                    f'SELECT COUNT("{col_name}"), COUNT(DISTINCT "{col_name}") FROM "{table}"'
                 ).fetchone()
             except Exception:
                 continue
@@ -153,13 +186,6 @@ def _detect_entities(conn, tables: list[str]) -> list[str]:
 
 
 def _detect_uniqueness_profile(conn, tables: list[str]) -> tuple[list[str], list[str]]:
-    """
-    Build a uniqueness profile and safe grouping-key hints.
-
-    Returns:
-      - profile_lines: human-readable uniqueness lines per table
-      - grouping_lines: preferred display->key mapping for collision-safe grouping
-    """
     profile_lines: list[str] = []
     grouping_lines: list[str] = []
 
@@ -177,7 +203,6 @@ def _detect_uniqueness_profile(conn, tables: list[str]) -> tuple[list[str], list
         label_non_unique: list[str] = []
 
         for col_name, dtype in cols:
-            # Keep cardinality checks focused on text/numeric columns.
             if not (_is_text_type(dtype) or _is_numeric_type(dtype)):
                 continue
             if _looks_like_date_column(col_name):
@@ -185,12 +210,7 @@ def _detect_uniqueness_profile(conn, tables: list[str]) -> tuple[list[str], list
 
             try:
                 non_null, distinct_cnt = conn.execute(
-                    f'''
-                    SELECT
-                        COUNT("{col_name}") AS non_null_count,
-                        COUNT(DISTINCT "{col_name}") AS distinct_count
-                    FROM "{table}"
-                    '''
+                    f'SELECT COUNT("{col_name}"), COUNT(DISTINCT "{col_name}") FROM "{table}"'
                 ).fetchone()
             except Exception:
                 continue
@@ -220,7 +240,6 @@ def _detect_uniqueness_profile(conn, tables: list[str]) -> tuple[list[str], list
         if label_non_unique:
             profile_lines.append(f'  "{table}" non-unique labels: {", ".join(label_non_unique[:6])}')
 
-        # Build safe grouping map: <base> -> <base>_id/<base>_code when key is unique-like.
         for raw_col, dtype in cols:
             c = raw_col.lower()
             if _is_text_type(dtype):
@@ -244,13 +263,6 @@ def _detect_uniqueness_profile(conn, tables: list[str]) -> tuple[list[str], list
 
 
 def _detect_business_rules(conn, tables: list[str]) -> list[str]:
-    """
-    Scan each table for well-known boolean / status filter columns.
-
-    Returns a list of human-readable rule strings ready to embed into the
-    SQL-generation prompt, e.g.:
-      "zomato_master_final.is_cancelled = 0  (exclude cancelled rows)"
-    """
     rules: list[str] = []
 
     for table in tables:
@@ -261,7 +273,6 @@ def _detect_business_rules(conn, tables: list[str]) -> list[str]:
             continue
 
         for col_name, dtype in cols.items():
-            # Boolean / integer flag columns
             rule_tmpl = _FILTER_COLUMN_RULES.get(col_name)
             if rule_tmpl:
                 condition = rule_tmpl.format(col=col_name)
@@ -271,7 +282,6 @@ def _detect_business_rules(conn, tables: list[str]) -> list[str]:
                 )
                 continue
 
-            # "status" / "state" text columns — inspect distinct values
             if col_name in ("status", "order_status", "ride_status",
                             "payment_status", "state"):
                 try:
@@ -295,16 +305,8 @@ def _detect_business_rules(conn, tables: list[str]) -> list[str]:
 
 
 def _detect_metric_columns(conn, tables: list[str]) -> list[str]:
-    """
-    Auto-detect likely monetary / count metric columns and suggest
-    canonical names for the LLM to use.
-
-    Returns lines like:
-      "revenue / sales / earnings → SUM(final_price)  [table zomato_master_final]"
-    """
     hints: list[str] = []
 
-    # Keyword → column-name fragments (checked as substrings)
     MONETARY_KEYWORDS   = ("price", "fare", "amount", "earning", "revenue",
                            "commission", "fee", "cost", "sale", "payment", "total")
     QUANTITY_KEYWORDS   = ("quantity", "qty", "count", "units", "volume")
@@ -326,7 +328,6 @@ def _detect_metric_columns(conn, tables: list[str]) -> list[str]:
         duration_cols  = [c for c, t in cols if any(k in c.lower() for k in DURATION_KEYWORDS)]
 
         if monetary_cols:
-            # Prefer "final_price" > "total_fare" > "total_amount" > first found
             preferred = next(
                 (c for c in monetary_cols if "final" in c.lower()),
                 next((c for c in monetary_cols if "total" in c.lower()), monetary_cols[0])
@@ -351,7 +352,15 @@ def _detect_metric_columns(conn, tables: list[str]) -> list[str]:
 
 
 def _detect_date_columns(conn, tables: list[str]) -> list[str]:
-    """Return lines telling the LLM which column to use for date filtering."""
+    """
+    Return lines telling the LLM which column to use for date filtering
+    and — critically — what SQL cast expression to use based on the actual type.
+
+    Distinguishes three cases:
+      1. Native DATE / TIMESTAMP  → CAST(col AS DATE) works directly
+      2. BIGINT millisecond epoch → epoch_ms(col) must be used first
+      3. BIGINT second epoch      → to_timestamp(col) must be used first
+    """
     hints: list[str] = []
     DATE_KEYWORDS = ("date", "time", "created", "updated", "at", "on", "when")
 
@@ -362,21 +371,42 @@ def _detect_date_columns(conn, tables: list[str]) -> list[str]:
         except Exception:
             continue
 
-        date_cols = [c for c, t in cols
-                     if any(k in c.lower() for k in DATE_KEYWORDS)
-                     and any(x in t for x in ("DATE", "TIMESTAMP", "VARCHAR"))]
-        if date_cols:
-            hints.append(
-                f'  date filter for "{table}": use {date_cols[0]} >= ? AND {date_cols[0]} < ?  (exclusive end — pass end+1day)'
-            )
+        for col, dtype in cols:
+            col_l = col.lower()
+            if not any(k in col_l for k in DATE_KEYWORDS):
+                continue
+
+            if "DATE" in dtype or "TIMESTAMP" in dtype:
+                # Native date type — standard CAST works
+                hints.append(
+                    f'  date filter for "{table}"."{col}" (type: {dtype}): '
+                    f'use CAST("{col}" AS DATE) >= ? AND CAST("{col}" AS DATE) < ?  '
+                    f'(exclusive end — pass end+1day as second ?)'
+                )
+
+            elif any(t in dtype for t in _BIGINT_TYPES):
+                # Integer epoch — CAST(col AS DATE) will FAIL.  Must convert first.
+                epoch_expr = _get_epoch_cast_expr(conn, table, col)
+                cast_for_date = f'CAST({epoch_expr} AS DATE)'
+                hints.append(
+                    f'  date filter for "{table}"."{col}" (type: {dtype} — INTEGER EPOCH TIMESTAMP):\n'
+                    f'    *** CRITICAL: "{col}" is stored as an INTEGER, not a native date. ***\n'
+                    f'    CORRECT:   {cast_for_date} >= ? AND {cast_for_date} < ?\n'
+                    f'    WRONG:     CAST("{col}" AS DATE) >= ?   ← causes BIGINT->DATE error\n'
+                    f'    WRONG:     "{col}" >= ?                  ← causes type mismatch\n'
+                    f'    For EXTRACT:   EXTRACT(YEAR FROM {epoch_expr})\n'
+                    f'    For STRFTIME:  STRFTIME({epoch_expr}, \'%Y-%m\')\n'
+                    f'    For DATE_TRUNC: DATE_TRUNC(\'month\', {epoch_expr})\n'
+                    f'    Always use {epoch_expr} before any date operation on this column.'
+                )
 
     return hints
 
 
 def _build_schema_examples(conn, tables: list[str]) -> list[str]:
     """
-    Build dynamic few-shot SQL examples using detected columns from the live schema.
-    The examples are generated from actual table/column names so they stay domain-agnostic.
+    Build dynamic few-shot SQL examples using actual table/column names.
+    Now epoch-aware: if the date column is BIGINT, uses the right cast.
     """
     metric_keywords = (
         "final", "total", "amount", "revenue", "sales", "price",
@@ -384,8 +414,8 @@ def _build_schema_examples(conn, tables: list[str]) -> list[str]:
     )
     date_keywords = ("date", "time", "created", "updated", "at")
 
-    best: tuple[int, str, str, str, str] | None = None
-    # score, table, entity_col, metric_col, date_col
+    best: tuple[int, str, str, str, str, str] | None = None
+    # score, table, entity_col, metric_col, date_col, date_cast_expr
 
     for table in tables:
         try:
@@ -408,11 +438,11 @@ def _build_schema_examples(conn, tables: list[str]) -> list[str]:
         if not metric_cols:
             continue
 
-        date_cols = [
-            c for c, t in cols
-            if (any(k in c.lower() for k in date_keywords) or any(x in t for x in ("DATE", "TIMESTAMP")))
-        ]
-        if not date_cols:
+        date_col_info: list[tuple[str, str]] = []  # (col_name, dtype)
+        for c, t in cols:
+            if any(k in c.lower() for k in date_keywords) or any(x in t for x in ("DATE", "TIMESTAMP")):
+                date_col_info.append((c, t))
+        if not date_col_info:
             continue
 
         entity_col = next((c for c in entity_cols if "name" in c.lower()), entity_cols[0])
@@ -420,7 +450,14 @@ def _build_schema_examples(conn, tables: list[str]) -> list[str]:
             (c for c in metric_cols if any(k in c.lower() for k in metric_keywords)),
             metric_cols[0],
         )
-        date_col = date_cols[0]
+        date_col, date_dtype = date_col_info[0]
+
+        # Determine the right date cast expression for this column
+        if any(t in date_dtype.upper() for t in _BIGINT_TYPES):
+            epoch_expr = _get_epoch_cast_expr(conn, table, date_col)
+            date_cast_expr = f'CAST({epoch_expr} AS DATE)'
+        else:
+            date_cast_expr = f'CAST("{date_col}" AS DATE)'
 
         score = 0
         if "name" in entity_col.lower():
@@ -432,32 +469,40 @@ def _build_schema_examples(conn, tables: list[str]) -> list[str]:
         score += min(len(metric_cols), 3)
 
         if best is None or score > best[0]:
-            best = (score, table, entity_col, metric_col, date_col)
+            best = (score, table, entity_col, metric_col, date_col, date_cast_expr)
 
     if best is None:
         return []
 
-    _, table, entity_col, metric_col, date_col = best
+    _, table, entity_col, metric_col, date_col, date_cast_expr = best
+
+    # For time series, build the right bucket expression
+    if any(t in date_cast_expr for t in ("epoch_ms", "to_timestamp")):
+        # Extract the epoch expression for use in STRFTIME etc.
+        epoch_inner = date_cast_expr.replace("CAST(", "").replace(" AS DATE)", "")
+        month_expr = f"STRFTIME({epoch_inner}, '%Y-%m')"
+    else:
+        month_expr = f"STRFTIME(CAST(\"{date_col}\" AS DATE), '%Y-%m')"
 
     return [
         f"  Example 1 (Top-N by metric):",
         f'    User: "Top 10 {entity_col} by {metric_col} in a time range"',
         f'    SQL:  SELECT "{entity_col}" AS name, SUM("{metric_col}") AS value',
         f'          FROM "{table}"',
-        f'          WHERE CAST("{date_col}" AS DATE) >= ? AND CAST("{date_col}" AS DATE) < ?',
+        f'          WHERE {date_cast_expr} >= ? AND {date_cast_expr} < ?',
         f'          GROUP BY 1 ORDER BY value DESC LIMIT ?',
         "",
         f"  Example 2 (Aggregate total):",
         f'    User: "Total {metric_col} in a time range"',
         f'    SQL:  SELECT SUM("{metric_col}") AS value',
         f'          FROM "{table}"',
-        f'          WHERE CAST("{date_col}" AS DATE) >= ? AND CAST("{date_col}" AS DATE) < ?',
+        f'          WHERE {date_cast_expr} >= ? AND {date_cast_expr} < ?',
         "",
         f"  Example 3 (Monthly trend):",
         f'    User: "Monthly trend of {metric_col}"',
-        f"""    SQL:  SELECT DATE_TRUNC('month', CAST("{date_col}" AS DATE)) AS name, SUM("{metric_col}") AS value""",
+        f"    SQL:  SELECT {month_expr} AS name, SUM(\"{metric_col}\") AS value",
         f'          FROM "{table}"',
-        f'          WHERE CAST("{date_col}" AS DATE) >= ? AND CAST("{date_col}" AS DATE) < ?',
+        f'          WHERE {date_cast_expr} >= ? AND {date_cast_expr} < ?',
         "          GROUP BY 1 ORDER BY 1",
     ]
 
@@ -478,7 +523,6 @@ def _live_schema_prompt() -> str:
         if not tables:
             return ""
 
-        # ── Column listing ─────────────────────────────────────────────────────
         lines = ["Tables", "------"]
         for t in tables:
             cols = conn.execute(f'DESCRIBE "{t}"').fetchall()
@@ -494,7 +538,7 @@ def _live_schema_prompt() -> str:
         if entity_hints:
             lines += entity_hints
         else:
-            lines += ["  (No high-cardinality entity-like text columns detected from current data.)"]
+            lines += ["  (No high-cardinality entity-like text columns detected.)"]
 
         uniqueness_lines, grouping_lines = _detect_uniqueness_profile(conn, tables)
         lines += ["", "Uniqueness Profile", "------------------"]
@@ -505,23 +549,23 @@ def _live_schema_prompt() -> str:
         lines += ["", "Safe Grouping Keys", "------------------"]
         if grouping_lines:
             lines += [
-                "When display labels are not unique, group by stable key + label to avoid merged entities.",
+                "When display labels are not unique, group by stable key + label.",
             ]
             lines += grouping_lines
         else:
             lines += ["  (No explicit display->key pairing detected.)"]
 
-        # ── Auto-detected metric mappings ──────────────────────────────────────
         metric_hints = _detect_metric_columns(conn, tables)
         if metric_hints:
             lines += ["", "Metric column mappings (USE THESE EXACT COLUMN NAMES)",
                       "-----------------------------------------------------------"]
             lines += metric_hints
 
-        # ── Auto-detected date columns ─────────────────────────────────────────
+        # Date column hints — now epoch-aware
         date_hints = _detect_date_columns(conn, tables)
         if date_hints:
-            lines += ["", "Date filter columns", "--------------------"]
+            lines += ["", "Date filter columns (READ CAREFULLY — some are BIGINT epochs)",
+                      "-------------------------------------------------------------------"]
             lines += date_hints
 
         examples = _build_schema_examples(conn, tables)
@@ -537,10 +581,9 @@ def _live_schema_prompt() -> str:
                 "  (No complete table profile found with entity + metric + date columns.)",
             ]
 
-        # ── Auto-detected business / validity filters ──────────────────────────
-
         lines += [""]
         lines += render_semantic_layer_lines(conn, tables)
+
         biz_rules = _detect_business_rules(conn, tables)
         if biz_rules:
             lines += [
@@ -548,11 +591,9 @@ def _live_schema_prompt() -> str:
                 "MANDATORY business-validity filters (ALWAYS apply — never omit)",
                 "-------------------------------------------------------------------",
                 "These filters MUST appear in every query that touches these tables.",
-                "Omitting them will include cancelled, deleted, or fraudulent rows.",
             ]
             lines += biz_rules
 
-        # ── General SQL rules ──────────────────────────────────────────────────
         lines += [
             "",
             "SQL rules",
@@ -563,6 +604,7 @@ def _live_schema_prompt() -> str:
             "- For ranked queries: ORDER BY value DESC/ASC LIMIT ?",
             "- For aggregate queries: single scalar column aliased 'value', no GROUP BY",
             "- APPLY all mandatory business-validity filters listed above",
+            "- NEVER use CAST(bigint_epoch_col AS DATE) — see 'Date filter columns' above",
         ]
 
         return "\n".join(lines)

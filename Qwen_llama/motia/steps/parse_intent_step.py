@@ -30,6 +30,7 @@ from motia import FlowContext, queue
 from shared_config import (
     GROQ_API_TOKEN,
     QWEN_MODEL,
+    LLAMA_MODEL,
     GROQ_URL,
     QWEN_ENABLE_REASONING,
     QWEN_REASONING_EFFORT,
@@ -113,6 +114,14 @@ METRIC RULES — read the "Metric column mappings" section from the schema above
 - For "rides", "trips", "bookings", "orders", "count of", "number of", "how many":
   metric = "count"
   IMPORTANT: use COUNT(DISTINCT <order_id_column>) NOT COUNT(*).
+- For "repeat/returning buyers/customers/users/drivers/stores":
+  metric = "count", query_type = "aggregate", entity = null.
+  This means "count of entities with >= 2 events in the selected period",
+  not total orders.
+- For "contribution/share of top X% <entities>":
+  this is NOT top-N rows. Treat as top-percent share analytics.
+  Keep entity dimension, and attach top-percent intent (X).
+  SQL should compute share = (sum(metric for top X% ranked entities) / sum(metric for all entities)) * 100.
 - For "quantity", "units sold", "items": use the quantity column from the schema.
 - When in doubt: pick the primary revenue/amount column from the schema.
 
@@ -206,6 +215,20 @@ _REVENUE_WEAK_COL_HINTS = (
 _AOV_QUERY_HINTS = (
     "aov", "average order value", "avg order value",
     "average basket value", "average transaction value", "average ticket size",
+)
+
+_REPEAT_ENTITY_CUES = (
+    "repeat", "repeated", "returning", "return", "repeat purchase", "repeat order",
+)
+
+_REPEAT_ENTITY_NOUNS = (
+    "buyer", "customer", "user", "client", "account", "member",
+    "driver", "rider", "vendor", "merchant", "seller", "partner",
+    "employee", "agent", "store", "warehouse", "branch",
+)
+
+_SHARE_CUES = (
+    "contribution", "contribute", "share", "percent of", "percentage of",
 )
 
 _MANDATORY_FILTER_COLS: dict[str, dict] = {
@@ -763,36 +786,34 @@ def _has_metric_cue(query: str) -> bool:
     return any(c in q for c in metric_cues)
 
 
-def _should_use_rule_first(user_query: str) -> bool:
-    q = (user_query or "").strip().lower()
-    if not q:
+def _is_repeat_entity_count_intent(query: str) -> bool:
+    q = f" {(query or '').lower()} "
+    has_repeat = any(c in q for c in _REPEAT_ENTITY_CUES)
+    has_entity = any(n in q for n in _REPEAT_ENTITY_NOUNS)
+    if not (has_repeat and has_entity):
         return False
-    if len(q) > 220:
+    if _has_ranking_cue(query):
         return False
+    if _is_trend_query(query):
+        return False
+    return True
 
-    complex_cues = (
-        "correlation", "cohort", "retention", "attribution", "causal",
-        "forecast", "prediction", "why ", "reason", "root cause",
-        "intersection", "growth ranking", "percentile", "median",
-    )
-    if any(c in q for c in complex_cues):
-        return False
 
-    has_simple_shape = (
-        _has_ranking_cue(q)
-        or _is_trend_query(q)
-        or any(c in q for c in ("total", "overall", "sum", "average", "count", "number of", "how many"))
-        or any(c in q for c in (" vs ", " versus ", " compared to ", " against "))
-    )
-    if not has_simple_shape:
-        return False
+def _extract_top_percent_share_value(query: str) -> float | None:
+    q = (query or "").lower()
+    if not any(c in q for c in _SHARE_CUES):
+        return None
 
-    if not _has_metric_cue(q) and not any(c in q for c in ("count", "number of", "how many", "orders", "records")):
-        return False
-
-    extracted_ranges, _ = parse_time_ranges_from_query(user_query)
-    has_time = bool(extracted_ranges) or _looks_like_all_time_trend(user_query) or bool(re.search(r"\b(19|20)\d{2}\b", q))
-    return has_time
+    m = re.search(r"\btop\s+(\d+(?:\.\d+)?)\s*(?:%|percent\b)", q)
+    if not m:
+        return None
+    try:
+        pct = float(m.group(1))
+    except Exception:
+        return None
+    if pct <= 0 or pct >= 100:
+        return None
+    return pct
 
 
 def _infer_entity_from_grouping_cue(
@@ -890,129 +911,6 @@ def _infer_entity_from_query_terms(
 
 
 # ── Schema-aware fallback parser ──────────────────────────────────────────────
-
-def _fallback_parse(user_query: str) -> dict:
-    """
-    Build a best-effort intent from user query WITHOUT calling the LLM.
-    Uses the LIVE SCHEMA to detect entity and metric columns instead of
-    hardcoded keyword lists.
-    """
-    q = user_query.lower()
-
-    # ── Time series ───────────────────────────────────────────────────────────
-    if _is_trend_query(user_query):
-        if _is_aov_intent(user_query):
-            return {
-                "entity": None,
-                "metric": "aov",
-                "semantic_metric": "aov",
-                "_aov_revenue_col": _select_primary_revenue_column(_build_schema_keyword_maps()[1]),
-                "_count_distinct_key": _select_primary_count_key(),
-                "query_type": "time_series",
-                "time_bucket": _detect_time_bucket(user_query),
-                "top_n": 5,
-                "time_ranges": [],
-                "threshold": None,
-                "filters": {},
-                "is_complete": False,
-                "clarification_question": "What time period should I use? (e.g. 2024, Q1 2024)",
-            }
-
-        # Try to identify the metric from live schema
-        _, metric_map = _build_schema_keyword_maps()
-        metric = None
-        for kw, col in metric_map:
-            if kw in q:
-                metric = col
-                break
-
-        if _is_revenue_intent(user_query):
-            revenue_col = _select_primary_revenue_column(metric_map)
-            if revenue_col and (
-                metric is None or _revenue_col_score(metric) < _revenue_col_score(revenue_col)
-            ):
-                metric = revenue_col
-
-        if metric is None:
-            metric = "count"
-
-        bucket = _detect_time_bucket(user_query)
-        return {
-            "entity": None, "metric": metric, "query_type": "time_series",
-            "time_bucket": bucket, "top_n": 5, "time_ranges": [],
-            "threshold": None, "filters": {}, "is_complete": False,
-            "clarification_question": "What time period should I use? (e.g. 2024, Q1 2024)",
-        }
-
-    # ── Ranked / aggregate queries ────────────────────────────────────────────
-    entity_map, metric_map = _build_schema_keyword_maps()
-
-    qt    = "top_n"
-    entity: str | None = None
-    top_n = 5
-
-    # Detect entity from live schema keyword map
-    for kw, col in entity_map:
-        if kw in q:
-            entity = col
-            break
-
-    # If still no entity and query looks aggregate, set accordingly
-    if entity is None and any(x in q for x in ["total", "how much", "how many", "average"]):
-        qt = "aggregate"
-
-    # Detect metric from live schema keyword map
-    metric = None
-    is_aov = _is_aov_intent(user_query)
-    if is_aov:
-        metric = "aov"
-
-    if not is_aov:
-        for kw, col in metric_map:
-            if kw in q:
-                metric = col
-                break
-
-    if not is_aov and _is_revenue_intent(user_query):
-        revenue_col = _select_primary_revenue_column(metric_map)
-        if revenue_col and (
-            metric is None or _revenue_col_score(metric) < _revenue_col_score(revenue_col)
-        ):
-            metric = revenue_col
-
-    if metric is None:
-        # Default to first monetary column found, or "count"
-        for kw, col in metric_map:
-            if col != "count":
-                metric = col
-                break
-        if metric is None:
-            metric = "count"
-
-    # Detect ranking direction
-    m = _TOPN_RE.search(q)
-    if m:
-        qt    = "bottom_n" if m.group(1).lower() == "bottom" else "top_n"
-        top_n = int(m.group(2))
-    elif any(x in q for x in ["lowest", "least", "bottom", "worst"]):
-        qt = "bottom_n"
-    elif any(x in q for x in ["highest", "most", "best", "top", "largest"]):
-        qt = "top_n"
-
-    is_complete = bool(metric) and qt == "aggregate"
-    parsed = {
-        "entity": entity, "metric": metric, "query_type": qt,
-        "time_bucket": None, "top_n": top_n, "time_ranges": [],
-        "threshold": None, "filters": {}, "is_complete": is_complete,
-        "clarification_question": "",
-    }
-    if not is_complete:
-        parsed["clarification_question"] = _default_clarification(parsed)
-    return parsed
-
-
-# ── Post-processing ───────────────────────────────────────────────────────────
-
 def _post_process(
     parsed: dict,
     user_query: str = "",
@@ -1039,6 +937,13 @@ def _post_process(
     split_cue = any(x in ql for x in (" vs ", " versus ", " compared to ", " against "))
     grouping_cue = bool(re.search(r"\b(per|by|for each|each)\b", ql))
 
+    schema_maps: tuple[list[tuple[str, str]], list[tuple[str, str]] | None] = None  # type: ignore[assignment]
+    def _get_schema_maps() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        nonlocal schema_maps
+        if schema_maps is None:
+            schema_maps = _build_schema_keyword_maps()
+        return schema_maps  # type: ignore[return-value]
+
     if _is_aov_intent(user_query):
         parsed["metric"] = "aov"
         parsed["semantic_metric"] = "aov"
@@ -1053,9 +958,44 @@ def _post_process(
 
     ranking_cue = _has_ranking_cue(user_query)
     rank_within_time_bucket = _infer_rank_within_time_bucket(user_query)
+    top_percent_share = _extract_top_percent_share_value(user_query)
+
+    if _is_repeat_entity_count_intent(user_query):
+        parsed["query_type"] = "aggregate"
+        parsed["metric"] = "count"
+        parsed["semantic_metric"] = "repeat_entity_count"
+        parsed["entity"] = None
+        parsed["_repeat_entity_count"] = True
+        qt = "aggregate"
+        m = "count"
+
+    if top_percent_share is not None:
+        parsed["_top_percent_share"] = top_percent_share
+        parsed.setdefault("semantic_metric", "top_percent_share")
+        # Keep ranking-style type so entity inference/completeness stays dimension-aware.
+        parsed["query_type"] = "top_n"
+        qt = "top_n"
+
+        if not parsed.get("entity"):
+            entity_map_for_grouping, _ = _get_schema_maps()
+            inferred_entity = _infer_entity_from_grouping_cue(user_query, entity_map_for_grouping)
+            if not inferred_entity:
+                inferred_entity = _infer_entity_from_query_terms(user_query, entity_map_for_grouping)
+            if inferred_entity:
+                parsed["entity"] = inferred_entity
+
+    # For plain period-vs-period comparisons without explicit grouping language,
+    # keep comparison aggregate (entity=None) even if an entity-like token appears.
+    if (
+        qt == "comparison"
+        and not grouping_cue
+        and not ranking_cue
+        and not rank_within_time_bucket
+    ):
+        parsed["entity"] = None
 
     if not parsed.get("entity") and grouping_cue:
-        entity_map_for_grouping, _ = _build_schema_keyword_maps()
+        entity_map_for_grouping, _ = _get_schema_maps()
         inferred_entity = _infer_entity_from_grouping_cue(user_query, entity_map_for_grouping)
         if inferred_entity:
             parsed["entity"] = inferred_entity
@@ -1137,7 +1077,7 @@ def _post_process(
         qt = "top_n"
 
     if qt in ("top_n", "bottom_n") and not parsed.get("entity"):
-        entity_map, _ = _build_schema_keyword_maps()
+        entity_map, _ = _get_schema_maps()
         inferred_entity = _infer_entity_from_grouping_cue(user_query, entity_map)
         if inferred_entity:
             parsed["entity"] = inferred_entity
@@ -1203,7 +1143,7 @@ def _post_process(
     parsed = resolve_intent_with_semantic_layer(parsed, user_query)
 
     if (parsed.get("metric") or "").lower() == "aov":
-        _, metric_map = _build_schema_keyword_maps()
+        _, metric_map = _get_schema_maps()
         parsed.setdefault("_aov_revenue_col", _select_primary_revenue_column(metric_map))
         parsed.setdefault("_count_distinct_key", _select_primary_count_key())
         parsed["semantic_metric"] = "aov"
@@ -1211,7 +1151,7 @@ def _post_process(
     # Revenue safety: if user asked for revenue-like metrics, prefer the
     # strongest net/final monetary column from live schema over list/base price.
     if _is_revenue_intent(user_query):
-        _, metric_map = _build_schema_keyword_maps()
+        _, metric_map = _get_schema_maps()
         preferred_revenue = _select_primary_revenue_column(metric_map)
         if preferred_revenue:
             current_metric = (parsed.get("metric") or "").lower().strip()
@@ -1238,7 +1178,7 @@ def _post_process(
     # Late guard: if ranking-style query still has no entity, infer one from
     # user phrasing + live schema column names.
     if parsed.get("query_type") in ("top_n", "bottom_n", "threshold", "growth_ranking", "zero_filter") and not parsed.get("entity"):
-        entity_map, _ = _build_schema_keyword_maps()
+        entity_map, _ = _get_schema_maps()
         inferred_entity = _infer_entity_from_grouping_cue(user_query, entity_map)
         if not inferred_entity:
             inferred_entity = _infer_entity_from_query_terms(user_query, entity_map)
@@ -1253,6 +1193,14 @@ def _post_process(
     qt = parsed.get("query_type", qt)
     tr = parsed.get("time_ranges", tr)
     m = parsed.get("metric", m)
+
+    if (
+        qt == "comparison"
+        and not grouping_cue
+        and not ranking_cue
+        and not parsed.get("_rank_within_time")
+    ):
+        parsed["entity"] = None
 
     if parsed.get("_force_clarification"):
         parsed["is_complete"] = False
@@ -1311,10 +1259,10 @@ def _post_process(
 
 # ── Qwen API call ─────────────────────────────────────────────────────────────
 
-def _call_qwen(user_query: str, schema: str) -> tuple[dict, dict]:
+def _call_parse_model(user_query: str, schema: str, model: str) -> tuple[dict, dict]:
     system = _SYSTEM_TEMPLATE.format(schema=schema)
     payload = {
-        "model": QWEN_MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user",   "content": user_query},
@@ -1323,7 +1271,7 @@ def _call_qwen(user_query: str, schema: str) -> tuple[dict, dict]:
         "temperature": 0.0,
     }
 
-    if QWEN_ENABLE_REASONING and "qwen" in QWEN_MODEL.lower() and QWEN_REASONING_EFFORT:
+    if QWEN_ENABLE_REASONING and "qwen" in model.lower() and QWEN_REASONING_EFFORT:
         payload["reasoning_effort"] = QWEN_REASONING_EFFORT
 
     headers = {
@@ -1351,20 +1299,45 @@ def _call_qwen(user_query: str, schema: str) -> tuple[dict, dict]:
         return json.loads(obj), data.get("usage", {})
 
 
-def _call_qwen_with_retry(user_query: str, schema: str) -> tuple[dict, dict]:
+def _is_rate_limit_error(exc: Exception) -> bool:
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return exc.response.status_code == 429
+    return "429" in str(exc)
+
+
+def _call_parse_with_retry_and_fallback(
+    user_query: str,
+    schema: str,
+) -> tuple[dict, dict, str]:
     attempts = max(1, int(PARSE_INTENT_MAX_RETRIES or 1))
     last_exc: Exception | None = None
+
     for attempt in range(1, attempts + 1):
         try:
-            return _call_qwen(user_query, schema)
+            parsed, usage = _call_parse_model(user_query, schema, QWEN_MODEL)
+            return parsed, usage, QWEN_MODEL
         except Exception as exc:
             last_exc = exc
             if attempt >= attempts:
                 break
-            time.sleep(min(0.5 * attempt, 1.5))
+            wait_sec = min((1.0 if _is_rate_limit_error(exc) else 0.5) * attempt, 3.0)
+            time.sleep(wait_sec)
+
+    fallback_model = (LLAMA_MODEL or "").strip()
+    if fallback_model and fallback_model != QWEN_MODEL:
+        for attempt in range(1, 3):
+            try:
+                parsed, usage = _call_parse_model(user_query, schema, fallback_model)
+                return parsed, usage, fallback_model
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2:
+                    wait_sec = 1.5 if _is_rate_limit_error(exc) else 0.8
+                    time.sleep(wait_sec)
+
     if last_exc:
         raise last_exc
-    raise RuntimeError("Qwen parse failed with unknown error")
+    raise RuntimeError("Parse intent failed with unknown error")
 
 
 # ── Handler ───────────────────────────────────────────────────────────────────
@@ -1387,37 +1360,27 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     else:
         ctx.logger.info("Qwen intent extraction", {"queryId": query_id, "query": user_query})
         try:
-            rule_first = _should_use_rule_first(user_query)
-            if rule_first:
-                candidate = _post_process(_fallback_parse(user_query), user_query, mandatory_filters)
-                if candidate.get("is_complete") and candidate.get("metric"):
-                    parsed = candidate
-                    parsed["_parser_source"] = "rule_based_primary"
-                    log_tokens(ctx, query_id, "ParseIntentRule", "rule_based", {})
-                    await add_tokens_to_state(ctx, query_id, "ParseIntentRule", "rule_based", {})
-                    ctx.logger.info("Intent parsed via rule-first path", {"queryId": query_id, "parsed": parsed})
-                else:
-                    schema = get_schema_prompt()
-                    parsed, usage = _call_qwen_with_retry(user_query, schema)
-                    parsed = _post_process(parsed, user_query, mandatory_filters)
-                    parsed["_parser_source"] = "qwen_llm"
-                    log_tokens(ctx, query_id, "ParseIntent", QWEN_MODEL, usage)
-                    await add_tokens_to_state(ctx, query_id, "ParseIntent", QWEN_MODEL, usage)
-                    ctx.logger.info("Intent parsed via Qwen after rule-first fallback", {"queryId": query_id, "parsed": parsed})
-            else:
-                schema = get_schema_prompt()
-                parsed, usage = _call_qwen_with_retry(user_query, schema)
-                parsed = _post_process(parsed, user_query, mandatory_filters)
-                parsed["_parser_source"] = "qwen_llm"
-                log_tokens(ctx, query_id, "ParseIntent", QWEN_MODEL, usage)
-                await add_tokens_to_state(ctx, query_id, "ParseIntent", QWEN_MODEL, usage)
-                ctx.logger.info("Intent parsed", {"queryId": query_id, "parsed": parsed})
+            schema = get_schema_prompt()
+            parsed, usage, model_used = _call_parse_with_retry_and_fallback(user_query, schema)
+            parsed = _post_process(parsed, user_query, mandatory_filters)
+            parsed["_parser_source"] = f"llm_{model_used.split('/')[-1]}"
+            log_tokens(ctx, query_id, "ParseIntent", model_used, usage)
+            await add_tokens_to_state(ctx, query_id, "ParseIntent", model_used, usage)
+            ctx.logger.info("Intent parsed", {"queryId": query_id, "parsed": parsed})
         except Exception as exc:
             ctx.logger.error("Intent parse failed", {"error": str(exc), "queryId": query_id})
-            parsed = _post_process(_fallback_parse(user_query), user_query, mandatory_filters)
-            parsed["_parser_source"] = "rule_based_fallback"
-            log_tokens(ctx, query_id, "ParseIntentFallback", "rule_based", {})
-            await add_tokens_to_state(ctx, query_id, "ParseIntentFallback", "rule_based", {})
+            qs = await ctx.state.get("queries", query_id)
+            if qs:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                prev_ts = qs.get("status_timestamps", {})
+                await ctx.state.set("queries", query_id, {
+                    **qs,
+                    "status": "error",
+                    "error": f"Parse intent model failed: {exc}",
+                    "updatedAt": now_iso,
+                    "status_timestamps": {**prev_ts, "error": now_iso},
+                })
+            return
 
     qs = await ctx.state.get("queries", query_id)
     if qs:
@@ -1433,3 +1396,4 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         "topic": "query::ambiguity.check",
         "data":  {"queryId": query_id, "query": user_query, "parsed": parsed},
     })
+

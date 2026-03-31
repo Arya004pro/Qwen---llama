@@ -373,16 +373,33 @@ def _bar(labels, values, metric, currency, entity, title, subtitle):
 def _token_summary(usage, totals):
     if not usage and not totals:
         return ""
+
+    def _is_llm_entry(e: dict) -> bool:
+        if "is_llm" in e:
+            return bool(e.get("is_llm"))
+        model = (e.get("model") or "").strip()
+        return model not in ("rule_based", "adaptive_rule")
+
     lines = ["\n\n Token Usage "]
+    llm_rows = 0
     for e in usage:
-        short = e.get("model", "").split("/")[-1]
+        short = (e.get("model", "") or "").split("/")[-1]
+        is_llm = _is_llm_entry(e)
+        if is_llm:
+            llm_rows += 1
+            prompt = f"{e.get('prompt_tokens', 0):>5}"
+            completion = f"{e.get('completion_tokens', 0):>4}"
+            total = f"{e.get('total_tokens', 0):>5}"
+        else:
+            prompt = f"{0:>5}"
+            completion = f"{0:>4}"
+            total = f"{0:>5}"
         lines.append(
             f"  {e.get('step','?'):<20} {short:<28} "
-            f"prompt={e.get('prompt_tokens',0):>5}  "
-            f"completion={e.get('completion_tokens',0):>4}  "
-            f"total={e.get('total_tokens',0):>5}"
+            f"prompt={prompt}  completion={completion}  total={total}"
         )
-    if totals:
+
+    if llm_rows > 0 and totals:
         lines.append("  " + "" * 70)
         lines.append(
             f"  {'TOTAL':<20} {'':28} "
@@ -390,6 +407,9 @@ def _token_summary(usage, totals):
             f"completion={totals.get('completion_tokens',0):>4}  "
             f"total={totals.get('total_tokens',0):>5}"
         )
+    elif llm_rows == 0:
+        lines.append("  LLM tokens: 0 (no LLM used)")
+
     return "\n".join(lines)
 
 
@@ -772,40 +792,86 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     elif is_scalar:
         v = results[0]["value"]
         period_str = _period_phrase if _period_phrase else f"between {start_date} and {end_date}"
-        val_s = _fmt_indian(v, p)
-        formatted_text = f"Total {mlabel} {period_str} is {val_s}"
-        items = [{"label": f"Total {mlabel}", "value": val_s}]
+        if parsed.get("_top_percent_share"):
+            try:
+                pct_in = float(parsed.get("_top_percent_share"))
+            except Exception:
+                pct_in = None
+            try:
+                share_val = float(v)
+                val_s = f"{share_val:.2f}%"
+            except Exception:
+                val_s = str(v)
+            top_lbl = f"top {pct_in:g}%" if isinstance(pct_in, float) else "top segment"
+            formatted_text = f"Revenue share of {top_lbl} {elabel} {period_str} is {val_s}"
+            items = [{"label": f"Share of {top_lbl}", "value": val_s}]
+        else:
+            val_s = _fmt_indian(v, p)
+            formatted_text = f"Total {mlabel} {period_str} is {val_s}"
+            items = [{"label": f"Total {mlabel}", "value": val_s}]
 
     #  GROWTH RANKING 
     elif has_delta:
         p1 = period_labels[0] if len(period_labels) > 0 else "Period 1"
         p2 = period_labels[1] if len(period_labels) > 1 else "Period 2"
-        direction = "highest" if qt != "bottom_n" else "lowest"
-        header = f" {elabel.title()} with {direction} {mlabel} growth ({p1}  {p2}):"
-        items = []
-        for i, row in enumerate(results, 1):
-            name = _display_entity_name(row.get("name", "?"), entity)
-            v1, v2, d = row.get("value1", 0), row.get("value2", 0), row.get("delta", 0)
-            sign  = "+" if d >= 0 else ""
-            pct   = (d / v1 * 100) if v1 != 0 else float("inf")
-            pct_s = f"{sign}{pct:.1f}%" if pct != float("inf") else "new entry"
-            header += (f"\n{i}. {name}"
-                       f"\n   {p1}: {_fmt_indian(v1, p)}"
-                       f"\n   {p2}: {_fmt_indian(v2, p)}"
-                       f"\n   Growth: {sign}{_fmt_indian(abs(d), p)} ({pct_s})")
-            items.append({"rank": i, "name": name, "delta": d})
-        insights = _insights_ranked(items, p)
-        insight_txt = ""
-        if insights:
-            insight_txt = "\n\nInsights:\n" + "\n".join(f"- {x}" for x in insights)
-        formatted_text = header + insight_txt + _token_summary(token_usage, token_totals)
-        names  = [_display_entity_name(r.get("name", "?"), entity) for r in results]
-        deltas = [r.get("delta", 0)   for r in results]
-        chart_config = _bar(
-            names, deltas, metric_display, currency, entity,
-            user_query or f"{elabel.title()} by {mlabel} growth: {p1}{p2}",
-            f"Delta in {mlabel} ({p1}  {p2})",
-        )
+        is_scalar_delta = (not entity) and len(results) == 1
+        if is_scalar_delta:
+            row = results[0]
+            v1 = row.get("value1", 0)
+            v2 = row.get("value2", 0)
+            d = row.get("delta", 0)
+            sign = "+" if d >= 0 else ""
+            pct = (d / v1 * 100) if v1 != 0 else float("inf")
+            pct_s = f"{sign}{pct:.1f}%" if pct != float("inf") else "new"
+
+            lines = [
+                f"{mlabel} comparison: {p1} vs {p2}",
+                f"- {p1}: {_fmt_indian(v1, p)}",
+                f"- {p2}: {_fmt_indian(v2, p)}",
+                f"- Change: {sign}{_fmt_indian(abs(d), p)} ({pct_s})",
+            ]
+            formatted_text = "\n".join(lines) + _token_summary(token_usage, token_totals)
+            items = [{
+                f"{p1}_value": _fmt(v1, p),
+                f"{p2}_value": _fmt(v2, p),
+                "delta": _delta_str(v1, v2, p),
+            }]
+            chart_config = _bar(
+                [p1, p2],
+                [v1 or 0, v2 or 0],
+                metric_display,
+                currency,
+                "period",
+                user_query or f"{mlabel} comparison",
+                f"{p1} vs {p2}",
+            )
+        else:
+            direction = "highest" if qt != "bottom_n" else "lowest"
+            header = f" {elabel.title()} with {direction} {mlabel} growth ({p1}  {p2}):"
+            items = []
+            for i, row in enumerate(results, 1):
+                name = _display_entity_name(row.get("name", "?"), entity)
+                v1, v2, d = row.get("value1", 0), row.get("value2", 0), row.get("delta", 0)
+                sign  = "+" if d >= 0 else ""
+                pct   = (d / v1 * 100) if v1 != 0 else float("inf")
+                pct_s = f"{sign}{pct:.1f}%" if pct != float("inf") else "new entry"
+                header += (f"\n{i}. {name}"
+                           f"\n   {p1}: {_fmt_indian(v1, p)}"
+                           f"\n   {p2}: {_fmt_indian(v2, p)}"
+                           f"\n   Growth: {sign}{_fmt_indian(abs(d), p)} ({pct_s})")
+                items.append({"rank": i, "name": name, "delta": d})
+            insights = _insights_ranked(items, p)
+            insight_txt = ""
+            if insights:
+                insight_txt = "\n\nInsights:\n" + "\n".join(f"- {x}" for x in insights)
+            formatted_text = header + insight_txt + _token_summary(token_usage, token_totals)
+            names  = [_display_entity_name(r.get("name", "?"), entity) for r in results]
+            deltas = [r.get("delta", 0)   for r in results]
+            chart_config = _bar(
+                names, deltas, metric_display, currency, entity,
+                user_query or f"{elabel.title()} by {mlabel} growth: {p1}{p2}",
+                f"Delta in {mlabel} ({p1}  {p2})",
+            )
 
     #  COMPARISON 
     elif has_value2:

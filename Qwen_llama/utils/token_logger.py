@@ -31,12 +31,14 @@ def _build_entry(step: str, model: str, usage: dict) -> dict:
     prompt     = _safe_int(usage.get("prompt_tokens"))
     completion = _safe_int(usage.get("completion_tokens"))
     total      = _safe_int(usage.get("total_tokens")) or prompt + completion
+    is_llm     = model not in ("rule_based", "adaptive_rule")
     return {
         "step":             step,
         "model":            model,
         "prompt_tokens":    prompt,
         "completion_tokens":completion,
         "total_tokens":     total,
+        "is_llm":           is_llm,
     }
 
 

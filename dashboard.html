@@ -654,16 +654,27 @@ function renderTokens(usage, totals) {
   if (!usage || usage.length === 0) return;
   document.getElementById('detail-grid').classList.add('show');
   let html = '';
+  let llmRows = 0;
   usage.forEach(e => {
     const model = (e.model || '').split('/').pop().replace(/-instant$/, '');
+    const isLlm = (typeof e.is_llm === 'boolean')
+      ? e.is_llm
+      : !['rule_based', 'adaptive_rule'].includes((e.model || '').trim());
+    if (isLlm) llmRows += 1;
+    const totalVal = isLlm ? (e.total_tokens || 0).toLocaleString() : 'N/A';
     html += `<div class="token-row">
       <span class="lbl">${e.step}<br>
         <span style="font-size:10px;color:#475569">${model}</span>
       </span>
-      <span class="val">${(e.total_tokens || 0).toLocaleString()}</span>
+      <span class="val">${totalVal}</span>
     </div>`;
   });
-  if (totals && totals.total_tokens) {
+  if (llmRows === 0) {
+    html += `<div class="token-row token-total" style="margin-top:6px;padding-top:8px;border-top:1px solid var(--border)">
+      <span class="lbl">LLM tokens</span>
+      <span class="val">N/A (no LLM used)</span>
+    </div>`;
+  } else if (totals && totals.total_tokens) {
     html += `<div class="token-row token-total" style="margin-top:6px;padding-top:8px;border-top:1px solid var(--border)">
       <span class="lbl">Total</span>
       <span class="val">${totals.total_tokens.toLocaleString()}</span>
