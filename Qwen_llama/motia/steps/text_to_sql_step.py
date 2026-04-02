@@ -428,7 +428,7 @@ def _build_llm_prompt(user_query: str, parsed: dict, schema: str) -> str:
             f"Output columns must be: period, name, value.\n"
             f"ORDER BY period ASC, value {'DESC' if qt != 'bottom_n' else 'ASC'}."
         )
-    elif qt == "time_series":
+    elif qt in ("time_series", "forecast"):
         ts_hint    = _build_time_series_sql_hint(parsed)
         rank_instr = (
             f"This is a TIME SERIES / TREND query.\n"
@@ -516,7 +516,7 @@ Parsed intent:
   metric     : {metric}
     aov_numerator_col: {aov_revenue_col or 'N/A'}
     count_distinct_key: {count_key or 'N/A'}
-    time_bucket: {bucket if (qt == 'time_series' or rank_within_time) else 'N/A'}
+    time_bucket: {bucket if (qt in ('time_series', 'forecast') or rank_within_time) else 'N/A'}
   top_n      : {top_n}
     disable_limit: {disable_limit}
   filters    : {filter_desc}{date_hints}
@@ -1564,7 +1564,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     # ── Registry fallback — no longer used (registry is empty) ──────────────────
 
     # ── Deterministic time-series fallback (any schema) ────────────────────────
-    if generated_sql is None and qt == "time_series":
+    if generated_sql is None and qt in ("time_series", "forecast"):
         fb = _deterministic_time_series_fallback(parsed)
         if fb:
             generated_sql = fb

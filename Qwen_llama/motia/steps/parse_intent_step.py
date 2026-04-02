@@ -70,8 +70,10 @@ JSON schema (all fields required):
 {{
   "entity":       string or null,
   "metric":       string (semantic metric or physical column; resolver will map to real column),
-  "query_type":   one of [top_n, bottom_n, aggregate, threshold, comparison, growth_ranking, intersection, zero_filter, time_series],
-  "time_bucket":  one of [month, week, quarter, day] or null  (ONLY for time_series queries),
+    "query_type":   one of [top_n, bottom_n, aggregate, threshold, comparison, growth_ranking, intersection, zero_filter, time_series, forecast],
+    "time_bucket":  one of [month, week, quarter, year, day] or null  (for time_series/forecast queries),
+    "forecast_periods": integer (default 3),
+    "forecast_method": one of [auto, holt, linear, sma] or null,
   "top_n":        integer (default 5; use 1 for "highest/best/worst/which single entity"),
   "time_ranges":  array of {{start:YYYY-MM-DD, end:YYYY-MM-DD, label:string}},
   "threshold":    {{value:number, type:absolute|percentage, operator:gt|lt}} or null,
@@ -90,9 +92,20 @@ TIME SERIES RULES (CRITICAL):
     "month-wise revenue", "monthly trend", "weekly sales", "quarterly earnings",
     "how did revenue change over time", "revenue by month", "per month breakdown"
 - For time_series: entity MUST be null.
-- For time_series: set time_bucket to: month | week | quarter | day
+- For time_series: set time_bucket to: month | week | quarter | year | day
 - For time_series: is_complete=true as long as metric and time_ranges are known.
 - NEVER ask for a business dimension for time_series queries.
+
+FORECAST RULES (CRITICAL):
+- Use query_type=forecast when user asks to PREDICT or PROJECT future values:
+    "forecast next 3 months", "predict revenue for next quarter",
+    "project sales for next year", "what will revenue be next month",
+    "expected earnings next 6 months", "future trend"
+- For forecast: entity MUST be null (same as time_series).
+- For forecast: set time_bucket to: month | week | quarter | year | day
+- For forecast: set forecast_periods to requested future periods (default 3).
+- For forecast: is_complete=true as long as metric and time_ranges are known.
+- forecast_method: use "auto" unless user explicitly asks for linear/smoothing/average.
 
 ENTITY RULES:
 - entity = the DISPLAY column to show in results — ALWAYS use the human-readable
@@ -134,6 +147,7 @@ BUSINESS FILTER RULES — CRITICAL for accuracy:
 COMPLETENESS RULES:
 - query_type=aggregate + metric known + time_ranges known → is_complete=true
 - query_type=time_series + metric known + time_ranges known → is_complete=true (NO entity needed)
+- query_type=forecast + metric known + time_ranges known → is_complete=true (NO entity needed)
 - query_type=top_n/bottom_n + entity unknown → is_complete=false, ask for entity
 - Any query_type + time_ranges empty → is_complete=false, ask for time period
 - NEVER ask for entity when query_type=aggregate or time_series. NEVER.
@@ -143,6 +157,7 @@ QUERY TYPE RULES:
 - bottom_n      → lowest N values
 - aggregate     → single scalar total/average/count (no grouping)
 - time_series   → metric grouped by time bucket — trend queries
+- forecast      → future projection using historical time-bucket series
 - threshold     → HAVING filter by absolute value or % of total
 - comparison    → two periods side-by-side with delta
 - growth_ranking→ rank entities BY growth delta between two periods
@@ -172,6 +187,11 @@ _TREND_KEYWORDS = {
     "revenue trend", "fare trend", "earnings trend", "how did", "how has",
     "yearly", "year-wise", "per year", "annual", "annually", "by year",
     "year over year", "yoy", "each year", "every year", "year-on-year",
+}
+_FORECAST_KEYWORDS = {
+    "forecast", "predict", "projection", "project", "next month", "next quarter",
+    "next year", "next 3 months", "next 6 months", "future", "anticipated",
+    "expected revenue", "expected sales", "will be", "going to be",
 }
 _ALL_TIME_YEARLY_HINTS = {
     "each year", "every year", "yearly", "annual", "annually",
@@ -723,7 +743,7 @@ def _is_aov_intent(query: str) -> bool:
 
 def _default_clarification(parsed: dict) -> str:
     qt = parsed.get("query_type", "top_n")
-    if qt in ("aggregate", "time_series"):
+    if qt in ("aggregate", "time_series", "forecast"):
         return "What time period should I use? (e.g. 2024, Q1 2024, March 2024)"
     if not parsed.get("entity"):
         return "Which dimension should I group by? (e.g. customer, product, region, channel, category)"
@@ -753,6 +773,66 @@ def _detect_time_bucket(query: str) -> str:
 def _is_trend_query(query: str) -> bool:
     q = query.lower()
     return any(kw in q for kw in _TREND_KEYWORDS)
+
+
+def _is_forecast_query(query: str) -> bool:
+    q = (query or "").lower()
+    return any(kw in q for kw in _FORECAST_KEYWORDS)
+
+
+def _detect_forecast_bucket(query: str) -> str:
+    q = (query or "").lower()
+    if any(x in q for x in ["month", "monthly", "month-wise", "by month", "per month"]):
+        return "month"
+    if any(x in q for x in ["quarter", "q1", "q2", "q3", "q4", "quarterly"]):
+        return "quarter"
+    if any(x in q for x in ["week", "weekly", "week-wise", "per week"]):
+        return "week"
+    if any(x in q for x in ["day", "daily", "day-wise", "per day"]):
+        return "day"
+    # For forecast phrasing, "next year" usually implies monthly projections.
+    if "next year" in q:
+        return "month"
+    if any(x in q for x in ["per year", "by year", "each year", "yearly", "year-wise", "annual", "annually"]):
+        return "year"
+    return _detect_time_bucket(query)
+
+
+def _extract_forecast_periods(query: str, bucket: str = "month") -> int:
+    q = (query or "").lower()
+    m = re.search(r"next\s+(\d+)\s*(month|quarter|year|week|day)", q)
+    if m:
+        try:
+            n = int(m.group(1))
+            unit = m.group(2)
+            if bucket == "month" and unit == "year":
+                return n * 12
+            if bucket == "quarter" and unit == "year":
+                return n * 4
+            if bucket == "week" and unit == "year":
+                return n * 52
+            if bucket == "day" and unit == "year":
+                return n * 365
+            if bucket == "month" and unit == "quarter":
+                return n * 3
+            return n
+        except Exception:
+            return 3
+    if "next month" in q:
+        return 1
+    if "next quarter" in q:
+        return 3 if bucket == "month" else 1
+    if "next year" in q:
+        if bucket == "month":
+            return 12
+        if bucket == "quarter":
+            return 4
+        if bucket == "week":
+            return 52
+        if bucket == "day":
+            return 365
+        return 1
+    return 3
 
 
 def _infer_rank_within_time_bucket(query: str) -> str | None:
@@ -1086,10 +1166,19 @@ def _post_process(
             if inferred_entity:
                 parsed["entity"] = inferred_entity
 
+    if _is_forecast_query(user_query) and not ranking_cue:
+        parsed["query_type"] = "forecast"
+        parsed["entity"] = None
+        parsed["time_bucket"] = _detect_forecast_bucket(user_query)
+        parsed["forecast_periods"] = _extract_forecast_periods(user_query, parsed["time_bucket"])
+        if not parsed.get("forecast_method"):
+            parsed["forecast_method"] = "auto"
+        qt = "forecast"
+
     if (
         _is_trend_query(user_query)
         and not ranking_cue
-        and qt not in ("time_series",)
+        and qt not in ("time_series", "forecast")
         and not (split_cue and parsed.get("entity"))
     ):
         parsed["query_type"] = "time_series"
@@ -1111,6 +1200,15 @@ def _post_process(
 
     if qt == "time_series" and not parsed.get("time_bucket"):
         parsed["time_bucket"] = _detect_time_bucket(user_query)
+
+    if qt == "forecast":
+        parsed["entity"] = None
+        if not parsed.get("time_bucket"):
+            parsed["time_bucket"] = _detect_forecast_bucket(user_query)
+        if not parsed.get("forecast_periods"):
+            parsed["forecast_periods"] = _extract_forecast_periods(user_query, parsed.get("time_bucket", "month"))
+        if not parsed.get("forecast_method"):
+            parsed["forecast_method"] = "auto"
 
     if not tr and user_query:
         extracted, suggested_qt = parse_time_ranges_from_query(user_query)
@@ -1220,7 +1318,7 @@ def _post_process(
             )
             return parsed
 
-    if qt in ("aggregate", "time_series") and m and tr:
+    if qt in ("aggregate", "time_series", "forecast") and m and tr:
         parsed["is_complete"]            = True
         parsed["clarification_question"] = None
     if qt in ("comparison", "intersection"):

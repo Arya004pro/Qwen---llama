@@ -49,6 +49,7 @@ STATUS_MAP = {
     "schema_mapped":       3,
     "sql_generated":       3,
     "executed":            4,
+    "forecast_computed":   4,
     "completed":           5,
     "error":               5,
 }
@@ -58,7 +59,7 @@ STEP_STATUS_OPTIONS = {
     1: ["intent_parsed"],
     2: ["ambiguity_checked", "needs_clarification"],
     3: ["sql_generated", "schema_mapped"],
-    4: ["executed"],
+    4: ["executed", "forecast_computed"],
     5: ["completed", "error"],
 }
 

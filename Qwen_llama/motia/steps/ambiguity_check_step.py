@@ -211,6 +211,15 @@ def _is_actually_complete(parsed: dict) -> tuple[bool, str | None]:
             )
         return True, None
 
+    if qt == "forecast":
+        if m and tr:
+            return True, None
+        if not tr:
+            return False, "What historical period should I use to train the forecast? (e.g. all of 2024, last 2 years)"
+        if not m:
+            return False, f"What metric should I forecast? ({_live_metric_examples()})"
+        return True, None
+
     # ── aggregate ─────────────────────────────────────────────────────────────
     if qt == "aggregate":
         if m and tr:

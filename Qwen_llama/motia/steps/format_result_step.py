@@ -734,6 +734,50 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
                 bucket,
             )
 
+    #  FORECAST 
+    elif qt == "forecast":
+        fr = parsed.get("_forecast_result", {})
+        hist_labels = fr.get("hist_labels", [])
+        hist_values = fr.get("hist_values", [])
+        fc_labels   = fr.get("fc_labels", [])
+        fc_values   = fr.get("fc_values", [])
+        fc_lower    = fr.get("fc_lower", [])
+        fc_upper    = fr.get("fc_upper", [])
+        method      = fr.get("method", "auto")
+        trend_pct   = fr.get("trend_pct", 0.0)
+        rmse        = fr.get("rmse", 0.0)
+        conf        = fr.get("confidence_pct", 80.0)
+        periods     = fr.get("periods", 3)
+
+        if start_date and end_date:
+            training_str = f"training: {start_date} to {end_date}"
+        elif _period_phrase:
+            training_str = f"training: {_period_phrase.replace('in ', '')}"
+        else:
+            training_str = "training: selected historical period"
+        header = f"{mlabel} Forecast - next {periods} {bucket}(s) ({training_str})"
+
+        lines = [header, ""]
+        lines.append(f"Historical points: {len(hist_labels)}")
+        lines.append(f"Method: {str(method).capitalize()}, Trend: {'UP' if float(trend_pct or 0) >= 0 else 'DOWN'} {abs(float(trend_pct or 0)):.1f}%/period")
+        lines.append(f"Confidence band: {int(float(conf or 80))}%  |  RMSE: {_fmt_indian(rmse, p)}")
+        lines.append("")
+        lines.append("Projected values:")
+        for lbl, val, lo, hi in zip(fc_labels, fc_values, fc_lower, fc_upper):
+            lines.append(f"  {lbl:<14}  {_fmt_indian(val, p):>16}  [{_fmt_indian(lo, p)} - {_fmt_indian(hi, p)}]")
+
+        items = [{
+            "period": lbl,
+            "value": _fmt_indian(v, p),
+            "raw_value": v,
+            "lower": _fmt_indian(lo, p),
+            "upper": _fmt_indian(hi, p),
+            "is_forecast": True,
+        } for lbl, v, lo, hi in zip(fc_labels, fc_values, fc_lower, fc_upper)]
+
+        formatted_text = "\n".join(lines) + _token_summary(token_usage, token_totals)
+        chart_config = (qs or {}).get("chart_config") or input_data.get("_chart_config")
+
     #  RANKED WITHIN TIME BUCKET 
     elif is_rank_within_time:
         period_str = _period_phrase if _period_phrase else f"between {start_date} and {end_date}"

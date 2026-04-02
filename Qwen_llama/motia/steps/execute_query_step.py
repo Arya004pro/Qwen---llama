@@ -36,7 +36,7 @@ config = {
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::execute")],
-    "enqueues": ["query::detect.anomalies"],
+    "enqueues": ["query::forecast", "query::detect.anomalies"],
 }
 
 # ── Datetime column hints ──────────────────────────────────────────────────────
@@ -639,7 +639,9 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     start_date    = trs[0]["start"] if trs else ""
     end_date      = trs[-1]["end"]  if trs else ""
 
-    await ctx.enqueue({"topic": "query::detect.anomalies", "data": {
+    next_topic = "query::forecast" if qt == "forecast" else "query::detect.anomalies"
+
+    await ctx.enqueue({"topic": next_topic, "data": {
         "queryId":       query_id,
         "query":         user_query,
         "parsed":        parsed,
