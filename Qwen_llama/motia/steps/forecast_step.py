@@ -30,10 +30,10 @@ from motia import FlowContext, queue
 from utils.forecaster import forecast_auto, forecast, ForecastResult
 
 config = {
-    "name": "Forecast",
+    "name": "ForecastProjection",
     "description": (
-        "Applies Holt/linear/SMA forecasting to historical time-bucket results. "
-        "Enriches results with projected values and confidence intervals."
+        "Projects future time-bucket values from historical results. "
+        "Supports auto/linear/holt/sma with confidence intervals."
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::forecast")],

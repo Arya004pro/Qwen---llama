@@ -12,15 +12,29 @@ Changes vs original:
   - FIX: _post_process top_n inflated to 20 for vs-queries now handled gracefully.
 """
 
+import os
+import sys
 import re
+import json
 from typing import Any
+import requests
 from motia import FlowContext, queue
 
+_STEPS_DIR = os.path.dirname(os.path.abspath(__file__))
+_MOTIA_DIR = os.path.dirname(_STEPS_DIR)
+_PROJECT_ROOT = os.path.dirname(_MOTIA_DIR)
+for _p in (_STEPS_DIR, _MOTIA_DIR, _PROJECT_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from shared_config import GROQ_API_TOKEN, GROQ_URL, INSIGHTS_MODEL
+from utils.token_logger import log_tokens, add_tokens_to_state, calc_max_tokens
+
 config = {
-    "name": "FormatResult",
+    "name": "ResponseFormatter",
     "description": (
-        "Formats any result shape into user-facing text and Chart.js config. "
-        "Time-series queries render as line charts with human-readable bucket labels."
+        "Builds final user response text, summary tables, and chart configuration. "
+        "Supports scalar, ranking, comparison, trend, and forecast outputs."
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::format.result")],
@@ -41,6 +55,8 @@ _MONTH_ABBR = {
     "05": "May", "06": "Jun", "07": "Jul", "08": "Aug",
     "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec",
 }
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
 def _format_bucket_label(raw_label: str, bucket: str) -> str:
@@ -602,6 +618,80 @@ def _inject_ai_insights(formatted_text: str, insights: list[str]) -> str:
     return formatted_text + block
 
 
+def _compress_rows(rows: list[dict[str, Any]], limit: int = 12) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    if len(rows) <= limit:
+        return rows
+    head = max(3, limit // 2)
+    tail = max(3, limit - head)
+    return rows[:head] + rows[-tail:]
+
+
+def _should_skip_ai_insights(parsed: dict[str, Any], rows: list[dict[str, Any]], anomalies: dict[str, Any]) -> bool:
+    if not rows:
+        return True
+    if len(rows) < 3:
+        return True
+    qt = (parsed or {}).get("query_type", "")
+    has_anomalies = bool((anomalies or {}).get("items"))
+    if has_anomalies:
+        return False
+    if len(rows) == 1 and isinstance(rows[0], dict) and "name" not in rows[0]:
+        return True
+    if qt in ("aggregate", "time_series", "forecast") and len(rows) <= 3:
+        return True
+    return False
+
+
+def _call_ai_insights(user_query: str, parsed: dict[str, Any], rows: list[dict[str, Any]], anomalies: dict[str, Any]) -> tuple[list[str], dict]:
+    if not GROQ_API_TOKEN:
+        return [], {}
+
+    compact_rows = _compress_rows(rows, limit=12)
+    anomaly_items = (anomalies or {}).get("items", [])[:5]
+    prompt = (
+        "Return ONLY JSON: {\"insights\":[\"...\",\"...\"]}. "
+        "Write 2-3 concise business insights; use anomaly signals when present; avoid invented causality.\n"
+        f"User query: {user_query}\n"
+        f"Parsed intent: {json.dumps(parsed, ensure_ascii=False)}\n"
+        f"Sample rows: {json.dumps(compact_rows, ensure_ascii=False)}\n"
+        f"Anomalies: {json.dumps(anomaly_items, ensure_ascii=False)}\n"
+    )
+    messages = [{"role": "user", "content": prompt}]
+
+    resp = requests.post(
+        GROQ_URL,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": INSIGHTS_MODEL,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": calc_max_tokens(messages, task="insights", model=INSIGHTS_MODEL),
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    usage = data.get("usage", {})
+    raw = (data["choices"][0]["message"]["content"] or "").strip()
+    raw = _THINK_RE.sub("", raw).strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```$", "", raw).strip()
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not m:
+            return [], usage
+        obj = json.loads(m.group(0))
+    lines = [str(x).strip() for x in (obj.get("insights") or []) if str(x).strip()]
+    return lines[:3], usage
+
+
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     import datetime as _dt
 
@@ -645,6 +735,29 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     token_usage  = (qs or {}).get("token_usage", [])
     token_totals = (qs or {}).get("token_totals", {})
     chart_config = None
+
+    if not auto_insights:
+        if _should_skip_ai_insights(parsed, results, anomalies):
+            ctx.logger.info("AI insights skipped in formatter", {
+                "queryId": query_id,
+                "rows": len(results),
+                "query_type": parsed.get("query_type"),
+            })
+        else:
+            try:
+                ai_insights, usage = _call_ai_insights(user_query, parsed, results, anomalies)
+                auto_insights = ai_insights
+                if usage:
+                    log_tokens(ctx, query_id, "GenerateInsights", INSIGHTS_MODEL, usage)
+                    await add_tokens_to_state(ctx, query_id, "GenerateInsights", INSIGHTS_MODEL, usage)
+                    qs = await ctx.state.get("queries", query_id)
+                    token_usage = (qs or {}).get("token_usage", token_usage)
+                    token_totals = (qs or {}).get("token_totals", token_totals)
+            except Exception as exc:
+                ctx.logger.warn("Formatter AI insights failed; continuing", {
+                    "queryId": query_id,
+                    "error": str(exc),
+                })
 
     ctx.logger.info(" Formatting", {"queryId": query_id, "query_type": qt, "rows": len(results)})
 
@@ -1044,6 +1157,6 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             "token_totals":   token_totals,
             "completedAt":    now_iso,
             "updatedAt":      now_iso,
-            "status_timestamps": {**prev_ts, "completed": now_iso},
+            "status_timestamps": {**prev_ts, "insights_generated": now_iso, "completed": now_iso},
         })
     ctx.logger.info(" Pipeline complete!", {"queryId": query_id})

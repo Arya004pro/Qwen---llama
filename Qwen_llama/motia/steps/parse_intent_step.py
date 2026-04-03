@@ -36,144 +36,47 @@ from shared_config import (
     QWEN_REASONING_EFFORT,
     PARSE_INTENT_MAX_RETRIES,
 )
-from utils.token_logger import log_tokens, add_tokens_to_state
+from utils.token_logger import log_tokens, add_tokens_to_state, calc_max_tokens
 from utils.time_parser import parse_time_ranges_from_query
 from db.schema_context import get_schema_prompt
 from db.duckdb_connection import get_read_connection
 from db.semantic_layer import resolve_intent_with_semantic_layer
 
 config = {
-    "name": "ParseIntent",
+    "name": "IntentParser",
     "description": (
-        "Qwen extracts full structured intent JSON from any dataset. "
+        "Parses natural language into structured analytics intent JSON. "
         "Schema injected live — no hardcoded column/domain names. "
         "Fallback parser uses live schema for entity/metric detection. "
-        "Supports time_series queries and auto-injects mandatory business filters."
+        "Supports trend and forecast intents with mandatory business filters."
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::intent.parse")],
-    "enqueues": ["query::ambiguity.check"],
+    "enqueues": ["query::text.to.sql"],
 }
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 # NOTE: Metric rules no longer hardcode specific column names.
 # The LLM is told to read the "Metric column mappings" section from the
 # injected schema, which is built dynamically from the live DB.
-_SYSTEM_TEMPLATE = """You are an analytics query parser for business data stored in a database.
+_SYSTEM_TEMPLATE = """You are an analytics intent parser. Return ONLY valid JSON.
 
-The database has the following schema:
+Schema:
 {schema}
 
-Your job: extract the user's query intent and return ONLY valid JSON — no prose, no markdown fences.
+Output schema (all fields required):
+{{"entity":string|null,"metric":string,"query_type":one of [top_n,bottom_n,aggregate,threshold,comparison,growth_ranking,intersection,zero_filter,time_series,forecast],"time_bucket":one of [month,week,quarter,year,day]|null,"forecast_periods":integer(default 3),"forecast_method":one of [auto,holt,linear,sma]|null,"top_n":integer(default 5),"time_ranges":[{{"start":"YYYY-MM-DD","end":"YYYY-MM-DD","label":string}}],"threshold":{{"value":number,"type":absolute|percentage,"operator":gt|lt}}|null,"filters":object,"is_complete":boolean,"clarification_question":string|null}}
 
-JSON schema (all fields required):
-{{
-  "entity":       string or null,
-  "metric":       string (semantic metric or physical column; resolver will map to real column),
-    "query_type":   one of [top_n, bottom_n, aggregate, threshold, comparison, growth_ranking, intersection, zero_filter, time_series, forecast],
-    "time_bucket":  one of [month, week, quarter, year, day] or null  (for time_series/forecast queries),
-    "forecast_periods": integer (default 3),
-    "forecast_method": one of [auto, holt, linear, sma] or null,
-  "top_n":        integer (default 5; use 1 for "highest/best/worst/which single entity"),
-  "time_ranges":  array of {{start:YYYY-MM-DD, end:YYYY-MM-DD, label:string}},
-  "threshold":    {{value:number, type:absolute|percentage, operator:gt|lt}} or null,
-  "filters":      object of key-value pairs for any WHERE conditions mentioned,
-  "is_complete":  true or false,
-  "clarification_question": null or a single short question string
-}}
-
-SEMANTIC LAYER RULES (FOUNDATION):
-- The schema includes a Semantic Layer section with Dimensions and Metrics.
-- Prefer semantic business terms first; post-processing resolves them to physical columns.
-- Output the semantic entity/metric name that best matches user intent.
-
-TIME SERIES RULES (CRITICAL):
-- Use query_type=time_series when the user asks for a TREND or TIME-BUCKETED breakdown:
-    "month-wise revenue", "monthly trend", "weekly sales", "quarterly earnings",
-    "how did revenue change over time", "revenue by month", "per month breakdown"
-- For time_series: entity MUST be null.
-- For time_series: set time_bucket to: month | week | quarter | year | day
-- For time_series: is_complete=true as long as metric and time_ranges are known.
-- NEVER ask for a business dimension for time_series queries.
-
-FORECAST RULES (CRITICAL):
-- Use query_type=forecast when user asks to PREDICT or PROJECT future values:
-    "forecast next 3 months", "predict revenue for next quarter",
-    "project sales for next year", "what will revenue be next month",
-    "expected earnings next 6 months", "future trend"
-- For forecast: entity MUST be null (same as time_series).
-- For forecast: set time_bucket to: month | week | quarter | year | day
-- For forecast: set forecast_periods to requested future periods (default 3).
-- For forecast: is_complete=true as long as metric and time_ranges are known.
-- forecast_method: use "auto" unless user explicitly asks for linear/smoothing/average.
-
-ENTITY RULES:
-- entity = the DISPLAY column to show in results — ALWAYS use the human-readable
-  NAME column, NEVER a raw ID column.
-    Good: customer_name, product_name, category_name, city, segment_name
-    Bad:  customer_id, product_id, record_id, transaction_id
-- For query_type=aggregate or time_series: entity MUST be null.
-- If the user names a specific filter value (e.g. "in Mumbai"), put it in
-  filters: {{column_name: value}} — do NOT use it as entity.
-
-METRIC RULES — read the "Metric column mappings" section from the schema above:
-- Use those exact physical column names for metric selection.
-- For "revenue", "sales", "earnings": prefer the post-discount / final amount column
-  (highest specificity — read the schema to find it).
-- For "average order value" / "AOV": set metric="aov".
-    SQL generation will compute: SUM(revenue_column) / COUNT(DISTINCT order_identifier).
-- For "average order value", "average fare", "avg X": metric = "avg_<column>"
-  (signals SQL generation to use AVG not SUM).
-- For "rides", "trips", "bookings", "orders", "count of", "number of", "how many":
-  metric = "count"
-  IMPORTANT: use COUNT(DISTINCT <order_id_column>) NOT COUNT(*).
-- For "repeat/returning buyers/customers/users/drivers/stores":
-  metric = "count", query_type = "aggregate", entity = null.
-  This means "count of entities with >= 2 events in the selected period",
-  not total orders.
-- For "contribution/share of top X% <entities>":
-  this is NOT top-N rows. Treat as top-percent share analytics.
-  Keep entity dimension, and attach top-percent intent (X).
-  SQL should compute share = (sum(metric for top X% ranked entities) / sum(metric for all entities)) * 100.
-- For "quantity", "units sold", "items": use the quantity column from the schema.
-- When in doubt: pick the primary revenue/amount column from the schema.
-
-BUSINESS FILTER RULES — CRITICAL for accuracy:
-- If the schema has an is_cancelled column, always include: filters: {{"is_cancelled": 0}}
-- If the schema has is_deleted, cancelled, is_refunded: add them to filters.
-- If there is a status/order_status column, set filters to keep only completed rows.
-- These filters are MANDATORY — without them revenue figures will be inflated.
-
-COMPLETENESS RULES:
-- query_type=aggregate + metric known + time_ranges known → is_complete=true
-- query_type=time_series + metric known + time_ranges known → is_complete=true (NO entity needed)
-- query_type=forecast + metric known + time_ranges known → is_complete=true (NO entity needed)
-- query_type=top_n/bottom_n + entity unknown → is_complete=false, ask for entity
-- Any query_type + time_ranges empty → is_complete=false, ask for time period
-- NEVER ask for entity when query_type=aggregate or time_series. NEVER.
-
-QUERY TYPE RULES:
-- top_n         → highest N values for a grouped entity
-- bottom_n      → lowest N values
-- aggregate     → single scalar total/average/count (no grouping)
-- time_series   → metric grouped by time bucket — trend queries
-- forecast      → future projection using historical time-bucket series
-- threshold     → HAVING filter by absolute value or % of total
-- comparison    → two periods side-by-side with delta
-- growth_ranking→ rank entities BY growth delta between two periods
-- intersection  → entities present in BOTH of two periods
-- zero_filter   → entities with zero activity in period
-
-TIME RANGES:
-- Single period → 1 entry. Two-period queries → 2 entries.
-- Year-only: start=YYYY-01-01, end=YYYY-12-31
-- Quarter Q1 2024: start=2024-01-01, end=2024-03-31
-- Month March 2024: start=2024-03-01, end=2024-03-31
-- Relative: "this month", "last month", "this year", "last year", "last 30 days"
-- YoY queries produce two time ranges.
-
-clarification_question: ask ONLY the single most critical missing field.
-For aggregate and time_series queries, NEVER ask about entity.
+Rules:
+1) Use semantic terms from Semantic Layer/Metric mappings; resolver maps later.
+2) entity is display/name column only; never raw IDs.
+3) aggregate/time_series/forecast => entity must be null.
+4) time_series for trend/by-time asks; set time_bucket and mark complete when metric+time_ranges exist.
+5) forecast for predict/project/future asks; set time_bucket, forecast_periods (requested else 3), forecast_method=auto unless explicit.
+6) count asks => metric=count with COUNT(DISTINCT order-like id); AOV => metric=aov; avg asks => avg_<column>.
+7) Inject mandatory validity filters from schema (is_cancelled/is_deleted/is_refunded/status completed etc).
+8) Completeness: ranked queries need entity+time_ranges; aggregate/time_series/forecast need metric+time_ranges; ask one critical clarification only.
+9) Time ranges: parse absolute/relative periods; use full boundaries (year/quarter/month) and two ranges for comparison/YoY.
 """
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -1359,13 +1262,14 @@ def _post_process(
 
 def _call_parse_model(user_query: str, schema: str, model: str) -> tuple[dict, dict]:
     system = _SYSTEM_TEMPLATE.format(schema=schema)
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_query},
+    ]
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user_query},
-        ],
-        "max_tokens": 700,
+        "messages": messages,
+        "max_tokens": calc_max_tokens(messages, task="parse_intent", model=model),
         "temperature": 0.0,
     }
 
@@ -1438,6 +1342,53 @@ def _call_parse_with_retry_and_fallback(
     raise RuntimeError("Parse intent failed with unknown error")
 
 
+def _period_key(period: dict | None) -> tuple[str, str]:
+    period = period or {}
+    return (str(period.get("start") or ""), str(period.get("end") or ""))
+
+
+def _check_clarity(parsed: dict) -> tuple[bool, str | None]:
+    """Inline completeness/clarity gate merged into parse step."""
+    qt = parsed.get("query_type", "top_n")
+    tr = parsed.get("time_ranges", [])
+    m = parsed.get("metric")
+    ent = parsed.get("entity")
+    cq = parsed.get("clarification_question")
+
+    if parsed.get("_force_clarification") and cq:
+        return False, str(cq)
+
+    if (m or "").lower() == "aov":
+        if not parsed.get("_aov_revenue_col") or not parsed.get("_count_distinct_key"):
+            return False, (
+                cq or
+                "I need one revenue column and one order identifier column to compute AOV. Which should I use?"
+            )
+
+    if qt in ("aggregate", "time_series", "forecast"):
+        if m and tr:
+            return True, None
+        return False, cq or _default_clarification(parsed)
+
+    if qt in ("top_n", "bottom_n", "threshold", "zero_filter"):
+        if ent and tr:
+            return True, None
+        return False, cq or _default_clarification(parsed)
+
+    if qt in ("comparison", "intersection", "growth_ranking"):
+        if not tr or len(tr) < 2:
+            return False, (cq or "Please specify two time periods to compare (e.g. 2023 vs 2024).")
+        if _period_key(tr[0]) == _period_key(tr[1]):
+            return False, (cq or "Please specify two different time periods to compare (e.g. 2023 vs 2024).")
+        if qt == "growth_ranking" and not ent:
+            return False, cq or _default_clarification(parsed)
+        return True, None
+
+    if not parsed.get("is_complete", True):
+        return False, cq or _default_clarification(parsed)
+    return True, None
+
+
 # ── Handler ───────────────────────────────────────────────────────────────────
 
 async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
@@ -1481,17 +1432,34 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
             return
 
     qs = await ctx.state.get("queries", query_id)
+    is_complete, clarification = _check_clarity(parsed)
     if qs:
         now_iso = datetime.now(timezone.utc).isoformat()
         prev_ts = qs.get("status_timestamps", {})
+        ts = {**prev_ts, "intent_parsed": now_iso}
+        if not is_complete:
+            ts["needs_clarification"] = now_iso
+            await ctx.state.set("queries", query_id, {
+                **qs,
+                "status": "needs_clarification",
+                "parsed": parsed,
+                "clarification": clarification,
+                "updatedAt": now_iso,
+                "status_timestamps": ts,
+            })
+            return
+
+        ts["ambiguity_checked"] = now_iso
         await ctx.state.set("queries", query_id, {
-            **qs, "status": "intent_parsed", "parsed": parsed,
+            **qs,
+            "status": "ambiguity_checked",
+            "parsed": parsed,
             "updatedAt": now_iso,
-            "status_timestamps": {**prev_ts, "intent_parsed": now_iso},
+            "status_timestamps": ts,
         })
 
     await ctx.enqueue({
-        "topic": "query::ambiguity.check",
+        "topic": "query::text.to.sql",
         "data":  {"queryId": query_id, "query": user_query, "parsed": parsed},
     })
 

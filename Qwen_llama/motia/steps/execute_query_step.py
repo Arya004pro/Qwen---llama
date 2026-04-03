@@ -27,9 +27,9 @@ from db.duckdb_connection import run_query as _run_sql_raw, get_read_connection
 from db.query_validator import validate_query
 
 config = {
-    "name": "ExecuteQuery",
+    "name": "SQLExecutor",
     "description": (
-        "Executes LLM-generated SQL against DuckDB. "
+        "Executes planned SQL against DuckDB with safety rewrites and validation. "
         "Auto-detects BIGINT epoch timestamp columns and rewrites SQL accordingly. "
         "Uses exclusive end-date (>= start AND < end+1day). "
         "Auto-repairs missing GROUP BY for time-series queries."

@@ -33,12 +33,13 @@ SHARED_UPLOAD_DIR    = Path("Qwen_llama/motia/data/uploads")
 CONTAINER_UPLOAD_DIR = "/app/motia/data/uploads"
 
 STEPS = [
-    {"label": "Receive",      "sub": "REST entry point",    "icon": "R"},
-    {"label": "Parse intent", "sub": "Qwen 3-32B",          "icon": "P"},
-    {"label": "Ambiguity",    "sub": "Clarification check", "icon": "?"},
-    {"label": "Text to SQL",  "sub": "Builder / LLaMA",     "icon": "SQL"},
-    {"label": "Execute SQL",  "sub": "DuckDB",               "icon": "DB"},
-    {"label": "Format",       "sub": "Result + chart",      "icon": "F"},
+    {"label": "Query Received",   "sub": "REST API intake",                "icon": "IN"},
+    {"label": "Intent Parsing",   "sub": "Understand metric and scope",    "icon": "IP"},
+    {"label": "Clarification Gate","sub": "Resolve missing inputs",         "icon": "CL"},
+    {"label": "SQL Planning",     "sub": "Generate safe DuckDB SQL",       "icon": "SQL"},
+    {"label": "Query Execution",  "sub": "Run against dataset",             "icon": "DB"},
+    {"label": "Analysis",         "sub": "Forecast + anomaly detection",    "icon": "AN"},
+    {"label": "Response Assembly", "sub": "Insights + formatting",          "icon": "RS"},
 ]
 
 STATUS_MAP = {
@@ -46,21 +47,23 @@ STATUS_MAP = {
     "intent_parsed":       1,
     "ambiguity_checked":   2,
     "needs_clarification": 2,
-    "schema_mapped":       3,
     "sql_generated":       3,
     "executed":            4,
-    "forecast_computed":   4,
-    "completed":           5,
-    "error":               5,
+    "forecast_computed":   5,
+    "anomaly_detected":    5,
+    "insights_generated":  6,
+    "completed":           6,
+    "error":               6,
 }
 
 STEP_STATUS_OPTIONS = {
     0: ["received"],
     1: ["intent_parsed"],
     2: ["ambiguity_checked", "needs_clarification"],
-    3: ["sql_generated", "schema_mapped"],
-    4: ["executed", "forecast_computed"],
-    5: ["completed", "error"],
+    3: ["sql_generated"],
+    4: ["executed"],
+    5: ["forecast_computed", "anomaly_detected"],
+    6: ["insights_generated", "completed", "error"],
 }
 
 for key, default in {

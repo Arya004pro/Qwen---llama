@@ -37,7 +37,7 @@ from shared_config import (
     QWEN_ENABLE_REASONING,
     QWEN_REASONING_EFFORT,
 )
-from utils.token_logger import log_tokens, add_tokens_to_state
+from utils.token_logger import log_tokens, add_tokens_to_state, calc_max_tokens
 from db.schema_context import get_schema_prompt
 from db.sql_builder import build_sql
 from db.duckdb_connection import explain_query, get_read_connection
@@ -45,9 +45,9 @@ from db.duckdb_connection import explain_query, get_read_connection
 logger = logging.getLogger(__name__)
 
 config = {
-    "name": "TextToSQL",
+    "name": "SQLPlanner",
     "description": (
-        "Builds SQL from parsed intent using the live schema. "
+        "Builds validated DuckDB SQL from parsed intent using the live schema. "
         "Uses a deterministic builder only for the classic e-commerce schema; "
         "all other datasets always go through the LLM path with the live schema "
         "injected into the prompt."
@@ -521,56 +521,19 @@ Parsed intent:
     disable_limit: {disable_limit}
   filters    : {filter_desc}{date_hints}
 
-STRICT RULES:
-0. Read the "Semantic Layer" and "Metric column mappings" sections above first.
-   Use the EXACT physical column names from those sections for the metric.
-1. Use EXACT column names from the schema above (no guessing).
-2. Alias the display column as "name" in SELECT.
-3. Alias the aggregation as "value".
-3b. Read "Uniqueness Profile" and "Safe Grouping Keys" first.
-    If entity label is non-unique, group by stable key + label.
-4. DATE FILTER — CRITICAL:
-   Use EXCLUSIVE-RANGE pattern for datetime/timestamp columns:
-       col >= ?  AND  col < ?
-   where the second ? is the day AFTER the period end.
-   NEVER use BETWEEN for datetime columns.
-   NEVER use EXTRACT(YEAR ...) = ? or EXTRACT(MONTH ...) = ?
-5. Use ? for ALL date/number placeholders.
-6. No semicolons. No comments. SELECT only.
-7. For "count" metric: COUNT(DISTINCT {count_key or '<primary_order_id_column>'}) AS value
-8. For metric columns:
-   - Default: SUM(column_name) AS value  (use exact column from schema)
-   - If metric starts with "avg_": AVG(<column_without_avg_prefix>) AS value
-   - If metric is "count": COUNT(DISTINCT <primary_order_id>) AS value
-    - If metric is "aov":
-         SUM({aov_revenue_col or '<revenue_column>'}) / NULLIF(COUNT(DISTINCT {count_key or '<order_identifier_column>'}), 0) AS value
-      (Use this exact derived formula; never use COUNT(DISTINCT row-like IDs) for AOV.)
-9. Ranking: {rank_instr}
+RULES:
+1. Use exact schema columns only; no guessing.
+2. Output one SELECT/WITH statement only; no comments or semicolons.
+3. Alias display column as name and metric expression as value.
+4. Date filters must use exclusive range: col >= ? AND col < ? (never BETWEEN/EXTRACT equality).
+5. Use ? for all runtime values.
+6. Metric logic: count => COUNT(DISTINCT {count_key or '<primary_order_id_column>'}); avg_* => AVG(base_col); aov => SUM({aov_revenue_col or '<revenue_column>'}) / NULLIF(COUNT(DISTINCT {count_key or '<order_identifier_column>'}),0); otherwise SUM(metric).
+7. Ranking/query behavior: {rank_instr}
+8. Respect uniqueness + business filters + special intents below:
 {groupby_rule}
 {filter_rule}
 {repeat_instr}
 {top_percent_instr}
-
-SCHEMA-AGNOSTIC PATTERN EXAMPLES (use exact schema columns; placeholders only):
-- Aggregate:
-    SELECT <agg_expr> AS value
-    FROM <table>
-    WHERE <date_col> >= ? AND <date_col> < ?
-
-- Grouped ranking/breakdown:
-    SELECT <entity_col> AS name, <agg_expr> AS value
-    FROM <table>
-    WHERE <date_col> >= ? AND <date_col> < ?
-    GROUP BY <entity_col>
-    ORDER BY value DESC
-    [LIMIT N only when ranking is requested]
-
-- Time series:
-    SELECT <bucket_expr> AS name, <agg_expr> AS value
-    FROM <table>
-    WHERE <date_col> >= ? AND <date_col> < ?
-    GROUP BY <bucket_expr>
-    ORDER BY name ASC
 
 SQL:"""
 
@@ -578,10 +541,11 @@ SQL:"""
 # ── LLM call ──────────────────────────────────────────────────────────────────
 
 def _call_llm(model: str, prompt: str) -> tuple[str, dict]:
+    messages = [{"role": "user", "content": prompt}]
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 1024,
+        "messages": messages,
+        "max_tokens": calc_max_tokens(messages, task="text_to_sql", model=model),
         "temperature": 0.0,
     }
 
@@ -651,7 +615,28 @@ def _try_repair_sql(
 ) -> tuple[str | None, dict]:
     try:
         fix_prompt = _build_sql_fix_prompt(user_query, parsed, schema, bad_sql, error_msg)
-        raw_fix, usage_fix = _call_llm(model, fix_prompt)
+        messages = [{"role": "user", "content": fix_prompt}]
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": calc_max_tokens(messages, task="sql_repair", model=model),
+            "temperature": 0.0,
+        }
+        if QWEN_ENABLE_REASONING and "qwen" in model.lower() and QWEN_REASONING_EFFORT:
+            payload["reasoning_effort"] = QWEN_REASONING_EFFORT
+
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=45)
+        if resp.status_code >= 400 and "reasoning_effort" in payload:
+            payload.pop("reasoning_effort", None)
+            resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=45)
+        resp.raise_for_status()
+        data = resp.json()
+        raw_fix = (data["choices"][0]["message"]["content"] or "").strip()
+        usage_fix = data.get("usage", {})
         repaired_sql = _extract_sql(raw_fix)
         ok, reason = _is_safe(repaired_sql)
         if not ok:

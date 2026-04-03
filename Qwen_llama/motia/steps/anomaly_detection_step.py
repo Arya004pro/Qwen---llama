@@ -14,14 +14,13 @@ from typing import Any
 from motia import FlowContext, queue
 
 config = {
-    "name": "AnomalyDetection",
+    "name": "AnomalyScanner",
     "description": (
-        "Detects statistical outliers in executed query results using z-score "
-        "and forwards anomaly metadata to formatter."
+        "Scans result values for statistical outliers and forwards anomaly metadata."
     ),
     "flows": ["sales-analytics-flow"],
     "triggers": [queue("query::detect.anomalies")],
-    "enqueues": ["query::generate.insights"],
+    "enqueues": ["query::format.result"],
 }
 
 
@@ -134,7 +133,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
 
     await ctx.enqueue(
         {
-            "topic": "query::generate.insights",
+            "topic": "query::format.result",
             "data": {
                 **input_data,
                 "anomalies": anomalies,

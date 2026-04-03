@@ -18,6 +18,63 @@ from __future__ import annotations
 from typing import Any
 
 
+# ─── Dynamic token budget helpers ───────────────────────────────────────────
+
+_CHARS_PER_TOKEN = 3.8
+
+_MODEL_CONTEXT: dict[str, int] = {
+    "qwen/qwen3-32b": 32768,
+    "llama-3.3-70b-versatile": 32768,
+    "llama-3.1-8b-instant": 8192,
+    "default": 32768,
+}
+
+_TASK_CEILINGS: dict[str, int] = {
+    "parse_intent": 512,
+    "text_to_sql": 1024,
+    "sql_repair": 768,
+    "schema_map": 256,
+    "insights": 300,
+    "ambiguity": 128,
+}
+
+_TASK_MINIMUMS: dict[str, int] = {
+    "parse_intent": 150,
+    "text_to_sql": 200,
+    "sql_repair": 200,
+    "schema_map": 100,
+    "insights": 150,
+    "ambiguity": 60,
+}
+
+
+def estimate_prompt_tokens(prompt: str | list[dict]) -> int:
+    if isinstance(prompt, list):
+        text = " ".join(str(m.get("content", "")) for m in prompt if isinstance(m, dict))
+    else:
+        text = str(prompt)
+    return max(1, int(len(text) / _CHARS_PER_TOKEN))
+
+
+def calc_max_tokens(
+    prompt: str | list[dict],
+    task: str,
+    model: str = "default",
+    headroom_ratio: float = 0.25,
+) -> int:
+    model_key = model
+    if model_key not in _MODEL_CONTEXT:
+        short = model.split("/")[-1] if "/" in model else model
+        model_key = next((k for k in _MODEL_CONTEXT if short in k or k in short), "default")
+
+    context_window = _MODEL_CONTEXT[model_key]
+    prompt_tokens = estimate_prompt_tokens(prompt)
+    available = int(context_window * (1 - headroom_ratio)) - prompt_tokens
+    ceiling = _TASK_CEILINGS.get(task, 512)
+    minimum = _TASK_MINIMUMS.get(task, 100)
+    return max(minimum, min(available, ceiling))
+
+
 # ─── helpers ────────────────────────────────────────────────────────────────
 
 def _safe_int(val) -> int:

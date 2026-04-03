@@ -24,6 +24,11 @@ from typing import Any
 import requests
 from db.duckdb_connection import explain_query
 
+try:
+    from utils.token_logger import calc_max_tokens as _shared_calc_max_tokens
+except Exception:
+    _shared_calc_max_tokens = None
+
 logger = logging.getLogger(__name__)
 
 # ─── Regex constants ──────────────────────────────────────────────────────────
@@ -39,6 +44,21 @@ _FORBIDDEN = re.compile(
 _SEMICOLON = re.compile(r";")
 _COMMENT   = re.compile(r"(--[^\n]*|/\*.*?\*/)", re.DOTALL)
 _THINK_TAG = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _calc_max_tokens(prompt: str | list[dict], task: str, model: str) -> int:
+    """Safe token-budget wrapper for CLI usage outside Motia runtime."""
+    if _shared_calc_max_tokens is not None:
+        try:
+            return int(_shared_calc_max_tokens(prompt, task=task, model=model))
+        except Exception:
+            pass
+    # Conservative fallback when utils import is unavailable.
+    if task == "text_to_sql":
+        return 1024
+    if task == "sql_repair":
+        return 768
+    return 512
 
 
 # ─── Extraction helpers ───────────────────────────────────────────────────────
@@ -189,12 +209,13 @@ def generate_sql(
     """
     ranking = intent.get("ranking", "top")
     prompt  = _build_prompt(intent, schema_prompt)
+    messages = [{"role": "user", "content": prompt}]
 
     headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
     payload = {
         "model":      model,
-        "messages":   [{"role": "user", "content": prompt}],
-        "max_tokens": 1024,   # enough for Qwen3 thinking + full SQL
+        "messages":   messages,
+        "max_tokens": _calc_max_tokens(messages, task="text_to_sql", model=model),
         "temperature": 0.0,
     }
 

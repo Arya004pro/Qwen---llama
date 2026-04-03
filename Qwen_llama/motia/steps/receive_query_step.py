@@ -18,8 +18,8 @@ from typing import Any
 from motia import ApiRequest, ApiResponse, FlowContext, http
 
 config = {
-    "name": "ReceiveQuery",
-    "description": "Entry point. Accepts natural-language query. Supports clarification via sessionId.",
+    "name": "QueryIntake",
+    "description": "Receives user query and starts or resumes the analytics workflow.",
     "flows": ["sales-analytics-flow"],
     "triggers": [http("POST", "/query")],
     "enqueues": ["query::intent.parse"],
