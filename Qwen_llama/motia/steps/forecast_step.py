@@ -113,7 +113,8 @@ def _next_year_bucket_labels(bucket: str, n: int, end_date: str = "") -> list[st
         base_year = int((end_date or "")[:4])
         target_year = base_year + 1
     except Exception:
-        target_year = datetime.now(timezone.utc).year + 1
+        # Avoid anchoring to wall-clock time when query data is historical.
+        return []
 
     labels: list[str] = []
     if bucket == "month":
@@ -169,48 +170,89 @@ def _next_year_bucket_labels(bucket: str, n: int, end_date: str = "") -> list[st
 def _next_bucket_labels(last_label: str, bucket: str, n: int) -> list[str]:
     """Generate N future bucket labels after last_label."""
     labels = []
+    last = (last_label or "").strip()
 
-    if bucket == "month" and re.match(r"\d{4}-\d{2}", last_label):
-        # YYYY-MM → advance monthly
-        year, month = int(last_label[:4]), int(last_label[5:7])
-        for _ in range(n):
-            month += 1
-            if month > 12:
-                month = 1
+    # Month labels: YYYY-MM or Mon YYYY
+    if bucket == "month":
+        m_iso = re.match(r"^(\d{4})[-/](\d{2})$", last)
+        m_hum = re.match(r"^([A-Za-z]{3,9})\s+(\d{4})$", last)
+        if m_iso:
+            year, month = int(m_iso.group(1)), int(m_iso.group(2))
+        elif m_hum:
+            month_name = m_hum.group(1).lower()[:3]
+            month_map = {
+                "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+                "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+            }
+            if month_name not in month_map:
+                year, month = -1, -1
+            else:
+                year, month = int(m_hum.group(2)), month_map[month_name]
+        else:
+            year, month = -1, -1
+
+        if year > 0 and month > 0:
+            for _ in range(n):
+                month += 1
+                if month > 12:
+                    month = 1
+                    year += 1
+                labels.append(f"{_MONTH_ABBR[month]} {year}")
+            return labels
+
+    # Quarter labels: YYYY-Qn or Qn YYYY
+    if bucket == "quarter":
+        q_iso = re.match(r"^(\d{4})-Q([1-4])$", last)
+        q_hum = re.match(r"^Q([1-4])\s+(\d{4})$", last, re.IGNORECASE)
+        if q_iso:
+            year, q = int(q_iso.group(1)), int(q_iso.group(2))
+        elif q_hum:
+            year, q = int(q_hum.group(2)), int(q_hum.group(1))
+        else:
+            year, q = -1, -1
+        if year > 0 and q > 0:
+            for _ in range(n):
+                q += 1
+                if q > 4:
+                    q = 1
+                    year += 1
+                labels.append(f"{year}-Q{q}")
+            return labels
+
+    # Year labels: YYYY
+    if bucket == "year":
+        y = re.match(r"^(\d{4})$", last)
+        if y:
+            year = int(y.group(1))
+            for _ in range(n):
                 year += 1
-            labels.append(f"{_MONTH_ABBR[month]} {year}")
+                labels.append(str(year))
+            return labels
 
-    elif bucket == "quarter" and re.match(r"\d{4}-Q\d", last_label):
-        year = int(last_label[:4])
-        q    = int(last_label[-1])
+    # Week labels: YYYY-Www
+    if bucket == "week":
+        w = re.match(r"^(\d{4})-W(\d{2})$", last)
+        if w:
+            year, week = int(w.group(1)), int(w.group(2))
+            for _ in range(n):
+                week += 1
+                if week > 52:
+                    week = 1
+                    year += 1
+                labels.append(f"{year}-W{week:02d}")
+            return labels
+
+    # Day labels: YYYY-MM-DD
+    if bucket == "day" and re.match(r"^\d{4}-\d{2}-\d{2}$", last):
+        cur = datetime.fromisoformat(last).replace(tzinfo=timezone.utc)
         for _ in range(n):
-            q += 1
-            if q > 4:
-                q = 1
-                year += 1
-            labels.append(f"{year}-Q{q}")
+            cur = cur.fromtimestamp(cur.timestamp() + 86400, tz=timezone.utc)
+            labels.append(cur.strftime("%Y-%m-%d"))
+        return labels
 
-    elif bucket == "year" and re.match(r"\d{4}", last_label):
-        year = int(last_label[:4])
-        for _ in range(n):
-            year += 1
-            labels.append(str(year))
-
-    elif bucket == "week" and re.match(r"\d{4}-W\d{2}", last_label):
-        year = int(last_label[:4])
-        w    = int(last_label[6:])
-        for _ in range(n):
-            w += 1
-            if w > 52:
-                w = 1
-                year += 1
-            labels.append(f"{year}-W{w:02d}")
-
-    else:
-        # Fallback: just number future periods
-        for i in range(1, n + 1):
-            labels.append(f"Forecast +{i}")
-
+    # Fallback: just number future periods
+    for i in range(1, n + 1):
+        labels.append(f"Forecast +{i}")
     return labels
 
 
@@ -472,19 +514,34 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     # Human-readable historical labels
     hist_labels = _human_labels(raw_labels, bucket)
     ql = (user_query or "").lower()
+    fc_labels: list[str] = []
     if "next year" in ql:
         fc_labels = _next_year_bucket_labels(bucket, periods, end_date)
-    else:
-        fc_labels = _next_bucket_labels_from_now(bucket, periods)
-    if not fc_labels:
+    if not fc_labels and raw_labels:
         fc_labels = _next_bucket_labels(raw_labels[-1], bucket, periods)
+    if not fc_labels and hist_labels:
+        fc_labels = _next_bucket_labels(hist_labels[-1], bucket, periods)
+    if not fc_labels:
+        # Last fallback only (avoids clock-time drift for historical queries).
+        fc_labels = _next_bucket_labels_from_now(bucket, periods)
 
     # ── Run forecast ──────────────────────────────────────────────────────────
     try:
         if method == "auto":
-            result: ForecastResult = forecast_auto(hist_values, periods, conf_pct)
+            result: ForecastResult = forecast_auto(
+                hist_values,
+                periods,
+                conf_pct,
+                bucket=bucket,
+            )
         else:
-            result = forecast(hist_values, periods, method, conf_pct)
+            result = forecast(
+                hist_values,
+                periods,
+                method,
+                conf_pct,
+                bucket=bucket,
+            )
     except Exception as exc:
         ctx.logger.error("Forecast algorithm failed", {"queryId": query_id, "error": str(exc)})
         await ctx.enqueue({

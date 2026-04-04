@@ -165,6 +165,35 @@ _MANDATORY_FILTER_COLS: dict[str, dict] = {
     "is_test":       {"is_test":      0},
 }
 
+_FOLLOWUP_CUES = (
+    "same",
+    "same as above",
+    "same as before",
+    "as above",
+    "as before",
+    "of that",
+    "for that",
+    "that one",
+    "those",
+    "this one",
+    "again",
+    "previous",
+    "earlier",
+    "continue",
+)
+
+_EXPLICIT_NEW_INTENT_CUES = (
+    "compare",
+    "versus",
+    " vs ",
+    "forecast",
+    "predict",
+    "projection",
+    "trend",
+    "over time",
+    "time series",
+)
+
 
 # ── Schema-driven fallback builder ────────────────────────────────────────────
 
@@ -767,6 +796,87 @@ def _has_metric_cue(query: str) -> bool:
         "discount", "profit", "margin", "rate", "score",
     )
     return any(c in q for c in metric_cues)
+
+
+def _is_followup_referential_query(query: str) -> bool:
+    q = f" {(query or '').lower()} "
+    if any(cue in q for cue in _FOLLOWUP_CUES):
+        return True
+    return False
+
+
+def _is_explicit_new_intent_query(query: str) -> bool:
+    q = f" {(query or '').lower()} "
+    if _has_ranking_cue(query):
+        return True
+    if _is_trend_query(query) or _is_forecast_query(query):
+        return True
+    if any(cue in q for cue in _EXPLICIT_NEW_INTENT_CUES):
+        return True
+    return False
+
+
+def _merge_followup_intent(
+    parsed: dict[str, Any],
+    user_query: str,
+    followup_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    prev_parsed = dict((followup_context or {}).get("previousParsed") or {})
+    if not prev_parsed:
+        return parsed
+
+    q = (user_query or "").strip()
+    token_count = len(re.findall(r"[a-z0-9]+", q.lower()))
+    missing_core = not parsed.get("entity") or not parsed.get("metric") or not parsed.get("time_ranges")
+    referential = _is_followup_referential_query(q)
+    short_followup = token_count <= 7 and missing_core
+    explicit_new_intent = _is_explicit_new_intent_query(q)
+
+    # Merge only when the user likely refers to previous context.
+    if not referential and not short_followup:
+        return parsed
+    if explicit_new_intent and not referential:
+        return parsed
+
+    merged = dict(parsed)
+
+    if not merged.get("entity") and prev_parsed.get("entity"):
+        merged["entity"] = prev_parsed.get("entity")
+
+    if not merged.get("metric") and prev_parsed.get("metric"):
+        merged["metric"] = prev_parsed.get("metric")
+
+    if not merged.get("time_ranges") and prev_parsed.get("time_ranges"):
+        merged["time_ranges"] = prev_parsed.get("time_ranges")
+
+    current_filters = dict(merged.get("filters") or {})
+    previous_filters = dict(prev_parsed.get("filters") or {})
+    if previous_filters:
+        previous_filters.update(current_filters)
+        merged["filters"] = previous_filters
+
+    for key in ("time_bucket", "forecast_periods", "forecast_method", "top_n"):
+        if not merged.get(key) and prev_parsed.get(key):
+            merged[key] = prev_parsed.get(key)
+
+    # For referential phrasing like "same for last year", keep previous type
+    # unless the new turn clearly asks for a different intent family.
+    if (
+        referential
+        and not explicit_new_intent
+        and (not merged.get("query_type") or merged.get("query_type") == "top_n")
+        and prev_parsed.get("query_type")
+    ):
+        merged["query_type"] = prev_parsed.get("query_type")
+
+    if (merged.get("metric") or "").lower() == "aov":
+        for key in ("_aov_revenue_col", "_count_distinct_key"):
+            if not merged.get(key) and prev_parsed.get(key):
+                merged[key] = prev_parsed.get(key)
+
+    merged["_followup_applied"] = True
+    merged["_followup_from_query_id"] = (followup_context or {}).get("previousQueryId")
+    return merged
 
 
 def _is_repeat_entity_count_intent(query: str) -> bool:
@@ -1395,6 +1505,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     query_id      = input_data.get("queryId")
     user_query    = input_data.get("query", "")
     merged_parsed = input_data.get("mergedParsed")
+    followup_ctx  = input_data.get("followupContext") or {}
 
     mandatory_filters = _get_mandatory_filters()
     if mandatory_filters:
@@ -1411,8 +1522,17 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         try:
             schema = get_schema_prompt()
             parsed, usage, model_used = _call_parse_with_retry_and_fallback(user_query, schema)
+            if followup_ctx:
+                parsed = _merge_followup_intent(parsed, user_query, followup_ctx)
             parsed = _post_process(parsed, user_query, mandatory_filters)
-            parsed["_parser_source"] = f"llm_{model_used.split('/')[-1]}"
+            source = f"llm_{model_used.split('/')[-1]}"
+            if parsed.get("_followup_applied"):
+                source += "_followup_merge"
+                ctx.logger.info("Follow-up context merged", {
+                    "queryId": query_id,
+                    "previousQueryId": parsed.get("_followup_from_query_id"),
+                })
+            parsed["_parser_source"] = source
             log_tokens(ctx, query_id, "ParseIntent", model_used, usage)
             await add_tokens_to_state(ctx, query_id, "ParseIntent", model_used, usage)
             ctx.logger.info("Intent parsed", {"queryId": query_id, "parsed": parsed})

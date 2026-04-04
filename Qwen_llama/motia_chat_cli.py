@@ -1,9 +1,9 @@
 """motia_chat_cli.py — Terminal chat client with chart file generation.
 
 Changes vs original:
-  - Passes sessionId back to /query when the previous response was needs_clarification
-    so the pipeline can merge the clarification text into the existing parsed state
-    rather than starting fresh.
+  - Keeps a conversation sessionId across turns so follow-up prompts
+    (e.g. "same for last year", "top 3 of that") reuse prior intent context.
+  - Clarification replies continue to work in the same session.
   - Chart output and everything else is unchanged.
 """
 
@@ -293,7 +293,7 @@ def print_final(result: dict, query_id: str) -> None:
 
 
 def submit_query(user_input: str, session_id: str | None = None) -> dict | None:
-    """POST /query, optionally attaching a sessionId for clarification replies."""
+    """POST /query, optionally attaching a sessionId for conversational context."""
     body = {"query": user_input}
     if session_id:
         body["sessionId"] = session_id
@@ -342,8 +342,7 @@ def main() -> None:
     print(f"API    : {API_BASE}")
     print(f"Charts : {CHART_DIR}\n")
 
-    # Track whether the last response was needs_clarification
-    pending_session_id: str | None = None
+    conversation_session_id: str | None = None
 
     while True:
         user_input = input("User: ").strip()
@@ -353,14 +352,13 @@ def main() -> None:
         if not user_input:
             continue
 
-        # If we're answering a clarification, pass the session ID back
-        data = submit_query(user_input, session_id=pending_session_id)
-        pending_session_id = None   # reset; will be re-set if response is needs_clarification
+        data = submit_query(user_input, session_id=conversation_session_id)
 
         if not data:
             continue
 
         query_id = data.get("queryId")
+        conversation_session_id = data.get("sessionId") or conversation_session_id or query_id
         if not query_id:
             print("Assistant: No queryId returned.")
             continue
@@ -372,10 +370,6 @@ def main() -> None:
             continue
 
         print_final(result, query_id)
-
-        # If the pipeline is waiting for clarification, remember the session
-        if result.get("status") == "needs_clarification":
-            pending_session_id = query_id
 
         print()
 

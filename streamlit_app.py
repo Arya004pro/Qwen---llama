@@ -14,7 +14,7 @@ import streamlit.components.v1 as components
 import requests
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timezone as _tz
 from pathlib import Path
 
 # ── Import ER diagram renderer ────────────────────────────────────────────────
@@ -41,6 +41,120 @@ def fetch_schema(view: str = "derived"):
         return r.json()
     except Exception:
         return None
+
+
+def suggestions_css() -> None:
+    """Inject chip-bar styles."""
+    st.markdown(
+        """
+        <style>
+        .sug-header {
+            font-size: 10px;
+            font-weight: 700;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            margin-bottom: 8px;
+        }
+        .sug-status {
+            font-size: 10px;
+            color: #64748b;
+            margin-bottom: 8px;
+            min-height: 14px;
+        }
+        div[data-testid="stButton"] > button[kind="secondaryFormSubmit"] {
+            border-radius: 10px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _fetch_suggestions(api_base: str, force_refresh: bool = False) -> dict:
+    """Call GET /suggestions (optionally with ?refresh=1)."""
+    url = f"{api_base.rstrip('/')}/suggestions"
+    params = {"refresh": "1"} if force_refresh else {}
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+_SUGS_KEY = "_sug_list"
+_SUGS_AT_KEY = "_sug_generated_at"
+_SUGS_CACHED = "_sug_from_cache"
+
+
+def render_suggestions(api_base: str) -> str | None:
+    """Render suggestion chips and return the clicked suggestion, if any."""
+    if _SUGS_KEY not in st.session_state:
+        with st.spinner("Loading suggestions..."):
+            try:
+                data = _fetch_suggestions(api_base, force_refresh=False)
+                st.session_state[_SUGS_KEY] = data.get("suggestions", [])
+                st.session_state[_SUGS_AT_KEY] = data.get("generated_at", "")
+                st.session_state[_SUGS_CACHED] = data.get("cached", False)
+            except Exception:
+                st.session_state[_SUGS_KEY] = []
+                st.session_state[_SUGS_AT_KEY] = ""
+                st.session_state[_SUGS_CACHED] = False
+
+    suggestions: list[str] = st.session_state.get(_SUGS_KEY, [])
+    if not suggestions:
+        return None
+
+    col_lbl, col_refresh = st.columns([5, 1])
+    with col_lbl:
+        st.markdown('<div class="sug-header">Suggested questions</div>', unsafe_allow_html=True)
+    with col_refresh:
+        refresh_clicked = st.button(
+            "Refresh",
+            key="_sug_refresh_btn",
+            help="Generate new suggestions for the current dataset",
+            use_container_width=True,
+            type="secondary",
+        )
+
+    if refresh_clicked:
+        with st.spinner("Generating suggestions..."):
+            try:
+                data = _fetch_suggestions(api_base, force_refresh=True)
+                st.session_state[_SUGS_KEY] = data.get("suggestions", [])
+                st.session_state[_SUGS_AT_KEY] = data.get("generated_at", "")
+                st.session_state[_SUGS_CACHED] = False
+                st.rerun()
+            except Exception as exc:
+                st.warning(f"Could not refresh suggestions: {exc}")
+
+    chosen: str | None = None
+    chips_per_row = 2
+    for row_start in range(0, len(suggestions), chips_per_row):
+        row_chips = suggestions[row_start : row_start + chips_per_row]
+        cols = st.columns(len(row_chips))
+        for col, chip_text in zip(cols, row_chips):
+            with col:
+                label = chip_text if len(chip_text) <= 60 else chip_text[:57] + "..."
+                if st.button(
+                    label,
+                    key=f"_sug_chip_{row_start}_{abs(hash(chip_text))}",
+                    use_container_width=True,
+                    help=chip_text,
+                    type="secondary",
+                ):
+                    chosen = chip_text
+
+    gen_at = st.session_state.get(_SUGS_AT_KEY, "")
+    is_cached = st.session_state.get(_SUGS_CACHED, False)
+    if gen_at:
+        try:
+            dt = datetime.fromisoformat(gen_at.replace("Z", "+00:00"))
+            age_min = int((datetime.now(_tz.utc) - dt).total_seconds() / 60)
+            cache_note = "cached" if is_cached else "fresh"
+            st.caption(f"Suggestions {cache_note} - {age_min} min ago")
+        except Exception:
+            pass
+
+    return chosen
 
 
 API           = "http://127.0.0.1:3121"
@@ -85,6 +199,7 @@ STEP_STATUS_OPTIONS = {
 for key, default in {
     "query_id":        None,
     "polling":         False,
+    "conversation_session_id": None,
     "pending_session": None,
     "final_state":     None,
     "current_status":  "",
@@ -112,8 +227,17 @@ def _on_enter():
     st.session_state.last_completed = -1
     st.session_state.poll_start     = time.time()
     try:
-        resp = submit_query(val, session_id=st.session_state.pending_session)
-        st.session_state.query_id        = resp["queryId"]
+        session_id = (
+            st.session_state.pending_session
+            or st.session_state.conversation_session_id
+        )
+        resp = submit_query(val, session_id=session_id)
+        st.session_state.query_id = resp["queryId"]
+        st.session_state.conversation_session_id = (
+            resp.get("sessionId")
+            or st.session_state.conversation_session_id
+            or resp["queryId"]
+        )
         st.session_state.pending_session = None
     except Exception as e:
         st.session_state.polling = False
@@ -941,6 +1065,9 @@ with left:
                         if n_rels:
                             msg += f" - {n_rels} relationship{'s' if n_rels != 1 else ''} detected"
                         st.success(msg)
+                        # Reset conversational context on schema change.
+                        st.session_state.conversation_session_id = None
+                        st.session_state.pending_session = None
                         skipped = result.get("skipped_files") or []
                         if skipped:
                             for s in skipped:
@@ -952,6 +1079,13 @@ with left:
                         st.error(f"Ingestion failed: {e}")
 
     st.divider()
+
+    # Suggested question chips
+    suggestions_css()
+    chosen = render_suggestions(api_base=API)
+    if chosen:
+        st.session_state["query_input_field"] = chosen
+        _on_enter()
 
     #  Query input
     st.markdown('<div class="section-lbl">Ask a question</div>', unsafe_allow_html=True)
@@ -1167,7 +1301,10 @@ if state:
     if status == "needs_clarification":
         if st.session_state.polling:
             st.session_state.polling         = False
-            st.session_state.pending_session = st.session_state.query_id
+            st.session_state.pending_session = (
+                st.session_state.conversation_session_id
+                or st.session_state.query_id
+            )
             st.session_state.final_state     = state
             st.rerun()
 
@@ -1185,7 +1322,12 @@ if state:
                     st.session_state.poll_start     = time.time()
                     resp = submit_query(answer.strip(),
                                         session_id=st.session_state.pending_session)
-                    st.session_state.query_id        = resp["queryId"]
+                    st.session_state.query_id = resp["queryId"]
+                    st.session_state.conversation_session_id = (
+                        resp.get("sessionId")
+                        or st.session_state.conversation_session_id
+                        or resp["queryId"]
+                    )
                     st.session_state.pending_session = None
                     st.rerun()
 
