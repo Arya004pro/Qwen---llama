@@ -8,6 +8,10 @@ Key additions:
   - All detection is live from DuckDB — fully schema-agnostic
 """
 
+import hashlib
+import re
+import time
+
 from db.duckdb_connection import get_read_connection
 from db.semantic_layer import render_semantic_layer_lines
 
@@ -52,6 +56,117 @@ _NON_ENTITY_NAME_HINTS: tuple[str, ...] = (
 
 # Integer types that might hold epoch timestamps
 _BIGINT_TYPES = ("BIGINT", "INT8", "LONG", "HUGEINT", "INT64")
+
+_SCHEMA_PROMPT_CACHE: dict[str, tuple[float, str]] = {}
+_SCHEMA_PROMPT_CACHE_TTL_SECS = 300.0
+_SCHEMA_MINIFIED_QUERY_RE = re.compile(r"[^a-z0-9_ ]+")
+
+
+def _normalize_query_signature(user_query: str | None) -> str:
+    text = (user_query or "").strip().lower()
+    if not text:
+        return "all"
+    text = _SCHEMA_MINIFIED_QUERY_RE.sub(" ", text)
+    parts = [p for p in text.split() if len(p) >= 3]
+    if not parts:
+        return "all"
+    return " ".join(parts[:10])
+
+
+def _cache_get(cache_key: str) -> str | None:
+    hit = _SCHEMA_PROMPT_CACHE.get(cache_key)
+    if not hit:
+        return None
+    ts, value = hit
+    if (time.time() - ts) > _SCHEMA_PROMPT_CACHE_TTL_SECS:
+        _SCHEMA_PROMPT_CACHE.pop(cache_key, None)
+        return None
+    return value
+
+
+def _cache_put(cache_key: str, value: str) -> None:
+    _SCHEMA_PROMPT_CACHE[cache_key] = (time.time(), value)
+
+
+def _schema_fingerprint(conn) -> str:
+    rows = conn.execute(
+        """
+        SELECT table_name, column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'main'
+          AND table_name NOT LIKE '_raw_%'
+        ORDER BY table_name, ordinal_position
+        """
+    ).fetchall()
+    if not rows:
+        return "empty"
+    serial = "\n".join(f"{t}|{c}|{d}" for t, c, d in rows)
+    return hashlib.sha1(serial.encode("utf-8")).hexdigest()[:16]
+
+
+def _column_priority(col_name: str, dtype: str, query_sig: str) -> tuple[int, int, int, int]:
+    n = (col_name or "").lower()
+    d = (dtype or "").upper()
+    qparts = set(query_sig.split()) if query_sig and query_sig != "all" else set()
+    score = 0
+    if qparts and any(q in n for q in qparts):
+        score += 8
+    if any(k in n for k in ("date", "time", "created", "updated", "timestamp")):
+        score += 7
+    if any(k in n for k in ("name", "title", "label", "category", "brand", "store", "region")):
+        score += 6
+    if any(k in n for k in ("revenue", "sales", "amount", "total", "final", "earning", "qty", "quantity")):
+        score += 6
+    if any(k in n for k in ("status", "active", "deleted", "cancelled", "refunded")):
+        score += 4
+    if n == "id" or n.endswith("_id"):
+        score += 3
+    if any(k in d for k in ("DATE", "TIMESTAMP")):
+        score += 4
+    return (
+        score,
+        1 if _looks_like_entity_column(n) else 0,
+        1 if _is_numeric_type(d) else 0,
+        1 if _is_text_type(d) else 0,
+    )
+
+
+def _pick_table_columns(cols: list[tuple[str, str]], query_sig: str, max_cols: int) -> list[tuple[str, str]]:
+    if len(cols) <= max_cols:
+        return cols
+    ranked = sorted(
+        cols,
+        key=lambda x: (_column_priority(x[0], x[1], query_sig), -len(x[0])),
+        reverse=True,
+    )
+    kept = ranked[:max_cols]
+    kept_names = {c[0] for c in kept}
+    ordered = [c for c in cols if c[0] in kept_names]
+    return ordered[:max_cols]
+
+
+def _rank_tables_for_query(
+    table_to_cols: dict[str, list[tuple[str, str]]],
+    query_sig: str,
+) -> list[str]:
+    qparts = set(query_sig.split()) if query_sig and query_sig != "all" else set()
+    if not qparts:
+        return sorted(table_to_cols.keys())
+    scored: list[tuple[int, str]] = []
+    for table, cols in table_to_cols.items():
+        score = 0
+        t = table.lower()
+        if any(q in t for q in qparts):
+            score += 10
+        for col, _ in cols:
+            c = col.lower()
+            if any(q in c for q in qparts):
+                score += 2
+        if score <= 0:
+            score = 1
+        scored.append((score, table))
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [t for _, t in scored]
 
 
 def _is_text_type(dtype: str) -> bool:
@@ -507,6 +622,30 @@ def _build_schema_examples(conn, tables: list[str]) -> list[str]:
     ]
 
 
+def _detect_date_columns_compact(conn, tables: list[str]) -> list[str]:
+    hints: list[str] = []
+    DATE_KEYWORDS = ("date", "time", "created", "updated", "at", "on", "when")
+    for table in tables:
+        try:
+            cols = [(c[0], c[1].upper()) for c in conn.execute(f'DESCRIBE "{table}"').fetchall()]
+        except Exception:
+            continue
+        for col, dtype in cols:
+            cl = col.lower()
+            if not any(k in cl for k in DATE_KEYWORDS) and not any(x in dtype for x in ("DATE", "TIMESTAMP")):
+                continue
+            if any(x in dtype for x in ("DATE", "TIMESTAMP")):
+                hints.append(
+                    f'  "{table}"."{col}" ({dtype}): use CAST("{col}" AS DATE) >= ? AND CAST("{col}" AS DATE) < ?'
+                )
+            elif any(t in dtype for t in _BIGINT_TYPES):
+                epoch_expr = _get_epoch_cast_expr(conn, table, col)
+                hints.append(
+                    f'  "{table}"."{col}" ({dtype} epoch): use CAST({epoch_expr} AS DATE) >= ? AND CAST({epoch_expr} AS DATE) < ?'
+                )
+    return hints
+
+
 def _live_schema_prompt() -> str:
     conn = get_read_connection()
     try:
@@ -613,10 +752,101 @@ def _live_schema_prompt() -> str:
         conn.close()
 
 
-def get_schema_prompt() -> str:
+def _live_schema_prompt_compact(user_query: str | None = None) -> str:
+    conn = get_read_connection()
     try:
-        live = _live_schema_prompt().strip()
+        rows = conn.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema='main'
+              AND table_name NOT LIKE '_raw_%'
+            ORDER BY table_name
+            """
+        ).fetchall()
+        tables = [r[0] for r in rows]
+        if not tables:
+            return ""
+
+        query_sig = _normalize_query_signature(user_query)
+
+        table_to_cols: dict[str, list[tuple[str, str]]] = {}
+        for t in tables:
+            try:
+                table_to_cols[t] = [(c[0], c[1]) for c in conn.execute(f'DESCRIBE "{t}"').fetchall()]
+            except Exception:
+                continue
+        if not table_to_cols:
+            return ""
+
+        ranked_tables = _rank_tables_for_query(table_to_cols, query_sig)
+        selected_tables = ranked_tables[: min(5, len(ranked_tables))]
+
+        lines = ["Tables (focused)", "----------------"]
+        for t in selected_tables:
+            cols = table_to_cols.get(t, [])
+            compact_cols = _pick_table_columns(cols, query_sig, max_cols=20)
+            col_s = ", ".join(f"{c[0]} {c[1]}" for c in compact_cols)
+            truncated = " ..." if len(cols) > len(compact_cols) else ""
+            lines.append(f'{t:<14}: {col_s}{truncated}')
+
+        # Keep section titles stable so upstream prompt rules still align.
+        metric_hints = _detect_metric_columns(conn, selected_tables)
+        lines += ["", "Metric column mappings (USE THESE EXACT COLUMN NAMES)",
+                  "-----------------------------------------------------------"]
+        lines += metric_hints or ["  (No obvious metric columns detected from names/types.)"]
+
+        date_hints = _detect_date_columns_compact(conn, selected_tables)
+        lines += ["", "Date filter columns", "-------------------"]
+        lines += date_hints or ["  (No date-like columns detected.)"]
+
+        biz_rules = _detect_business_rules(conn, selected_tables)
+        lines += ["", "MANDATORY business-validity filters (ALWAYS apply)",
+                  "----------------------------------------------------"]
+        lines += biz_rules or ["  (No mandatory business filters detected.)"]
+
+        # Semantic layer is already capped (dims/metrics), useful for generality.
+        lines += [""]
+        lines += render_semantic_layer_lines(conn, selected_tables)
+
+        lines += [
+            "",
+            "SQL rules",
+            "---------",
+            "- SELECT only; no DML",
+            "- Alias group key as name and metric as value",
+            "- Use ? placeholders for ALL params",
+            "- Ranked queries: ORDER BY value DESC/ASC LIMIT ?",
+            "- Aggregate queries: one scalar column aliased value",
+            "- Use exclusive date ranges: col >= ? AND col < ?",
+        ]
+        return "\n".join(lines)
+    finally:
+        conn.close()
+
+
+def get_schema_prompt(mode: str = "full", user_query: str | None = None) -> str:
+    try:
+        conn = get_read_connection()
+        try:
+            fp = _schema_fingerprint(conn)
+        finally:
+            conn.close()
+
+        normalized_mode = (mode or "full").strip().lower()
+        query_sig = _normalize_query_signature(user_query if normalized_mode == "compact" else "")
+        cache_key = f"{normalized_mode}|{fp}|{query_sig}"
+        cached = _cache_get(cache_key)
+        if cached:
+            return cached
+
+        if normalized_mode == "compact":
+            live = _live_schema_prompt_compact(user_query=user_query).strip()
+        else:
+            live = _live_schema_prompt().strip()
+
         if live:
+            _cache_put(cache_key, live)
             return live
     except Exception:
         pass

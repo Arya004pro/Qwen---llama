@@ -25,7 +25,6 @@ for _p in [_STEPS_DIR, _MOTIA_DIR, _PROJECT_ROOT]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import requests
 from motia import FlowContext, queue
 from shared_config import (
     GROQ_API_TOKEN,
@@ -38,6 +37,7 @@ from shared_config import (
 )
 from utils.token_logger import log_tokens, add_tokens_to_state, calc_max_tokens
 from utils.time_parser import parse_time_ranges_from_query
+from utils.llm_client import clean_model_text, is_rate_limit_error, post_chat_completion
 from db.schema_context import get_schema_prompt
 from db.duckdb_connection import get_read_connection
 from db.semantic_layer import resolve_intent_with_semantic_layer
@@ -79,7 +79,6 @@ Rules:
 9) Time ranges: parse absolute/relative periods; use full boundaries (year/quarter/month) and two ranges for comparison/YoY.
 """
 
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _TOPN_RE  = re.compile(r"\b(top|bottom)\s+(\d+)\b", re.IGNORECASE)
 
 _TREND_KEYWORDS = {
@@ -1386,22 +1385,13 @@ def _call_parse_model(user_query: str, schema: str, model: str) -> tuple[dict, d
     if QWEN_ENABLE_REASONING and "qwen" in model.lower() and QWEN_REASONING_EFFORT:
         payload["reasoning_effort"] = QWEN_REASONING_EFFORT
 
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
-    resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
-    if resp.status_code >= 400 and "reasoning_effort" in payload:
-        # Backward-safe fallback for providers/models that don't support this field.
-        payload.pop("reasoning_effort", None)
-        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    raw  = data["choices"][0]["message"]["content"].strip()
-    raw  = _THINK_RE.sub("", raw).strip()
-    raw  = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-    raw  = re.sub(r"\s*```$", "", raw).strip()
+    data = post_chat_completion(
+        api_url=GROQ_URL,
+        api_token=GROQ_API_TOKEN,
+        payload=payload,
+        timeout=30,
+    )
+    raw = clean_model_text(data["choices"][0]["message"]["content"], strip_fences=True)
     try:
         return json.loads(raw), data.get("usage", {})
     except Exception:
@@ -1409,12 +1399,6 @@ def _call_parse_model(user_query: str, schema: str, model: str) -> tuple[dict, d
         if not obj:
             raise
         return json.loads(obj), data.get("usage", {})
-
-
-def _is_rate_limit_error(exc: Exception) -> bool:
-    if isinstance(exc, requests.HTTPError) and exc.response is not None:
-        return exc.response.status_code == 429
-    return "429" in str(exc)
 
 
 def _call_parse_with_retry_and_fallback(
@@ -1432,7 +1416,7 @@ def _call_parse_with_retry_and_fallback(
             last_exc = exc
             if attempt >= attempts:
                 break
-            wait_sec = min((1.0 if _is_rate_limit_error(exc) else 0.5) * attempt, 3.0)
+            wait_sec = min((1.0 if is_rate_limit_error(exc) else 0.5) * attempt, 3.0)
             time.sleep(wait_sec)
 
     fallback_model = (LLAMA_MODEL or "").strip()
@@ -1444,7 +1428,7 @@ def _call_parse_with_retry_and_fallback(
             except Exception as exc:
                 last_exc = exc
                 if attempt < 2:
-                    wait_sec = 1.5 if _is_rate_limit_error(exc) else 0.8
+                    wait_sec = 1.5 if is_rate_limit_error(exc) else 0.8
                     time.sleep(wait_sec)
 
     if last_exc:
@@ -1520,7 +1504,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
     else:
         ctx.logger.info("Qwen intent extraction", {"queryId": query_id, "query": user_query})
         try:
-            schema = get_schema_prompt()
+            schema = get_schema_prompt(mode="compact", user_query=user_query)
             parsed, usage, model_used = _call_parse_with_retry_and_fallback(user_query, schema)
             if followup_ctx:
                 parsed = _merge_followup_intent(parsed, user_query, followup_ctx)

@@ -24,7 +24,6 @@ for _p in [_STEPS_DIR, _MOTIA_DIR, _PROJECT_ROOT]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import requests
 from datetime import date, datetime, timezone
 from typing import Any
 from motia import FlowContext, queue
@@ -38,6 +37,7 @@ from shared_config import (
     QWEN_REASONING_EFFORT,
 )
 from utils.token_logger import log_tokens, add_tokens_to_state, calc_max_tokens
+from utils.llm_client import clean_model_text, post_chat_completion
 from db.schema_context import get_schema_prompt
 from db.sql_builder import build_sql
 from db.duckdb_connection import explain_query, get_read_connection
@@ -57,7 +57,6 @@ config = {
     "enqueues": ["query::execute"],
 }
 
-_THINK_RE    = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _SQL_LINE_RE = re.compile(r"(?im)^(WITH|SELECT)\b")
 _FENCE_RE    = re.compile(r"```(?:sql)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
 _FORBIDDEN   = re.compile(
@@ -138,7 +137,7 @@ def _detect_id_name_pairs() -> dict[str, str]:
 # ── SQL extraction / safety ────────────────────────────────────────────────────
 
 def _extract_sql(raw: str) -> str:
-    text  = _THINK_RE.sub("", raw).strip()
+    text = clean_model_text(raw, strip_fences=False)
     fence = _FENCE_RE.search(text)
     if fence:
         text = fence.group(1).strip()
@@ -556,17 +555,12 @@ def _call_llm(model: str, prompt: str) -> tuple[str, dict]:
     ):
         payload["reasoning_effort"] = QWEN_REASONING_EFFORT
 
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
-    resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=45)
-    if resp.status_code >= 400 and "reasoning_effort" in payload:
-        payload.pop("reasoning_effort", None)
-        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=45)
-    resp.raise_for_status()
-    data = resp.json()
+    data = post_chat_completion(
+        api_url=GROQ_URL,
+        api_token=GROQ_API_TOKEN,
+        payload=payload,
+        timeout=45,
+    )
     return data["choices"][0]["message"]["content"].strip(), data.get("usage", {})
 
 
@@ -625,16 +619,12 @@ def _try_repair_sql(
         if QWEN_ENABLE_REASONING and "qwen" in model.lower() and QWEN_REASONING_EFFORT:
             payload["reasoning_effort"] = QWEN_REASONING_EFFORT
 
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_TOKEN}",
-            "Content-Type": "application/json",
-        }
-        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=45)
-        if resp.status_code >= 400 and "reasoning_effort" in payload:
-            payload.pop("reasoning_effort", None)
-            resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=45)
-        resp.raise_for_status()
-        data = resp.json()
+        data = post_chat_completion(
+            api_url=GROQ_URL,
+            api_token=GROQ_API_TOKEN,
+            payload=payload,
+            timeout=45,
+        )
         raw_fix = (data["choices"][0]["message"]["content"] or "").strip()
         usage_fix = data.get("usage", {})
         repaired_sql = _extract_sql(raw_fix)
@@ -1503,7 +1493,7 @@ async def handler(input_data: Any, ctx: FlowContext[Any]) -> None:
         ctx.logger.info("🤖 LLM SQL generation", {"queryId": query_id, "model": model})
 
         try:
-            schema     = get_schema_prompt()
+            schema     = get_schema_prompt(mode="compact", user_query=user_query)
             prompt     = _build_llm_prompt(user_query, parsed, schema)
             raw, usage = _call_llm(model, prompt)
             ctx.logger.info("🔬 LLM raw", {"queryId": query_id, "preview": raw[:400]})

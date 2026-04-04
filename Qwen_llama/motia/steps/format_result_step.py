@@ -17,7 +17,6 @@ import sys
 import re
 import json
 from typing import Any
-import requests
 from motia import FlowContext, queue
 
 _STEPS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,6 +27,7 @@ for _p in (_STEPS_DIR, _MOTIA_DIR, _PROJECT_ROOT):
         sys.path.insert(0, _p)
 
 from shared_config import GROQ_API_TOKEN, GROQ_URL, INSIGHTS_MODEL
+from utils.llm_client import clean_model_text, post_chat_completion
 from utils.token_logger import log_tokens, add_tokens_to_state, calc_max_tokens
 
 config = {
@@ -55,9 +55,6 @@ _MONTH_ABBR = {
     "05": "May", "06": "Jun", "07": "Jul", "08": "Aug",
     "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec",
 }
-
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-
 
 def _format_bucket_label(raw_label: str, bucket: str) -> str:
     """Convert raw bucket label (e.g. '2024-01') to a human-readable string."""
@@ -660,27 +657,20 @@ def _call_ai_insights(user_query: str, parsed: dict[str, Any], rows: list[dict[s
     )
     messages = [{"role": "user", "content": prompt}]
 
-    resp = requests.post(
-        GROQ_URL,
-        headers={
-            "Authorization": f"Bearer {GROQ_API_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={
+    data = post_chat_completion(
+        api_url=GROQ_URL,
+        api_token=GROQ_API_TOKEN,
+        payload={
             "model": INSIGHTS_MODEL,
             "messages": messages,
             "temperature": 0.0,
             "max_tokens": calc_max_tokens(messages, task="insights", model=INSIGHTS_MODEL),
         },
         timeout=30,
+        retry_without_reasoning_effort=False,
     )
-    resp.raise_for_status()
-    data = resp.json()
     usage = data.get("usage", {})
-    raw = (data["choices"][0]["message"]["content"] or "").strip()
-    raw = _THINK_RE.sub("", raw).strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-    raw = re.sub(r"\s*```$", "", raw).strip()
+    raw = clean_model_text(data["choices"][0]["message"]["content"], strip_fences=True)
     try:
         obj = json.loads(raw)
     except Exception:

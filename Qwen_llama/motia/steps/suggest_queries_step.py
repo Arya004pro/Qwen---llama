@@ -35,18 +35,17 @@ for _p in (_STEPS_DIR, _MOTIA_DIR, _PROJECT_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import requests
 from motia import ApiRequest, ApiResponse, FlowContext, http
 
 from shared_config import GROQ_API_TOKEN, QWEN_MODEL, GROQ_URL
 from db.duckdb_connection import get_read_connection
+from utils.llm_client import clean_model_text, post_chat_completion
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 CACHE_KEY      = "suggestions"          # key inside the "query_suggestions" state namespace
 CACHE_TTL_SECS = 30 * 60               # 30 minutes
 NUM_SUGGESTIONS = 8
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 config = {
     "name": "QuerySuggestions",
@@ -182,19 +181,14 @@ def _call_llm(schema: str) -> list[str]:
         "max_tokens": 512,
         "temperature": 0.7,   # slight creativity for diverse suggestions
     }
-    resp = requests.post(
-        GROQ_URL,
-        headers={"Authorization": f"Bearer {GROQ_API_TOKEN}", "Content-Type": "application/json"},
-        json=payload,
+    data = post_chat_completion(
+        api_url=GROQ_URL,
+        api_token=GROQ_API_TOKEN,
+        payload=payload,
         timeout=30,
+        retry_without_reasoning_effort=False,
     )
-    resp.raise_for_status()
-    raw = resp.json()["choices"][0]["message"]["content"].strip()
-    raw = _THINK_RE.sub("", raw).strip()
-
-    # Strip markdown fences if present
-    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-    raw = re.sub(r"\s*```$", "", raw).strip()
+    raw = clean_model_text(data["choices"][0]["message"]["content"], strip_fences=True)
 
     suggestions: list[str] = json.loads(raw)
     if not isinstance(suggestions, list):
