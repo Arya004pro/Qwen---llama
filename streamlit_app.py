@@ -157,6 +157,112 @@ def render_suggestions(api_base: str) -> str | None:
     return chosen
 
 
+def _fetch_business_report(api_base: str, period: str = "weekly") -> dict:
+    r = requests.get(
+        f"{api_base.rstrip('/')}/reports/latest",
+        params={"period": period},
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def _trigger_business_report(api_base: str, period: str = "weekly") -> dict:
+    r = requests.post(
+        f"{api_base.rstrip('/')}/reports/run",
+        json={"period": period, "requestedBy": "streamlit"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+_DIGEST_CACHE_KEY = "_digest_cache"
+_DIGEST_CACHE_TS_KEY = "_digest_cache_ts"
+
+
+def _load_business_report(api_base: str, period: str, force: bool = False) -> tuple[dict | None, str | None]:
+    cache = st.session_state.setdefault(_DIGEST_CACHE_KEY, {})
+    ts_map = st.session_state.setdefault(_DIGEST_CACHE_TS_KEY, {})
+    now_ts = time.time()
+    if not force and period in cache and (now_ts - float(ts_map.get(period, 0))) < 45:
+        return cache.get(period), None
+
+    try:
+        data = _fetch_business_report(api_base, period=period)
+        cache[period] = data
+        ts_map[period] = now_ts
+        return data, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def render_business_digest(api_base: str) -> None:
+    period = st.selectbox(
+        "Digest period",
+        options=["weekly", "monthly"],
+        key="_digest_period",
+        label_visibility="collapsed",
+    )
+    run_col, refresh_col = st.columns([1, 1])
+    run_now = run_col.button("Run now", key="_digest_run_now", use_container_width=True, type="secondary")
+    refresh = refresh_col.button("Refresh", key="_digest_refresh", use_container_width=True, type="secondary")
+
+    if run_now:
+        try:
+            _trigger_business_report(api_base, period=period)
+            st.info(f"{period.title()} digest queued. Refresh in a few seconds.")
+            _load_business_report(api_base, period=period, force=True)
+        except Exception as exc:
+            st.warning(f"Could not trigger digest run: {exc}")
+
+    report, err = _load_business_report(api_base, period=period, force=refresh)
+    if not report:
+        st.caption("No digest available yet. Use 'Run now' to generate one.")
+        if err:
+            st.caption(f"API message: {err}")
+        return
+
+    generated_at = str(report.get("generatedAt") or "")
+    if generated_at:
+        st.caption(f"Generated: {generated_at}")
+    md = str(report.get("summaryMarkdown") or "").strip()
+    if md:
+        st.markdown(md)
+    else:
+        st.caption("Digest report is empty.")
+        return
+
+    safe_period = period.lower().strip()
+    date_part = datetime.now().strftime("%Y-%m-%d")
+    st.download_button(
+        label="Download Markdown",
+        data=md,
+        file_name=f"{safe_period}_digest_{date_part}.md",
+        mime="text/markdown",
+        use_container_width=True,
+        key="_digest_download_md",
+    )
+    try:
+        digest_state = {
+            "formattedText": md,
+            "formattedItems": [],
+            "chart_config": None,
+            "token_totals": {},
+        }
+        pdf_bytes = _build_export_pdf(digest_state, f"{period.title()} Business Summary")
+        st.download_button(
+            label="Download PDF",
+            data=pdf_bytes,
+            file_name=f"{safe_period}_digest_{date_part}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            key="_digest_download_pdf",
+        )
+    except Exception:
+        pass
+
+
 API           = "http://127.0.0.1:3121"
 POLL_INTERVAL = 0.7
 SHARED_UPLOAD_DIR    = Path("Qwen_llama/motia/data/uploads")
@@ -211,6 +317,7 @@ for key, default in {
     "bm_loaded":       False,
     "schema_refresh_nonce": 0,
     "schema_last_refresh": "",
+    "_digest_period": "weekly",
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -1121,6 +1228,10 @@ with right:
     with sql_placeholder.container():
         st.markdown('<div class="sql-box">Waiting for SQL generation</div>',
                     unsafe_allow_html=True)
+
+    st.divider()
+    st.markdown('<div class="section-lbl">Business digest</div>', unsafe_allow_html=True)
+    render_business_digest(API)
 
 # ── Bookmark localStorage bridge ──────────────────────────────────────────────
 
