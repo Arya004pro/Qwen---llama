@@ -30,13 +30,20 @@ async def handler(request: ApiRequest[dict[str, Any]], ctx: FlowContext[Any]) ->
     body = request.body or {}
     files = body.get("files") or []
     reset_db = bool(body.get("reset_db", False))
+    merge_confirm = bool(body.get("merge_confirm", False))
     use_llm_grouping = bool(body.get("use_llm_grouping", False))
+    auto_structure = bool(body.get("auto_structure", True))
 
     if not isinstance(files, list) or not files:
         return ApiResponse(status=400, body={"error": "files[] is required"})
 
     try:
-        result = ingest_files(files, reset_db=reset_db)
+        result = ingest_files(
+            files,
+            reset_db=reset_db,
+            auto_structure=auto_structure,
+            merge_confirm=merge_confirm,
+        )
     except Exception as exc:
         ctx.logger.error("Ingest failed", {"error": str(exc)})
         return ApiResponse(status=500, body={"error": str(exc)})
@@ -49,6 +56,7 @@ async def handler(request: ApiRequest[dict[str, Any]], ctx: FlowContext[Any]) ->
             "updatedAt": now_iso,
             "source": "upload",
             "use_llm_grouping": use_llm_grouping,
+            "auto_structure": auto_structure,
             **result,
         },
     )

@@ -2,7 +2,7 @@
 
 Layout changes:
   - Data source (file upload) stays in left panel, top position.
-  - Schema viewer moved to BOTTOM of page (below result + history).
+  - Schema viewer replaced with interactive ER diagram (schema_diagram.py).
   - Pipeline steps + query input remain in left panel.
   - Token usage + SQL remain in right panel.
 
@@ -17,10 +17,26 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+# ── Import ER diagram renderer ────────────────────────────────────────────────
+try:
+    from schema_diagram import render_schema_diagram
+    _HAS_DIAGRAM = True
+except ImportError:
+    _HAS_DIAGRAM = False
 
-def fetch_schema():
+
+def fetch_schema(view: str = "derived"):
     try:
-        r = requests.get(f"{API}/schema", timeout=5)
+        v = (view or "derived").strip().lower()
+        if v not in {"derived", "raw", "all"}:
+            v = "derived"
+        nonce = int(st.session_state.get("schema_refresh_nonce", 0))
+        r = requests.get(
+            f"{API}/schema",
+            params={"view": v, "_nonce": nonce},
+            timeout=5,
+            headers={"Cache-Control": "no-cache"},
+        )
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -33,12 +49,12 @@ SHARED_UPLOAD_DIR    = Path("Qwen_llama/motia/data/uploads")
 CONTAINER_UPLOAD_DIR = "/app/motia/data/uploads"
 
 STEPS = [
-    {"label": "Query Received",   "sub": "REST API intake",                "icon": "IN"},
-    {"label": "Intent Parsing",   "sub": "Understand metric and scope",    "icon": "IP"},
+    {"label": "Query Received",    "sub": "REST API intake",                "icon": "IN"},
+    {"label": "Intent Parsing",    "sub": "Understand metric and scope",    "icon": "IP"},
     {"label": "Clarification Gate","sub": "Resolve missing inputs",         "icon": "CL"},
-    {"label": "SQL Planning",     "sub": "Generate safe DuckDB SQL",       "icon": "SQL"},
-    {"label": "Query Execution",  "sub": "Run against dataset",             "icon": "DB"},
-    {"label": "Analysis",         "sub": "Forecast + anomaly detection",    "icon": "AN"},
+    {"label": "SQL Planning",      "sub": "Generate safe DuckDB SQL",       "icon": "SQL"},
+    {"label": "Query Execution",   "sub": "Run against dataset",            "icon": "DB"},
+    {"label": "Analysis",          "sub": "Forecast + anomaly detection",   "icon": "AN"},
     {"label": "Response Assembly", "sub": "Insights + formatting",          "icon": "RS"},
 ]
 
@@ -76,8 +92,10 @@ for key, default in {
     "step_times":      {},
     "poll_start":      None,
     "last_completed":  -1,
-    "bookmarks":       [],       # list of {query_id, query, text, timestamp}
-    "bm_loaded":       False,    # have we loaded bookmarks from localStorage yet?
+    "bookmarks":       [],
+    "bm_loaded":       False,
+    "schema_refresh_nonce": 0,
+    "schema_last_refresh": "",
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -184,7 +202,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-#  PDF export 
+#  PDF export
 
 def _safe_text(v) -> str:
     s = "" if v is None else str(v)
@@ -258,7 +276,6 @@ def _build_pdf_chart(chart_config):
     chart.height = chart_h
     chart.data   = tuple(tuple(row) for row in series)
     display_labels = [str(x) if len(str(x)) <= 28 else f"{str(x)[:25]}..." for x in labels]
-    # Reduce axis clutter for long time series by showing only periodic ticks.
     if len(display_labels) > 24:
         step = max(2, len(display_labels) // 12)
         display_labels = [lab if i % step == 0 else "" for i, lab in enumerate(display_labels)]
@@ -283,7 +300,6 @@ def _build_pdf_chart(chart_config):
             line_c = _to_rl_color(c, colors.HexColor("#60a5fa"))
             chart.lines[i].strokeColor = line_c
             chart.lines[i].strokeWidth = 1.7
-            # Some reportlab versions do not expose `symbol` on line props.
             if hasattr(chart.lines[i], "symbol") and len(labels) > 36:
                 chart.lines[i].symbol = None
     else:
@@ -345,8 +361,7 @@ def _build_pdf_chart_image(chart_config, max_width_pts):
     if is_line:
         for i, vals in enumerate(series):
             ax.plot(
-                x,
-                vals,
+                x, vals,
                 color=colors[i % len(colors)],
                 linewidth=1.4,
                 marker="o" if len(labels) <= 36 else None,
@@ -442,7 +457,6 @@ def _build_export_pdf(state: dict, user_query: str) -> bytes:
     story.append(Spacer(1, 10))
 
     summary_lines = summary.splitlines() if summary else ["-"]
-    # Collapse repeated blank lines to keep PDF narrative compact.
     compact_lines = []
     prev_blank = False
     for ln in summary_lines:
@@ -459,7 +473,6 @@ def _build_export_pdf(state: dict, user_query: str) -> bytes:
         ("insights:" in summary_lower) or
         (summary.count("\n") > 40 and (" - " in summary or "\n- " in summary))
     )
-    # Avoid ReportLab LayoutError for very long single-cell answer tables.
     if len(summary_lines) > 80:
         summary_lines = summary_lines[:80] + [
             "",
@@ -499,7 +512,6 @@ def _build_export_pdf(state: dict, user_query: str) -> bytes:
         or (items and "period" in items[0] and "value" in items[0])
     )
     if summary_looks_structured and items:
-        # Keep table for time-series so exact values are available after the chart.
         if is_time_series_pdf:
             include_table = len(items) <= 500
         else:
@@ -508,7 +520,6 @@ def _build_export_pdf(state: dict, user_query: str) -> bytes:
     if include_table:
         skip_keys = {"raw_value", "raw_delta"}
         cols = [k for k in items[0].keys() if k not in skip_keys]
-        # Keep PDF tables readable for very large result sets.
         table_items = items
         trimmed_note = None
         if len(items) > 240:
@@ -585,7 +596,7 @@ def _build_export_pdf(state: dict, user_query: str) -> bytes:
     return buf.getvalue()
 
 
-#  API helpers 
+#  API helpers
 
 def api_ok():
     try:
@@ -624,7 +635,7 @@ def _wait_for_ingest_ready(max_wait_seconds=20.0):
     return False
 
 
-def ingest_uploaded_files(uploaded_files, reset_db=False):
+def ingest_uploaded_files(uploaded_files, reset_db=False, merge_confirm=False):
     files_payload = []
     SHARED_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     for f in uploaded_files or []:
@@ -641,7 +652,11 @@ def ingest_uploaded_files(uploaded_files, reset_db=False):
     if not files_payload:
         raise ValueError("No valid file content to upload.")
 
-    body = {"files": files_payload, "reset_db": bool(reset_db)}
+    body = {
+        "files": files_payload,
+        "reset_db": bool(reset_db),
+        "merge_confirm": bool(merge_confirm),
+    }
     _wait_for_ingest_ready(max_wait_seconds=20.0)
     last_err = None
     for attempt in range(12):
@@ -724,9 +739,9 @@ def render_steps(completed_idx, is_error, step_times):
     parts = []
     for i, s in enumerate(STEPS):
         if is_error and i == completed_idx:
-            cls, icon = "error", ""
+            cls, icon = "error", "✕"
         elif i <= completed_idx:
-            cls, icon = "done", ""
+            cls, icon = "done", "✓"
         elif i == completed_idx + 1:
             cls, icon = "active", s["icon"]
         else:
@@ -737,7 +752,7 @@ def render_steps(completed_idx, is_error, step_times):
             t_label   = f"{t:.2f}s" if t < 1 else f"{t:.1f}s"
             time_html = f'<div class="step-time">{t_label}</div>'
         elif cls == "active":
-            time_html = '<div class="step-time"></div>'
+            time_html = '<div class="step-time">…</div>'
         else:
             time_html = '<div class="step-time"></div>'
 
@@ -791,50 +806,76 @@ def render_tokens(usage, totals):
         c3.metric("Total tokens",      totals.get("total_tokens", 0))
 
 
+# ── Schema section — now uses ER diagram ─────────────────────────────────────
+
 def render_schema_section():
-    """Render the schema viewer  called at the bottom of the page."""
-    schema_data = fetch_schema()
-    if not schema_data or not schema_data.get("tables"):
-        st.caption("No data loaded yet.")
-        return
+    """
+    Renders schema views in two tabs:
+    - ER schema from derived tables only
+    - Raw uploaded source tables in tabular view
+    """
+    tab_er, tab_raw = st.tabs(["ER schema (derived tables)", "Raw uploaded tables"])
 
-    tables = schema_data.get("tables", [])
-    rels   = schema_data.get("relationships", [])
+    with tab_er:
+        if _HAS_DIAGRAM:
+            render_schema_diagram(
+                view="derived",
+                refresh_nonce=int(st.session_state.get("schema_refresh_nonce", 0)),
+            )
+        else:
+            schema_data = fetch_schema(view="derived")
+            if not schema_data or not schema_data.get("tables"):
+                st.caption("No derived schema available yet.")
+            else:
+                tables = schema_data.get("tables", [])
+                rels = schema_data.get("relationships", [])
+                st.caption(f"{len(tables)} derived table{'s' if len(tables) != 1 else ''}")
+                col_a, col_b = st.columns(2)
+                for i, tbl in enumerate(tables):
+                    tname = tbl.get("table", "unknown")
+                    cols = tbl.get("columns", [])
+                    target = col_a if i % 2 == 0 else col_b
+                    with target:
+                        with st.expander(f"[ ] {tname} ({len(cols)} columns)", expanded=False):
+                            st.dataframe(
+                                [{"Column": c["name"], "Type": c["type"]} for c in cols],
+                                hide_index=True, width="stretch",
+                            )
+                if rels:
+                    with st.expander(f"Relationships ({len(rels)})", expanded=False):
+                        for r in rels:
+                            st.markdown(
+                                f"`{r.get('from_table')}.{r.get('from_column')}` -> "
+                                f"`{r.get('to_table')}.{r.get('to_column')}` "
+                                f"*({r.get('type', 'FK')}, {r.get('confidence', '?')})*"
+                            )
 
-    total_tables = len(tables)
-    st.caption(f"{total_tables} table{'s' if total_tables != 1 else ''} loaded")
-
-    # Two-column layout for tables
-    col_a, col_b = st.columns(2)
-    for i, tbl in enumerate(tables):
-        tname = tbl.get("table", "unknown")
-        cols  = tbl.get("columns", [])
-        target = col_a if i % 2 == 0 else col_b
-        with target:
-            with st.expander(f" {tname}  ({len(cols)} columns)", expanded=False):
-                if cols:
+    with tab_raw:
+        raw_data = fetch_schema(view="raw")
+        if not raw_data or not raw_data.get("tables"):
+            st.caption("No raw tables loaded yet.")
+        else:
+            raw_tables = raw_data.get("tables", [])
+            st.caption(f"{len(raw_tables)} raw table{'s' if len(raw_tables) != 1 else ''}")
+            for tbl in raw_tables:
+                tname = tbl.get("table", "unknown")
+                cols = tbl.get("columns", [])
+                with st.expander(f"{tname} ({len(cols)} columns)", expanded=False):
                     st.dataframe(
                         [{"Column": c["name"], "Type": c["type"]} for c in cols],
-                        hide_index=True, width='stretch',              
+                        hide_index=True, width="stretch",
                     )
-                else:
-                    st.caption("No column info available.")
-
-    if rels:
-        with st.expander(f" Relationships detected ({len(rels)})", expanded=False):
-            for r in rels:
-                badge = "" if r.get("confidence") == "HIGH" else ""
-                st.markdown(
-                    f"{badge} `{r.get('from_table')}.{r.get('from_column')}` "
-                    f" `{r.get('to_table')}.{r.get('to_column')}`  "
-                    f"*({r.get('type', 'FK')})*"
-                )
 
     if st.button("Refresh schema", key="refresh_schema_bottom", type="secondary"):
+        st.session_state["schema_refresh_nonce"] = int(st.session_state.get("schema_refresh_nonce", 0)) + 1
+        st.session_state["schema_last_refresh"] = datetime.now().strftime("%H:%M:%S")
         st.rerun()
 
+    if st.session_state.get("schema_last_refresh"):
+        st.caption(f"Last schema refresh: {st.session_state['schema_last_refresh']}")
 
-#  Page layout 
+
+#  Page layout
 
 st.markdown("## Data Analytics - Live Pipeline")
 
@@ -849,7 +890,7 @@ st.divider()
 left, right = st.columns([3, 2], gap="large")
 
 with left:
-    #  Pipeline steps 
+    #  Pipeline steps
     st.markdown('<div class="section-lbl">Pipeline steps</div>', unsafe_allow_html=True)
     steps_placeholder = st.empty()
     with steps_placeholder.container():
@@ -857,7 +898,7 @@ with left:
 
     st.divider()
 
-    #  Data source (file upload)  stays here 
+    #  Data source (file upload)
     st.markdown('<div class="section-lbl">Data source</div>', unsafe_allow_html=True)
     with st.expander("Upload dataset files (CSV / JSON / Parquet)", expanded=False):
         upload_files = st.file_uploader(
@@ -866,24 +907,53 @@ with left:
             accept_multiple_files=True,
             label_visibility="collapsed",
         )
+        same_business_merge = False
+        n_uploads = len(upload_files or [])
+        if n_uploads > 1:
+            st.caption(
+                "Multiple files detected. By default, ingest one file at a time."
+            )
+            same_business_merge = st.checkbox(
+                "These files are from the same business schema (merge together)",
+                value=False,
+                key="same_business_merge_confirm",
+            )
         reset_db   = st.checkbox("Replace existing dataset", value=True)
         ingest_btn = st.button("Ingest files", type="secondary")
         if ingest_btn:
             if not upload_files:
                 st.warning("Select at least one file.")
+            elif len(upload_files) > 1 and not same_business_merge:
+                st.warning(
+                    "Please upload one file only, or confirm same-business merge."
+                )
             else:
                 with st.spinner("Ingesting files into DuckDB..."):
                     try:
-                        result = ingest_uploaded_files(upload_files, reset_db=reset_db)
+                        result = ingest_uploaded_files(
+                            upload_files,
+                            reset_db=reset_db,
+                            merge_confirm=same_business_merge,
+                        )
                         tnames = ", ".join(result.get("tables_created", []))
-                        st.success(f" Ingested: {tnames}" if tnames else "Ingestion completed.")
+                        n_rels = len(result.get("relationships", []))
+                        msg = f"Ingested: {tnames}" if tnames else "Ingestion completed."
+                        if n_rels:
+                            msg += f" - {n_rels} relationship{'s' if n_rels != 1 else ''} detected"
+                        st.success(msg)
+                        skipped = result.get("skipped_files") or []
+                        if skipped:
+                            for s in skipped:
+                                st.warning(
+                                    f"Skipped `{s.get('file', 'unknown')}`: {s.get('reason', 'incompatible schema')}"
+                                )
                         st.rerun()
                     except Exception as e:
                         st.error(f"Ingestion failed: {e}")
 
     st.divider()
 
-    #  Query input 
+    #  Query input
     st.markdown('<div class="section-lbl">Ask a question</div>', unsafe_allow_html=True)
 
     query_input = st.text_input(
@@ -909,7 +979,7 @@ with right:
     st.markdown('<div class="section-lbl">Token usage</div>', unsafe_allow_html=True)
     token_placeholder = st.empty()
     with token_placeholder.container():
-        st.caption("No data yet  submit a query to begin.")
+        st.caption("No data yet — submit a query to begin.")
 
     st.divider()
     st.markdown('<div class="section-lbl">Generated SQL</div>', unsafe_allow_html=True)
@@ -918,49 +988,9 @@ with right:
         st.markdown('<div class="sql-box">Waiting for SQL generation</div>',
                     unsafe_allow_html=True)
 
-# ── Bookmark localStorage bridge (hidden) ─────────────────────────
-BM_JS = """
-<script>
-(function() {
-  const KEY = 'sales_analytics_bookmarks';
-  // Send stored bookmarks to Streamlit once via a hidden input trick.
-  // We store them in sessionStorage so the Streamlit component rerenders trigger a check.
-  const stored = localStorage.getItem(KEY);
-  const bms = stored ? JSON.parse(stored) : [];
-  // Write to a hidden textarea that Streamlit can read via query params
-  // Alternative: use window.postMessage hack — here we inject as a div text for scraping
-  const tag = document.getElementById('bm-data-bridge');
-  if (tag) tag.textContent = JSON.stringify(bms);
-
-  window._bmSave = function(bms) {
-    localStorage.setItem(KEY, JSON.stringify(bms));
-  };
-  window._bmLoad = function() {
-    const s = localStorage.getItem(KEY);
-    return s ? JSON.parse(s) : [];
-  };
-})();
-</script>
-<div id="bm-data-bridge" style="display:none"></div>
-"""
-
-def _bm_ls_read_component():
-    """Inject JS that reads localStorage and stores result in a hidden element.
-       We use st.components to get bidirectional data via Streamlit component value."""
-    return components.html(
-        """
-        <script>
-        const KEY = 'sales_analytics_bookmarks';
-        const bms = JSON.parse(localStorage.getItem(KEY) || '[]');
-        // communicate back to python via Streamlit component return value trick
-        window.parent.postMessage({type:'bm_data', bookmarks: bms}, '*');
-        </script>
-        """,
-        height=0,
-    )
+# ── Bookmark localStorage bridge ──────────────────────────────────────────────
 
 def bm_save_to_ls(bookmarks):
-    """Inject JS snippet to write current bookmarks list to localStorage."""
     import json as _json
     safe = _json.dumps(bookmarks, ensure_ascii=False)
     components.html(
@@ -974,28 +1004,6 @@ def bm_save_to_ls(bookmarks):
         height=0,
     )
 
-def bm_load_from_ls():
-    """Render a hidden component that reads localStorage and returns bookmarks via query param hack."""
-    # We use a Streamlit-native trick: inject a form that auto-submits with the LS value
-    # Actually the simplest working method: render a component whose return value IS the data
-    val = components.html(
-        """
-        <!DOCTYPE html><html><body>
-        <script>
-        const bms = JSON.parse(localStorage.getItem('sales_analytics_bookmarks') || '[]');
-        // Write into a textarea so the parent iframe can read via MutationObserver (not reliable)
-        // Simplest: set document title and poll  but that won't work cross-origin.
-        // FINAL approach: use Streamlit's component bidirectional API via window.parent.Streamlit
-        window.parent.postMessage({isStreamlitMessage:true, type:'streamlit:componentReady'}, '*');
-        window.parent.postMessage({isStreamlitMessage:true, type:'streamlit:setComponentValue',
-          args: {value: JSON.stringify(bms)}}, '*');
-        </script>
-        </body></html>
-        """,
-        height=0,
-    )
-    return val  # will be the JSON string if component framework works, else None
-
 
 def _star_button_key(qid):
     return f"star_{qid}"
@@ -1003,8 +1011,8 @@ def _star_button_key(qid):
 
 def _render_bookmarks_panel():
     bms = st.session_state.bookmarks
-    label = f"⭐ Pinned Results"
-    count_html = f'<span class="bm-count">{len(bms)}</span>' if bms else '<span class="bm-count">0</span>'
+    label = "⭐ Pinned Results"
+    count_html = f'<span class="bm-count">{len(bms)}</span>'
     st.markdown(
         f'<div class="section-lbl">{label} {count_html}</div>',
         unsafe_allow_html=True,
@@ -1039,17 +1047,14 @@ def _render_bookmarks_panel():
                     st.rerun()
 
 
-# ── Load bookmarks from localStorage on first render ──────────────
+# ── Load bookmarks from localStorage on first render ─────────────────────────
 if not st.session_state.bm_loaded:
-    # Use a query-param trick: store bookmarks in the URL, or simply inject JS
-    # that writes to a st.query_params on load (Streamlit 1.30+)
     components.html(
         """
         <script>
         (function() {
           const bms = JSON.parse(localStorage.getItem('sales_analytics_bookmarks') || '[]');
           if (bms.length === 0) return;
-          // encode and write to URL so Streamlit can read via st.query_params
           const encoded = encodeURIComponent(JSON.stringify(bms));
           const url = new URL(window.parent.location.href);
           if (!url.searchParams.has('_bm_init')) {
@@ -1062,7 +1067,6 @@ if not st.session_state.bm_loaded:
         """,
         height=0,
     )
-    # Try reading from query params (set by the JS above on previous load)
     try:
         import urllib.parse as _ul
         raw = st.query_params.get("_bm_init", "")
@@ -1070,19 +1074,18 @@ if not st.session_state.bm_loaded:
             loaded = json.loads(_ul.unquote(raw))
             if isinstance(loaded, list):
                 st.session_state.bookmarks = loaded
-            # Remove from URL so it doesn't accumulate
             st.query_params.pop("_bm_init", None)
     except Exception:
         pass
     st.session_state.bm_loaded = True
 
 
-# ── Pinned Results panel ───────────────────────────────────────────
+# ── Pinned Results panel ──────────────────────────────────────────────────────
 _render_bookmarks_panel()
 
 st.divider()
 
-#  History (above schema) 
+# ── History ───────────────────────────────────────────────────────────────────
 if st.session_state.history:
     hist_search = st.text_input(
         "🔍 Filter history",
@@ -1108,17 +1111,17 @@ if st.session_state.history:
         for item in reversed(filtered_hist):
             st.markdown(f"""
             <div class="hist-item">
-                <div class="hist-q"> {item['query']}</div>
-                <div class="hist-a">{item['result'][:300]}{'' if len(item['result'])>300 else ''}</div>
+                <div class="hist-q">▸ {item['query']}</div>
+                <div class="hist-a">{item['result'][:300]}</div>
             </div>""", unsafe_allow_html=True)
 
-#  Schema section  MOVED TO BOTTOM 
+# ── Schema ER Diagram — BOTTOM OF PAGE ───────────────────────────────────────
 st.divider()
-st.markdown('<div class="section-lbl">Loaded dataset schema</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-lbl">Dataset schema — ER diagram</div>', unsafe_allow_html=True)
 render_schema_section()
 
 
-#  Polling / final state 
+# ── Polling / final state ─────────────────────────────────────────────────────
 state = None
 if st.session_state.polling and st.session_state.query_id:
     try:
@@ -1147,9 +1150,9 @@ if state:
     if st.session_state.polling:
         status_placeholder.caption(f"Status: `{status}`")
     elif is_error:
-        status_placeholder.caption("Pipeline error  check Motia logs")
+        status_placeholder.caption("Pipeline error — check Motia logs")
     else:
-        status_placeholder.caption("Done   ask another question")
+        status_placeholder.caption("Done — ask another question")
 
     if state.get("generated_sql"):
         with sql_placeholder.container():
@@ -1160,7 +1163,7 @@ if state:
         with token_placeholder.container():
             render_tokens(state.get("token_usage"), state.get("token_totals"))
 
-    #  Terminal states 
+    #  Terminal states
     if status == "needs_clarification":
         if st.session_state.polling:
             st.session_state.polling         = False
@@ -1170,7 +1173,7 @@ if state:
 
         q = state.get("clarification", "Please clarify your query.")
         with clarify_placeholder.container():
-            st.markdown(f'<div class="clarify-box"> {q}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="clarify-box">💬 {q}</div>', unsafe_allow_html=True)
             answer = st.text_input("Your answer",
                                    key=f"clarify_{st.session_state.query_id}",
                                    placeholder="Type your answer and press Enter")
@@ -1202,7 +1205,7 @@ if state:
             st.markdown('<div class="section-lbl">Result</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="result-box">{text}</div>', unsafe_allow_html=True)
 
-            # ── Star / bookmark button ──────────────────────────────
+            # ── Star / bookmark button ──────────────────────────────────────
             qid = st.session_state.query_id
             already_starred = any(b["query_id"] == qid for b in st.session_state.bookmarks)
             last_q = (st.session_state.history[-1]["query"]
@@ -1277,7 +1280,7 @@ if state:
         err = state.get("error", "Unknown error.")
         with result_placeholder.container():
             st.markdown('<div class="section-lbl">Result</div>', unsafe_allow_html=True)
-            st.markdown(f'<div class="result-box result-error"> {err}</div>',
+            st.markdown(f'<div class="result-box result-error">⚠ {err}</div>',
                         unsafe_allow_html=True)
 
     else:
